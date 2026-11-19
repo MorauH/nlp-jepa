@@ -6,6 +6,12 @@ pass.
 
 The decoder consumes detached latents, so its loss only trains the decoder,
 while the JEPA loss trains the encoder and predictor.
+
+Multi-GPU training is opt-in through the environment: when ``torchrun`` starts
+several processes, the same loop wraps the model in ``DistributedDataParallel``,
+shards the training batches (dropping the remainder so all ranks stay in step)
+and reduces the validation losses.  With one process nothing here touches
+``torch.distributed``, so the single-GPU behaviour is unchanged.
 """
 
 from __future__ import annotations
@@ -18,13 +24,29 @@ from contextlib import nullcontext
 from functools import partial
 
 import torch
+import torch.distributed as dist
+from torch.distributed.algorithms.ddp_comm_hooks import (
+    default_hooks as ddp_default_hooks,
+)
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import set_seed
 
 from ..models.stack import JepaDecodeModel
 from ..runtime import available_cpu_count, resolve_amp_dtype
-from .data import LengthBucketBatchSampler, example_lengths, tokenize_batch
+from .data import (
+    LengthBucketBatchSampler,
+    ShardedBatchSampler,
+    example_lengths,
+    tokenize_batch,
+)
+from .distributed import (
+    DistributedInfo,
+    barrier,
+    cleanup_distributed,
+    reduce_totals,
+    setup_distributed,
+)
 from .optim import parameter_groups
 
 
@@ -59,6 +81,8 @@ class JepaTrainer:
         log_every: int = 10,
         right_padded: bool = False,
         save_every_steps: int | None = None,
+        ddp_find_unused_parameters: bool = False,
+        ddp_bf16_compress_hook: bool = False,
     ):
         # Keep an uncompiled reference: ``torch.compile`` wraps the module and
         # prefixes state-dict keys with ``_orig_mod.``, so checkpoints must be
@@ -95,6 +119,18 @@ class JepaTrainer:
         # fused causal kernel.  Keep False for a left-padding tokenizer.
         self.right_padded = right_padded
 
+        # DDP knobs.  ``find_unused_parameters=False`` is correct for the
+        # default stack: every parameter receives a gradient on every step
+        # (PREDICTOR_CONTEXT_WINDOW=0 creates no context parameters, and the
+        # decoder's zero-initialized hint projections are used, so their
+        # gradients are non-zero).  It is also the fast setting: DDP then does
+        # not have to walk the autograd graph looking for unused params.
+        self.ddp_find_unused_parameters = ddp_find_unused_parameters
+        self.ddp_bf16_compress_hook = ddp_bf16_compress_hook
+        # Filled in by train(); single-process until then so the helpers work
+        # even when they are called before training starts.
+        self.dist_info = DistributedInfo()
+
         self._amp_dtype: torch.dtype | None = None
         self._scaler: torch.amp.GradScaler | None = None
 
@@ -115,6 +151,15 @@ class JepaTrainer:
     def select_device(self) -> torch.device:
         """Return the device to use for training."""
         if self.args.use_cpu:
+            return torch.device("cpu")
+        if self.dist_info.is_distributed:
+            if self.dist_info.backend == "nccl":
+                # One GPU per process; the process group was created after
+                # ``torch.cuda.set_device(local_rank)``, so the explicit index
+                # only makes the choice obvious (and is what DDP wants as
+                # device_ids).
+                return torch.device("cuda", self.dist_info.local_rank)
+            # A gloo group means the launch is CPU-only.
             return torch.device("cpu")
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -144,10 +189,22 @@ class JepaTrainer:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
+    def _num_workers(self) -> int:
+        """Dataloader workers for this rank.
+
+        Single process keeps the historical ``min(8, cpus)``.  With several
+        ranks on one node the same CPU budget is split between them, so four
+        ranks do not oversubscribe a 32-core allocation with 32 workers.
+        """
+        cpus = available_cpu_count()
+        if self.dist_info.is_distributed:
+            cpus = max(1, cpus // max(1, self.dist_info.local_world_size))
+        return min(8, cpus)
+
     def _make_loader(
         self, dataset, batch_size: int, shuffle: bool, device, collate_fn
     ):
-        num_workers = min(8, available_cpu_count())
+        num_workers = self._num_workers()
         kwargs = dict(
             num_workers=num_workers,
             persistent_workers=num_workers > 0,
@@ -158,13 +215,34 @@ class JepaTrainer:
             kwargs["prefetch_factor"] = 4
 
         if shuffle:
-            # Bucket by length to avoid padding every batch to 1024.
+            # Bucket by length to avoid padding every batch to 1024.  Every
+            # rank builds the identical batch list (same seed and epoch) and
+            # then takes its own stride, so the data order matches before
+            # sharding and all ranks run the same number of steps.
             return DataLoader(
                 dataset,
                 batch_sampler=LengthBucketBatchSampler(
                     example_lengths(dataset),
                     batch_size,
                     seed=self.args.seed,
+                    num_replicas=self.dist_info.world_size,
+                    rank=self.dist_info.rank,
+                ),
+                **kwargs,
+            )
+
+        if self.dist_info.is_distributed:
+            # Validation is sharded *without* dropping anything: each rank gets
+            # a disjoint stride of the sequential batches and evaluate()
+            # all-reduces the per-batch losses, so the epoch average still
+            # covers the whole set (exactly, up to float reduction order).
+            return DataLoader(
+                dataset,
+                batch_sampler=ShardedBatchSampler(
+                    len(dataset),
+                    batch_size,
+                    num_replicas=self.dist_info.world_size,
+                    rank=self.dist_info.rank,
                 ),
                 **kwargs,
             )
@@ -176,11 +254,27 @@ class JepaTrainer:
             **kwargs,
         )
 
+    def _mean_losses(self, totals: torch.Tensor, count: int) -> list[float]:
+        """Reduce per-rank loss totals and return the global means.
+
+        Collective: every rank must call this.  It runs only at log/epoch/save
+        boundaries, so the steady-state loop keeps no per-step syncs.
+        """
+        totals, count = reduce_totals(totals, count)
+        return (totals / max(1, count)).tolist()
+
     @torch.no_grad()
     def evaluate(self, val_loader: DataLoader, device: torch.device) -> dict[str, float]:
-        """Return the average validation losses."""
+        """Return the average validation losses.
+
+        Averages are per batch, not per token (each batch counts once).  In a
+        distributed job each rank evaluates a disjoint shard of the batches;
+        the sums and the batch count are all-reduced, so the result is the
+        average over the *whole* validation set, not an average of per-rank
+        averages (which would over-weight ranks with fewer batches).
+        """
         self.model.eval()
-        horizon = getattr(self.model, "pred_horizon", 1)
+        horizon = getattr(self._raw_model, "pred_horizon", 1)
 
         totals = torch.zeros(3, device=device)
         n_batches = 0
@@ -216,6 +310,10 @@ class JepaTrainer:
 
         self.model.train()
 
+        # Skipping short batches is fine here (unlike in the training loop):
+        # this is the only collective in evaluate(), and it carries the count.
+        totals, n_batches = reduce_totals(totals, n_batches)
+
         if n_batches == 0:
             return {
                 "loss": float("nan"),
@@ -230,10 +328,33 @@ class JepaTrainer:
         return averages
 
     def train(self) -> dict:
-        """Train the model and return the loss history."""
+        """Train the model and return the loss history.
+
+        Creates the process group when the launcher started several processes
+        and tears it down again on the way out (including on exceptions).
+        ``train.py`` already initializes it before building
+        ``TrainingArguments``; ``setup_distributed`` then just reuses it, and
+        because the group existed before this call it is not destroyed here
+        (the caller owns its lifetime).
+        """
+        already_initialized = dist.is_available() and dist.is_initialized()
+        self.dist_info = setup_distributed(
+            use_cpu=getattr(self.args, "use_cpu", False)
+        )
+        try:
+            return self._train()
+        finally:
+            if not already_initialized:
+                cleanup_distributed()
+
+    def _train(self) -> dict:
+        """Run the epochs; see :meth:`train` for the distributed setup."""
         args = self.args
         device = self.select_device()
-        print(f"Device: {device} | dataloader workers: {min(8, available_cpu_count())}")
+        if self.dist_info.is_main:
+            print(
+                f"Device: {device} | dataloader workers: {self._num_workers()}"
+            )
 
         set_seed(getattr(args, "seed", 42))
         self._configure_backends(device)
@@ -245,13 +366,43 @@ class JepaTrainer:
             enabled=(self._amp_dtype == torch.float16),
         )
         amp_label = str(self._amp_dtype).replace("torch.", "") if self._amp_dtype else "off"
-        print(
-            f"AMP: {amp_label} | compile: {self.compile_model} "
-            f"(mode={self.compile_mode}) | "
-            f"decoder loss chunk: {self.decoder_loss_chunk_size} | "
-            f"pad multiple: {self.pad_to_multiple_of}"
-        )
+        if self.dist_info.is_main:
+            print(
+                f"AMP: {amp_label} | compile: {self.compile_model} "
+                f"(mode={self.compile_mode}) | "
+                f"decoder loss chunk: {self.decoder_loss_chunk_size} | "
+                f"pad multiple: {self.pad_to_multiple_of}"
+            )
 
+        if self.dist_info.is_distributed:
+            # Wrap *before* torch.compile: DDP then splits the compiled graph at
+            # its gradient buckets (DDPOptimizer), so each bucket's all-reduce
+            # overlaps with the rest of the backward pass instead of serializing
+            # after it.  ``device_ids`` is required for single-node NCCL and must
+            # be omitted on CPU/gloo.
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[device.index] if device.type == "cuda" else None,
+                find_unused_parameters=self.ddp_find_unused_parameters,
+            )
+            if (
+                self.ddp_bf16_compress_hook
+                and self._amp_dtype == torch.bfloat16
+                and self.dist_info.backend == "nccl"
+            ):
+                # 4x L4 has PCIe only (no NVLink), so the gradient all-reduce is
+                # the main scaling cost.  The hook sends bf16 on the wire and
+                # decompresses back into the fp32 gradient buffers, so the
+                # optimizer and grad clipping still see fp32 grads.
+                self.model.register_comm_hook(
+                    None, ddp_default_hooks.bf16_compress_hook
+                )
+                if self.dist_info.is_main:
+                    print("DDP: bf16 gradient compression hook enabled")
+
+        # Whatever compile does below, this is the module to fall back to: the
+        # DDP wrapper when distributed, the raw model otherwise.
+        wrapped_model = self.model
         if self.compile_model:
             # ``dynamic=True`` keeps the varying sequence lengths and the
             # variable number of valid tokens in the VISReg loss from
@@ -270,13 +421,14 @@ class JepaTrainer:
                     mode=self.compile_mode,
                     dynamic=True,
                 )
-                print("torch.compile: enabled")
+                if self.dist_info.is_main:
+                    print("torch.compile: enabled")
             except Exception as exc:  # pragma: no cover - depends on the backend
                 warnings.warn(
                     f"torch.compile failed ({exc!r}); continuing eagerly.",
                     RuntimeWarning,
                 )
-                self.model = self._raw_model
+                self.model = wrapped_model
 
         optimizer_kwargs = {}
         if device.type == "cuda":
@@ -323,7 +475,7 @@ class JepaTrainer:
             collate_fn=collate,
         )
 
-        horizon = getattr(self.model, "pred_horizon", 1)
+        horizon = getattr(self._raw_model, "pred_horizon", 1)
         num_epochs = max(1, int(round(args.num_train_epochs)))
 
         # Linear warmup for the first 1% of steps, then cosine decay to 10%.
@@ -357,9 +509,12 @@ class JepaTrainer:
                 batch_sampler.set_epoch(epoch)
             running = torch.zeros(3, device=device)
             n_batches = 0
-            pbar = tqdm(
-                train_loader,
-                desc=f"epoch {epoch + 1}/{num_epochs}",
+            # Only rank 0 drives the progress bar; the others iterate the loader
+            # silently so they do not spam N identical bars.
+            pbar = (
+                tqdm(train_loader, desc=f"epoch {epoch + 1}/{num_epochs}")
+                if self.dist_info.is_main
+                else train_loader
             )
 
             for labels, attention_mask in pbar:
@@ -367,6 +522,16 @@ class JepaTrainer:
                 attention_mask = attention_mask.to(device, non_blocking=True)
 
                 if labels.shape[1] <= horizon:
+                    if self.dist_info.is_distributed:
+                        # One rank skipping a batch would leave the others
+                        # blocked in the next all-reduce; fail loudly instead of
+                        # hanging.  Real chunks are >= 64 tokens, so this only
+                        # fires on a degenerate dataset.
+                        raise RuntimeError(
+                            f"sequence length ({labels.shape[1]}) must exceed "
+                            f"pred_horizon ({horizon}); batches cannot be "
+                            "skipped in distributed mode"
+                        )
                     continue
 
                 with self._autocast(device):
@@ -391,7 +556,7 @@ class JepaTrainer:
                 if self.max_grad_norm is not None:
                     self._scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.max_grad_norm
+                        self._raw_model.parameters(), self.max_grad_norm
                     )
 
                 self._scaler.step(optimizer)
@@ -405,7 +570,7 @@ class JepaTrainer:
                 )
                 n_batches += 1
 
-                if n_batches % self.log_every == 0:
+                if self.dist_info.is_main and n_batches % self.log_every == 0:
                     mean_loss, mean_jepa, mean_decoder = (
                         running / n_batches
                     ).tolist()
@@ -421,30 +586,34 @@ class JepaTrainer:
                     self.save_every_steps
                     and global_step % self.save_every_steps == 0
                 ):
-                    mean_loss, mean_jepa, mean_decoder = (
-                        running / n_batches
-                    ).tolist()
-                    # Epoch-level history stays untouched; this records where
-                    # the mid-epoch checkpoint was taken and the running
-                    # train losses at that point.
-                    self.history["last_checkpoint"] = {
-                        "epoch": epoch + 1,
-                        "epoch_step": n_batches,
-                        "global_step": global_step,
-                        "total_steps": total_steps,
-                        "train_loss": mean_loss,
-                        "train_jepa_loss": mean_jepa,
-                        "train_decoder_loss": mean_decoder,
-                    }
-                    pbar.write(
-                        f"step {global_step}/{total_steps}: saving checkpoint "
-                        f"to {args.output_dir}"
+                    # Collective: the running losses become the global ones.
+                    mean_loss, mean_jepa, mean_decoder = self._mean_losses(
+                        running, n_batches
                     )
-                    self._save(args.output_dir)
+                    if self.dist_info.is_main:
+                        # Epoch-level history stays untouched; this records where
+                        # the mid-epoch checkpoint was taken and the running
+                        # train losses at that point.
+                        self.history["last_checkpoint"] = {
+                            "epoch": epoch + 1,
+                            "epoch_step": n_batches,
+                            "global_step": global_step,
+                            "total_steps": total_steps,
+                            "train_loss": mean_loss,
+                            "train_jepa_loss": mean_jepa,
+                            "train_decoder_loss": mean_decoder,
+                        }
+                        pbar.write(
+                            f"step {global_step}/{total_steps}: saving checkpoint "
+                            f"to {args.output_dir}"
+                        )
+                        self._save(args.output_dir)
+                    # Keep the other ranks from racing ahead while rank 0 writes.
+                    barrier()
 
-            mean_loss, mean_jepa, mean_decoder = (
-                running / max(1, n_batches)
-            ).tolist()
+            mean_loss, mean_jepa, mean_decoder = self._mean_losses(
+                running, n_batches
+            )
             train_stats = {
                 "loss": mean_loss,
                 "jepa_loss": mean_jepa,
@@ -467,33 +636,37 @@ class JepaTrainer:
                 val_stats["decoder_loss"]
             )
 
-            print(
-                f"epoch {epoch + 1}: "
-                f"train {train_stats['loss']:.4f} "
-                f"(jepa {train_stats['jepa_loss']:.4f}, "
-                f"decoder {train_stats['decoder_loss']:.4f}) | "
-                f"val {val_stats['loss']:.4f} "
-                f"(jepa {val_stats['jepa_loss']:.4f}, "
-                f"decoder {val_stats['decoder_loss']:.4f}) | "
-                f"val_ppl {val_stats['perplexity']:.2f}"
-            )
-
-            if device.type == "cuda":
+            if self.dist_info.is_main:
                 print(
-                    f"epoch {epoch + 1} peak VRAM: "
-                    f"{torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB allocated, "
-                    f"{torch.cuda.max_memory_reserved(device) / 1e9:.2f} GB reserved"
+                    f"epoch {epoch + 1}: "
+                    f"train {train_stats['loss']:.4f} "
+                    f"(jepa {train_stats['jepa_loss']:.4f}, "
+                    f"decoder {train_stats['decoder_loss']:.4f}) | "
+                    f"val {val_stats['loss']:.4f} "
+                    f"(jepa {val_stats['jepa_loss']:.4f}, "
+                    f"decoder {val_stats['decoder_loss']:.4f}) | "
+                    f"val_ppl {val_stats['perplexity']:.2f}"
                 )
 
-            print(f"Saving to {args.output_dir}.")
-            self.history["last_checkpoint"] = {
-                "epoch": epoch + 1,
-                "epoch_step": n_batches,
-                "global_step": global_step,
-                "total_steps": total_steps,
-                "end_of_epoch": True,
-            }
-            self._save(args.output_dir)
+                if device.type == "cuda":
+                    print(
+                        f"epoch {epoch + 1} peak VRAM: "
+                        f"{torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB allocated, "
+                        f"{torch.cuda.max_memory_reserved(device) / 1e9:.2f} GB reserved"
+                    )
+
+                print(f"Saving to {args.output_dir}.")
+                self.history["last_checkpoint"] = {
+                    "epoch": epoch + 1,
+                    "epoch_step": n_batches,
+                    "global_step": global_step,
+                    "total_steps": total_steps,
+                    "end_of_epoch": True,
+                }
+                self._save(args.output_dir)
+            # One rank writes the checkpoint; the others wait here instead of
+            # starting the next epoch (or exiting) while the files are written.
+            barrier()
         return self.history
 
     def _save(self, output_dir: str) -> None:

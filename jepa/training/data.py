@@ -47,6 +47,13 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
     length-homogeneous, which cuts the padded positions substantially.
 
     Call :meth:`set_epoch` before each epoch to reshuffle.
+
+    For distributed training, pass ``num_replicas`` / ``rank``: every rank
+    builds the *same* global batch list (same seed and epoch, so the data order
+    matches) and then keeps ``batches[rank::num_replicas]``.  The list is
+    truncated to a multiple of ``num_replicas`` first, so every rank runs the
+    same number of steps; a rank with one extra step would block the others in
+    DDP's gradient all-reduce.
     """
 
     def __init__(
@@ -57,14 +64,22 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
         drop_last: bool = False,
         seed: int = 0,
         window_batches: int = LENGTH_BUCKET_WINDOW,
+        num_replicas: int = 1,
+        rank: int = 0,
     ):
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
+        if num_replicas < 1:
+            raise ValueError("num_replicas must be positive")
+        if not 0 <= rank < num_replicas:
+            raise ValueError("rank must be in [0, num_replicas)")
         self.lengths = list(lengths)
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.seed = seed
         self.window = max(batch_size, batch_size * window_batches)
+        self.num_replicas = num_replicas
+        self.rank = rank
         self.epoch = 0
         self._batches: list[list[int]] | None = None
 
@@ -90,6 +105,18 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
         # see monotonically increasing lengths.
         permutation = torch.randperm(len(batches), generator=generator).tolist()
         self._batches = [batches[i] for i in permutation]
+        if self.num_replicas > 1:
+            # Drop the remainder so every rank sees exactly the same number of
+            # batches (DDP hangs if one rank runs ahead), then keep this
+            # rank's stride of the shared order.
+            usable = (len(self._batches) // self.num_replicas) * self.num_replicas
+            self._batches = self._batches[:usable][self.rank :: self.num_replicas]
+
+    def _num_global_batches(self) -> int:
+        """Batches per epoch before sharding (mirrors :meth:`_build`)."""
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return math.ceil(len(self.lengths) / self.batch_size)
 
     def __iter__(self):
         if self._batches is None:
@@ -97,9 +124,52 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
         return iter(self._batches)
 
     def __len__(self) -> int:
-        if self.drop_last:
-            return len(self.lengths) // self.batch_size
-        return math.ceil(len(self.lengths) / self.batch_size)
+        # The LR schedule and the progress bar use this, so it must match what
+        # __iter__ actually yields (including the dropped remainder).
+        batches = self._num_global_batches()
+        if self.num_replicas > 1:
+            return batches // self.num_replicas
+        return batches
+
+
+class ShardedBatchSampler(Sampler[list[int]]):
+    """Split a fixed sequential batch list across ranks without dropping any.
+
+    Validation uses this: the union of the ranks' batches is the full dataset
+    and every example is seen exactly once, so ``JepaTrainer.evaluate`` can
+    all-reduce the per-batch losses and reproduce the single-process average.
+    Ranks may differ by one batch; the trainer weights by batch count.
+    """
+
+    def __init__(
+        self,
+        num_examples: int,
+        batch_size: int,
+        *,
+        num_replicas: int = 1,
+        rank: int = 0,
+    ):
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if num_replicas < 1:
+            raise ValueError("num_replicas must be positive")
+        if not 0 <= rank < num_replicas:
+            raise ValueError("rank must be in [0, num_replicas)")
+        self.num_examples = num_examples
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self._starts = list(range(0, num_examples, batch_size))
+
+    def __iter__(self):
+        for index in range(self.rank, len(self._starts), self.num_replicas):
+            start = self._starts[index]
+            yield list(
+                range(start, min(start + self.batch_size, self.num_examples))
+            )
+
+    def __len__(self) -> int:
+        return len(range(self.rank, len(self._starts), self.num_replicas))
 
 
 def tokenize_batch(batch, tokenizer, pad_to_multiple_of: int = 1):

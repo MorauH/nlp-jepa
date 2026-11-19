@@ -206,6 +206,67 @@ python -m jepa train
 It writes the full checkpoint to `runs/jepa/`, plus standalone component
 checkpoints in `runs/jepa/encoder`, `runs/jepa/predictor`, and `runs/jepa/decoder`.
 
+### Multi-GPU (DDP)
+
+Data parallelism is a launcher change: `torchrun` exports
+`WORLD_SIZE` / `LOCAL_RANK`, `jepa/training/train.py` sees them, initializes a
+process group (`nccl` on CUDA, `gloo` on CPU) and `JepaTrainer` wraps the model
+in `DistributedDataParallel`. A single process never creates a process group,
+so `python -m jepa train` behaves exactly as before.
+
+```bash
+# 4 GPUs, one process each (torchrun ships with PyTorch)
+torchrun --standalone --nproc_per_node=4 -m jepa train --batch-size 6
+```
+
+- **`--batch-size` is per GPU.** The global batch is `N x --batch-size`,
+  because DDP all-reduces gradients every step (there is no gradient
+  accumulation). On 4 GPUs, `--batch-size 6` reproduces the single-GPU global
+  batch of 24 with the same `LEARNING_RATE = 6e-4`. If you keep
+  `--batch-size 24` on 4 GPUs (global 96), scale the LR by about
+  `sqrt(96/24) = 2`; the LR is never scaled automatically. Startup prints the
+  world size, the per-process batch and the global batch.
+- **Batches are sharded, not replicated.** `LengthBucketBatchSampler` builds
+  the same length-bucketed order on every rank (same seed and epoch) and each
+  rank takes `batches[rank::world_size]`, with the remainder dropped so every
+  rank runs the same number of steps. The LR schedule therefore counts
+  per-rank steps, and an epoch takes `N` times fewer optimizer steps at `N`
+  times the global batch.
+- **Validation is sharded without dropping.** Each rank evaluates a disjoint
+  stride of the sequential validation batches and the trainer all-reduces the
+  loss sums and batch count, so `val_loss` / `val_ppl` still describe the whole
+  validation set (same per-batch weighting as single-process). The collective
+  happens once per epoch, not per step. The progress-bar losses are rank 0's
+  local running averages; the epoch and checkpoint statistics are all-reduced.
+- **VISReg statistics are per GPU.** The loss, its diversity/score terms and
+  the random projection directions are computed on each rank's local batch
+  and averaged by the gradient all-reduce, so with `--batch-size 6` on 4 GPUs
+  they differ from a single-process batch of 24 (same mean objective, noisier
+  per-rank statistics). No cross-rank batch statistics are gathered.
+- **Rank 0 does the I/O.** Progress bar, prints, `history.json` and every
+  checkpoint (mid-epoch `SAVE_EVERY_STEPS` and end-of-epoch) come from rank 0
+  only; the other ranks wait at a barrier while it writes. Checkpoints are
+  saved from the unwrapped, uncompiled module, so keys stay unprefixed.
+- `--resume` loads the checkpoint on every rank (DDP re-broadcasts rank 0's
+  parameters at wrap time anyway); only rank 0 reads `history.json`.
+- Dataloader workers are `min(8, cpus / local_world_size)` per rank, so four
+  ranks on a 32-CPU allocation do not start 32 workers.
+- On CUDA with bf16 AMP, `DDP_BF16_COMPRESS_HOOK = True` compresses the
+  gradient all-reduce to bf16 (PCIe-only nodes like 4x L4 are bandwidth
+  bound). Gradients stay fp32 in the optimizer; clipping is unaffected.
+  `DDP_FIND_UNUSED_PARAMETERS = False` is safe because every parameter of the
+  default stack receives a gradient each step.
+
+On SLURM there is one launcher per setup:
+
+```bash
+sbatch scripts/slurm_train.sh          # 1x L40S, python -m jepa train
+sbatch scripts/slurm_train_multi.sh    # 4x L4, torchrun, --batch-size 6 per GPU
+```
+
+`slurm_train_multi.sh` requests `gpu:l4:4`, 32 CPUs and 64 GB, and defaults to
+`--batch-size 6` (global 24). Adjust the GRES name to your cluster.
+
 ### Performance knobs
 
 `jepa/training/train.py` exposes the main throughput switches:

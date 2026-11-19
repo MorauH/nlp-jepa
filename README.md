@@ -42,7 +42,8 @@ jepa/
     verify.py                 collapse / latent-usage checks
 runs/                         checkpoints (ignored)
 scripts/
-  slurm_train.sh              SLURM launcher
+  slurm_train.sh              SLURM launcher (1x L40S)
+  slurm_train_multi.sh        SLURM launcher (4x L4, DDP via torchrun)
 ```
 
 ## Environment

@@ -8,6 +8,12 @@ Run from the repository root::
 
     python -m jepa train
     python -m jepa train --resume
+
+For data-parallel training on N GPUs, launch one process per GPU with
+``torchrun``; nothing else changes, and ``--batch-size`` becomes the
+per-GPU batch size::
+
+    torchrun --standalone --nproc_per_node=4 -m jepa train --batch-size 6
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from ..config import (
 from ..data.tokenizer import load_tokenizer
 from ..models.stack import JepaDecodeModel
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
+from .distributed import cleanup_distributed, setup_distributed
 from .trainer import JepaTrainer
 
 # ---------------------------------------------------------------------------
@@ -89,12 +96,19 @@ SEED = 42
 # ---------------------------------------------------------------------------
 # Defaults for `--batch-size` / `--epochs`.  24 x <=1024 tokens is ~24k tokens
 # per step; 3 epochs over the ~500M-token set is ~90k steps.
+# `--batch-size` is the PER-GPU (per-process) batch size.  With N processes the
+# global batch is N x batch-size, because DDP all-reduces the gradients of all
+# ranks every step (there is no gradient accumulation).  So on 4 GPUs:
+#   --batch-size 6  -> global batch 24, same LR as single-GPU 24
+#   --batch-size 24 -> global batch 96, scale LEARNING_RATE by ~sqrt(4) = 2x
+# The LR is never scaled automatically; pick it for the global batch you run.
 BATCH_SIZE = 24
 EPOCHS = 3
 # Peak AdamW LR (1% linear warmup, cosine decay to 10%).  Earlier runs found
 # 3e-4 stable at batch 3-6; square-root scaling to batch 24 gives 6e-4.  We
 # stay at the conservative end (not 8e-4+) because the 6-layer predictor
-# trunk is new and untested.  Rescale (~sqrt) if you change BATCH_SIZE.
+# trunk is new and untested.  Rescale (~sqrt) if you change BATCH_SIZE, and
+# remember that N GPUs multiply the global batch by N.
 LEARNING_RATE = 6e-4
 
 # Save a checkpoint (full stack + components + history.json, overwriting
@@ -134,6 +148,20 @@ LOG_EVERY = 10
 # mask (Flash Attention); set False if you replace the tokenizer.
 RIGHT_PADDED = True
 
+# ---------------------------------------------------------------------------
+# Distributed (DDP) knobs
+# ---------------------------------------------------------------------------
+# Every parameter of this stack receives a gradient on every step (with
+# PREDICTOR_CONTEXT_WINDOW = 0 no context parameters exist, and the decoder's
+# zero-initialized hint projections are used), so DDP does not have to search
+# the autograd graph for unused parameters.  Only flip this if you add a
+# component that is conditionally unused.
+DDP_FIND_UNUSED_PARAMETERS = False
+# Compress the gradient all-reduce to bf16 (4x L4 is PCIe-only, no NVLink).
+# Only applied when AMP is bf16 on NCCL; the local gradient buffers stay fp32,
+# so clipping and the optimizer are unaffected.
+DDP_BF16_COMPRESS_HOOK = True
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -167,7 +195,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=BATCH_SIZE,
-        help="LEARNING_RATE is tuned for the default; rescale it if you change this.",
+        help="Batch size PER GPU/process; with N processes the global batch is "
+        "N x this. LEARNING_RATE is tuned for a global batch of 24; rescale it "
+        "(~sqrt) if the global batch changes.",
     )
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     return parser.parse_args(argv)
@@ -224,6 +254,18 @@ def build_model(tokenizer) -> JepaDecodeModel:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    # Must happen before TrainingArguments: accelerate would otherwise create
+    # the process group itself when it sees LOCAL_RANK, and it would also pick
+    # the device.  Initializing first means accelerate finds an initialized
+    # group and reuses it (see setup_distributed).
+    dist_info = setup_distributed()
+    try:
+        _train(args, dist_info)
+    finally:
+        cleanup_distributed()
+
+
+def _train(args: argparse.Namespace, dist_info) -> None:
     set_seed(SEED)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -241,12 +283,16 @@ def main(argv: list[str] | None = None) -> None:
     dataset = load_from_disk(str(args.fineweb_dir))
     train_dataset = dataset["train"]
     val_dataset = dataset["validation"]
-    print(
-        f"train examples: {len(train_dataset):,} | "
-        f"val examples: {len(val_dataset):,}"
-    )
+    if dist_info.is_main:
+        print(
+            f"train examples: {len(train_dataset):,} | "
+            f"val examples: {len(val_dataset):,}"
+        )
 
     if args.resume:
+        # Every rank loads the same checkpoint.  DDP broadcasts rank 0's
+        # parameters at wrap time anyway, but each rank needs a complete model
+        # to build the optimizer and run its own forward pass.
         model = JepaDecodeModel.from_pretrained(str(OUTPUT_DIR))
         if model.config.encoder.vocab_size != len(tokenizer):
             raise ValueError(
@@ -263,18 +309,26 @@ def main(argv: list[str] | None = None) -> None:
         model.config.visreg.score_w = VISREG_SCORE_W
         history_path = OUTPUT_DIR / "history.json"
         history = None
-        if history_path.exists():
+        # Only rank 0 reads the history; it is also the only rank that writes
+        # it back, so the other ranks would just be duplicating I/O.
+        if dist_info.is_main and history_path.exists():
             with open(history_path) as handle:
                 history = json.load(handle)
     else:
         model = build_model(tokenizer)
         history = None
 
-    print("Model loaded")
-    print("Parameters:", f"{sum(p.numel() for p in model.parameters()):,}")
-    print("  encoder:  ", f"{sum(p.numel() for p in model.encoder.parameters()):,}")
-    print("  predictor:", f"{sum(p.numel() for p in model.predictor.parameters()):,}")
-    print("  decoder:  ", f"{sum(p.numel() for p in model.decoder.parameters()):,}")
+    if dist_info.is_main:
+        print("Model loaded")
+        print("Parameters:", f"{sum(p.numel() for p in model.parameters()):,}")
+        print("  encoder:  ", f"{sum(p.numel() for p in model.encoder.parameters()):,}")
+        print("  predictor:", f"{sum(p.numel() for p in model.predictor.parameters()):,}")
+        print("  decoder:  ", f"{sum(p.numel() for p in model.decoder.parameters()):,}")
+        print(
+            f"Processes: {dist_info.world_size} | per-process batch: "
+            f"{args.batch_size} | global batch: "
+            f"{args.batch_size * dist_info.world_size}"
+        )
 
     # FineWeb chunks are long, so keep an eye on memory. For batch 20, raise
     # the LR to 6e-4-8e-4.
@@ -289,6 +343,9 @@ def main(argv: list[str] | None = None) -> None:
         per_device_eval_batch_size=args.batch_size,
         report_to=[],
         seed=SEED,
+        # Pin accelerate to the backend of the group we already created (on
+        # CPU it would otherwise prefer MPI when that is available).
+        ddp_backend=dist_info.backend,
     )
 
     N_TRAIN = 4
@@ -316,6 +373,8 @@ def main(argv: list[str] | None = None) -> None:
         log_every=LOG_EVERY,
         right_padded=RIGHT_PADDED,
         save_every_steps=SAVE_EVERY_STEPS,
+        ddp_find_unused_parameters=DDP_FIND_UNUSED_PARAMETERS,
+        ddp_bf16_compress_hook=DDP_BF16_COMPRESS_HOOK,
     )
 
     trainer.train()

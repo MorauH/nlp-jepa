@@ -8,6 +8,7 @@ JEPA text model (causal encoder → latent predictor → autoregressive decoder)
   - Use `python -m pytest`, not bare `pytest`/`uv run pytest`: `[tool.uv] package = false`, so `jepa` is only importable when the CWD is on `sys.path`. Bare pytest fails with `No module named 'jepa'`.
 - No lint, formatter, typecheck, or CI config exists. Don't invent one.
 - CLI entrypoint: `python -m jepa <train|train-decoder|generate|prepare-data|train-tokenizer|verify>` (`jepa/cli.py`). Each subcommand owns its argparse (`python -m jepa train --help`).
+- Multi-GPU: `torchrun --standalone --nproc_per_node=4 -m jepa train --batch-size 6` (`--batch-size` is per GPU; global = N x batch-size). DDP is detected from `WORLD_SIZE`/`LOCAL_RANK`, so the single-process command is unchanged. Details: `docs/architecture.md`.
 - Quick end-to-end training check: `python -m jepa train --subset` (needs the prepared data and tokenizer in `data/`).
 
 ## Layout / boundaries
@@ -26,4 +27,5 @@ JEPA text model (causal encoder → latent predictor → autoregressive decoder)
 - The decoder gets **detached** latent hints, so the decoder loss must not update the encoder or predictor.
 - Checkpoints are saved from the uncompiled module so state dicts don't get `_orig_mod.` prefixes. Keep this when touching saving code.
 - On NixOS, `torch.compile` needs the dev shell (`openssl` on PATH, `TRITON_LIBCUDA_PATH`). Outside it, `torch.compile` quietly falls back to eager mode with only a warning.
-- `scripts/slurm_train.sh` is the cluster launcher (L40S). It forwards its args to `python -m jepa train`.
+- Cluster launchers: `scripts/slurm_train.sh` (1x L40S, `python -m jepa train`) and `scripts/slurm_train_multi.sh` (4x L4, `torchrun`, `--batch-size 6` per GPU). Both forward their args to `jepa train`.
+- Distributed mode is env-driven (`jepa/training/distributed.py`), not a flag. `LengthBucketBatchSampler(num_replicas=..., rank=...)` drops the batch remainder so all ranks run the same number of steps; validation uses `ShardedBatchSampler` (no dropping) plus an all-reduced loss/count. `DDP_FIND_UNUSED_PARAMETERS=False` in `train.py` is only valid while every parameter gets a gradient — `tests/test_ddp.py` checks that for the default config.
