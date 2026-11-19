@@ -1,0 +1,200 @@
+# Autoregressive token decoder conditioned on latent waypoints.
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from transformers import PreTrainedModel
+
+from ..config import DecoderConfig
+from .blocks import DecoderLayer, RMSNorm, RotaryEmbedding
+
+
+def build_sliding_window_bias(seq_len: int, window: int, device, dtype):
+    """Additive causal sliding-window mask for a token sequence."""
+    positions = torch.arange(seq_len, device=device)
+    causal = positions[:, None] >= positions[None, :]
+    within = (positions[:, None] - positions[None, :]) < window
+    keep = causal & within
+    bias = torch.zeros((seq_len, seq_len), device=device, dtype=dtype)
+    bias.masked_fill_(~keep, torch.finfo(dtype).min)
+    return bias
+
+
+class DecoderModel(PreTrainedModel):
+    """Causal token transformer conditioned on latent hints.
+
+    The decoder is trained with standard next-token cross-entropy. It sees the
+    last ``sliding_window`` tokens and a latent hint for the current block:
+    ``z_t`` (the latent at the block start) and ``z_future`` (the latent at the
+    block end). The hint is added to every token embedding in the block, so the
+    token transformer keeps the grammar while the latent supplies the semantic
+    waypoint.
+    """
+
+    config_class = DecoderConfig
+
+    def __init__(self, config: DecoderConfig):
+        super().__init__(config)
+
+        config.validate()
+        self.pad_token_id = config.pad_token_id
+        self.sliding_window = config.sliding_window
+
+        self.rotary_emb = RotaryEmbedding(config)
+        self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.latent_proj_t = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=False
+        )
+        self.latent_proj_f = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=False
+        )
+        self.decoders = nn.ModuleList(
+            [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        self.post_init()
+
+    def _init_weights(self, module):
+        # The decoder has no custom-initialized head that must survive
+        # post_init; keep the constructor initialization.
+        return
+
+    def _hint(self, z_t, z_future):
+        """Project the block-start and block-end latents into decoder space."""
+        return self.latent_proj_t(z_t) + self.latent_proj_f(z_future)
+
+    def _run(self, input_ids, hint, attention_mask=None):
+        hidden_states = self.embedding(input_ids) + hint
+        rope_rotations = self.rotary_emb(hidden_states)
+
+        bias = build_sliding_window_bias(
+            hidden_states.shape[1],
+            self.sliding_window,
+            hidden_states.device,
+            hidden_states.dtype,
+        ).view(1, 1, hidden_states.shape[1], hidden_states.shape[1])
+        if attention_mask is not None:
+            keep = attention_mask.to(hidden_states.dtype)
+            bias = bias + (1.0 - keep)[:, None, None, :] * torch.finfo(
+                hidden_states.dtype
+            ).min
+
+        for decoder in self.decoders:
+            hidden_states = decoder(
+                hidden_states,
+                rope_rotations,
+                attn_bias=bias,
+                is_causal=False,
+            )
+        return self.norm(hidden_states)
+
+    def forward(
+        self,
+        z_t,
+        z_future,
+        labels,
+        training: bool = True,
+        loss_chunk_size: int | None = None,
+        attention_mask=None,
+    ):
+        """Teacher-forced next-token loss.
+
+        Args:
+            z_t: (B, S, H) latent at the start of each token's block.
+            z_future: (B, S, H) latent at the end of each token's block.
+            labels: (B, S) token ids.
+            training: must be True; use :meth:`generate` for inference.
+            loss_chunk_size: optional number of positions per ``lm_head`` chunk.
+            attention_mask: optional (B, S) padding mask.
+        """
+        if not training:
+            raise ValueError("DecoderModel.forward is training-only; use generate()")
+
+        input_ids = labels[:, :-1]
+        targets = labels[:, 1:]
+        steps = input_ids.shape[1]
+
+        hint = self._hint(z_t[:, :steps], z_future[:, :steps])
+        mask = attention_mask[:, :-1] if attention_mask is not None else None
+        hidden_states = self._run(input_ids, hint, mask)
+
+        if loss_chunk_size is None:
+            logits = self.lm_head(hidden_states)
+            total = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                targets.reshape(-1),
+                ignore_index=self.pad_token_id,
+                reduction="sum",
+            )
+            count = (targets != self.pad_token_id).sum()
+            return {"loss": total / count.clamp_min(1)}
+
+        total = hidden_states.new_zeros(())
+        count = torch.zeros((), device=hidden_states.device, dtype=torch.long)
+        chunk = max(1, int(loss_chunk_size))
+        for start in range(0, steps, chunk):
+            end = min(start + chunk, steps)
+            logits = self.lm_head(hidden_states[:, start:end, :])
+            chunk_targets = targets[:, start:end]
+            total = total + F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                chunk_targets.reshape(-1),
+                ignore_index=self.pad_token_id,
+                reduction="sum",
+            )
+            count = count + (chunk_targets != self.pad_token_id).sum()
+        return {"loss": total / count.clamp_min(1)}
+
+    @torch.no_grad()
+    def generate(
+        self,
+        z_t,
+        z_future,
+        context_ids,
+        k: int,
+        *,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+    ):
+        """Generate ``k`` tokens autoregressively from the latent hints.
+
+        Args:
+            z_t: (B, H) latent at the start of the block.
+            z_future: (B, H) waypoint latent for the block.
+            context_ids: (B, C) tokens already known/generated.
+            k: number of tokens to generate.
+            temperature: token sampling temperature; 0 means greedy.
+            top_k: optional top-k cutoff.
+        Returns:
+            (B, k) generated token ids.
+        """
+        generated = []
+        for _ in range(k):
+            window = context_ids[:, -self.sliding_window :]
+            hint = self._hint(
+                z_t.unsqueeze(1), z_future.unsqueeze(1)
+            ).expand(-1, window.shape[1], -1)
+            hidden_states = self._run(window, hint)
+            logits = self.lm_head(hidden_states[:, -1, :])
+
+            if temperature <= 0:
+                next_ids = logits.argmax(dim=-1)
+            else:
+                logits = logits / temperature
+                if top_k is not None and top_k > 0:
+                    kk = min(top_k, logits.shape[-1])
+                    kth = torch.topk(logits, kk, dim=-1).values[..., -1, None]
+                    logits = logits.masked_fill(logits < kth, float("-inf"))
+                probabilities = torch.softmax(logits, dim=-1)
+                next_ids = torch.multinomial(
+                    probabilities, num_samples=1
+                ).squeeze(-1)
+
+            generated.append(next_ids)
+            context_ids = torch.cat([context_ids, next_ids[:, None]], dim=1)
+
+        return torch.stack(generated, dim=1)

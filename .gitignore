@@ -1,0 +1,97 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.uv/
+.uv-cache/
+.python-version
+
+# Packaging / builds
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---------------------------------------------------------------------------
+# Jupyter
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+*.nbconvert.py
+jupyter_execute/
+
+# ---------------------------------------------------------------------------
+# Test / type-checker / tool caches
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.hypothesis/
+.tox/
+.nox/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# OS / editor / shell
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.direnv/
+.env
+.env.*
+
+# Nix build results
+/result
+/result-*
+
+# ---------------------------------------------------------------------------
+# Logs and temporary files
+# ---------------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.pid
+slurm-*.out
+
+# ---------------------------------------------------------------------------
+# Training / model artifacts
+# ---------------------------------------------------------------------------
+data/
+out/
+checkpoints/
+runs/
+wandb/
+mlruns/
+lightning_logs/
+saved_models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.pkl
+*.pickle
+*.npy
+*.npz
