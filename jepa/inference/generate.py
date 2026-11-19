@@ -115,9 +115,9 @@ def generate(
         latents = model.encoder(enc_ids)
         z_t = latents[:, -1, :]
 
-        candidates, scores = model.predictor(
-            z_t.unsqueeze(1), return_all_timesteps=False
-        )
+        # Pass the whole latent sequence: the predictor reads z_t from the
+        # last position and its context window from the ones before it.
+        candidates, scores = model.predictor(latents, return_all_timesteps=False)
         z_future = sample_direction(
             candidates,
             scores,

@@ -122,12 +122,16 @@ class VISRegLoss(nn.Module):
         if self.normalize_distance:
             cand_cmp = F.normalize(cand, dim=-1)
             tgt_cmp = F.normalize(tgt, dim=-1)
+            # Both sides are unit vectors, so the squared distance is
+            # 2 - 2 * (a . b).  Computing it from the dot product avoids
+            # materializing the (B, T, P, D) fp32 difference and its square
+            # (about 1.4 GB each at batch 32 x 1024).  Clamping at zero hides
+            # the fp32 rounding when a == b.
+            dot = torch.einsum("btpd,btd->btp", cand_cmp, tgt_cmp)
+            d = (2.0 - 2.0 * dot).clamp_min(0.0)
         else:
             cand_cmp = cand
-            tgt_cmp = tgt
-
-        # Squared distance from every target to every candidate: (B, T, P).
-        d = (cand_cmp - tgt_cmp.unsqueeze(2)).pow(2).sum(-1)
+            d = (cand - tgt.unsqueeze(2)).pow(2).sum(-1)
 
         # Adaptive temperature: relative differences stay usable even as the
         # overall distance shrinks during training.
@@ -154,16 +158,22 @@ class VISRegLoss(nn.Module):
         # similarity is penalized only when positive, i.e. only when two
         # candidates point in the same direction.
         if self.diversity_w > 0 and count > 1:
-            dirs = F.normalize(cand[valid], dim=-1)  # (N, P, D)
-            n_valid = dirs.shape[0]
-            if n_valid > 0:
-                sim = torch.bmm(dirs, dirs.transpose(1, 2))  # (N, P, P)
-                off_diag = 1.0 - torch.eye(count, device=device, dtype=sim.dtype)
-                l_div = (F.relu(sim) * off_diag).sum() / (
-                    n_valid * count * (count - 1)
-                )
-            else:
-                l_div = cand.new_zeros(())
+            dirs = (
+                cand_cmp if self.normalize_distance
+                else F.normalize(cand, dim=-1)
+            )
+            n_valid = valid_f.sum()
+            # Pairwise similarities for every position, then sum only over the
+            # valid ones.  Gathering the valid rows first (the old path) copied
+            # and re-normalized an (N, P, D) fp32 tensor; the bmm output is
+            # only (N, P, P) and is multiplied by the mask.
+            dirs = dirs.reshape(-1, count, dirs.shape[-1])
+            sim = torch.bmm(dirs, dirs.transpose(1, 2))  # (N, P, P)
+            off_diag = 1.0 - torch.eye(count, device=device, dtype=sim.dtype)
+            mask_div = valid_f.reshape(-1, 1, 1)
+            l_div = (F.relu(sim) * off_diag * mask_div).sum() / (
+                (n_valid * count * (count - 1)).clamp_min(1)
+            )
         else:
             l_div = cand.new_zeros(())
 

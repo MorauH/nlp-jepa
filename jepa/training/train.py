@@ -45,12 +45,33 @@ INTERMEDIATE_SIZE = 896
 NUM_ATTENTION_HEADS = 8
 NUM_HIDDEN_LAYERS = 8
 
+# Shared causal trunk over the latent sequence, run before the per-position
+# candidate head.  Six layers let every position read the whole prefix through
+# attention, so the predictor is no longer limited to z_t (or a fixed window).
+PREDICTOR_TRUNK_LAYERS = 6
+# Layers of the candidate head itself (expansion slots only, not time steps).
 PREDICTOR_HIDDEN_LAYERS = 2
-PREDICTOR_PREDICTION_COUNT = 24
+# Candidate futures per position.  Analysis of the old 24-candidate head found
+# only ~5 distinct candidate groups, so 8 keeps the useful diversity at a third
+# of the head's slot/score cost.
+PREDICTOR_PREDICTION_COUNT = 8
+# Past latents z_{t-W+1..t} the predictor slots (and score head) attend to.
+# 0 = only z_t.  The trunk already carries the temporal context, so a separate
+# window only adds tokens and activations.
+PREDICTOR_CONTEXT_WINDOW = 0
 PRED_HORIZON = 5
 
-DECODER_HIDDEN_LAYERS = 2
+# Deeper token decoder.  Its tables are tied (below) and the hint is injected
+# at every layer, so the extra depth buys grammar, not capacity in the tables.
+DECODER_HIDDEN_LAYERS = 4
 DECODER_SLIDING_WINDOW = 96
+# Share the decoder input embedding with the lm_head: one table instead of two
+# (the encoder keeps its own, so the decoder loss cannot touch the encoder).
+DECODER_TIE_EMBEDDINGS = True
+# Re-inject the latent hint before every decoder layer instead of only at the
+# input.  The per-layer projections start at zero, so this is a strict
+# extension of input-only injection.
+DECODER_HINT_EVERY_LAYER = True
 VISREG_NUM_SLICES = 256
 # Push the predictor candidates apart and make the score head discriminative.
 # These are applied on resume too, so old checkpoints pick up the new weights.
@@ -62,6 +83,25 @@ JEPA_LOSS_WEIGHT = 2.0
 DECODER_LOSS_WEIGHT = 1.0
 
 SEED = 42
+
+# ---------------------------------------------------------------------------
+# Optimization
+# ---------------------------------------------------------------------------
+# Defaults for `--batch-size` / `--epochs`.  24 x <=1024 tokens is ~24k tokens
+# per step; 3 epochs over the ~500M-token set is ~90k steps.
+BATCH_SIZE = 24
+EPOCHS = 3
+# Peak AdamW LR (1% linear warmup, cosine decay to 10%).  Earlier runs found
+# 3e-4 stable at batch 3-6; square-root scaling to batch 24 gives 6e-4.  We
+# stay at the conservative end (not 8e-4+) because the 6-layer predictor
+# trunk is new and untested.  Rescale (~sqrt) if you change BATCH_SIZE.
+LEARNING_RATE = 6e-4
+
+# Save a checkpoint (full stack + components + history.json, overwriting
+# OUTPUT_DIR) every N optimizer steps, in addition to the end of each epoch.
+# A crash or SLURM timeout then loses at most N steps, and `verify` can be run
+# on the partially trained model.  None disables mid-epoch saves.
+SAVE_EVERY_STEPS = 2000
 
 # ---------------------------------------------------------------------------
 # Performance
@@ -123,8 +163,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Tokenizer directory trained by `python -m jepa train-tokenizer`. "
         "Must match the model when --resume is used.",
     )
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=BATCH_SIZE,
+        help="LEARNING_RATE is tuned for the default; rescale it if you change this.",
+    )
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
     return parser.parse_args(argv)
 
 
@@ -150,12 +195,16 @@ def build_model(tokenizer) -> JepaDecodeModel:
     predictor_config = PredictorConfig.from_encoder(
         encoder_config,
         num_hidden_layers=PREDICTOR_HIDDEN_LAYERS,
+        trunk_layers=PREDICTOR_TRUNK_LAYERS,
         prediction_count=PREDICTOR_PREDICTION_COUNT,
+        context_window=PREDICTOR_CONTEXT_WINDOW,
     )
     decoder_config = DecoderConfig.from_encoder(
         encoder_config,
         num_hidden_layers=DECODER_HIDDEN_LAYERS,
         sliding_window=DECODER_SLIDING_WINDOW,
+        tie_embeddings=DECODER_TIE_EMBEDDINGS,
+        hint_every_layer=DECODER_HINT_EVERY_LAYER,
     )
     visreg_config = VISRegConfig(
         num_slices=VISREG_NUM_SLICES,
@@ -233,8 +282,7 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=str(OUTPUT_DIR),
         optim="adamw_torch",
         eval_strategy="epoch",
-        # 3e-4 at batch 3-6; 6e-4-8e-4 at batch 20 (sqrt-to-linear scaling).
-        learning_rate=1e-3,
+        learning_rate=LEARNING_RATE,
         weight_decay=0.01,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -267,6 +315,7 @@ def main(argv: list[str] | None = None) -> None:
         pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
         log_every=LOG_EVERY,
         right_padded=RIGHT_PADDED,
+        save_every_steps=SAVE_EVERY_STEPS,
     )
 
     trainer.train()

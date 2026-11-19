@@ -139,6 +139,19 @@ class PredictorConfig(TransformerConfig):
     predictor proposes from one input latent.  Each candidate gets its own
     score, so a single direction can be sampled later (like sampling a token
     from logits).
+
+    ``context_window`` is the number of most recent encoder latents
+    ``z_{t-W+1..t}`` that the candidate slots can attend to.  They are
+    appended to the predictor sequence as extra tokens, so the candidates and
+    the score head can use recent context instead of the single vector
+    ``z_t``.  ``0`` disables this (legacy behaviour: the predictor only sees
+    ``z_t`` through the expansion layer).
+
+    ``trunk_layers`` adds a causal transformer trunk over the latent sequence
+    before the per-position candidate head.  ``0`` keeps the legacy
+    per-position predictor (same parameters and state-dict keys); ``> 0``
+    lets each position read the whole prefix through attention, which makes
+    ``context_window`` redundant.
     """
 
     model_type = "jepa_predictor"
@@ -147,6 +160,8 @@ class PredictorConfig(TransformerConfig):
         self,
         target_dim: int | None = None,
         prediction_count: int = 16,
+        context_window: int = 0,
+        trunk_layers: int = 0,
         pad_token_id: int | None = None,
         is_causal: bool = False,
         **kwargs,
@@ -158,6 +173,11 @@ class PredictorConfig(TransformerConfig):
         # not time steps, which is why the predictor defaults to non-causal
         # attention.
         self.prediction_count = prediction_count
+        # Number of past latents (ending at z_t) appended as context tokens.
+        self.context_window = context_window
+        # Causal transformer layers over the latent sequence, run before the
+        # candidate head.  0 = legacy, position-independent predictor.
+        self.trunk_layers = trunk_layers
         self.pad_token_id = pad_token_id
 
     def validate(self) -> "PredictorConfig":
@@ -166,6 +186,10 @@ class PredictorConfig(TransformerConfig):
             raise ValueError("target_dim must be set (use from_encoder(...))")
         if self.prediction_count is None or self.prediction_count < 1:
             raise ValueError("prediction_count must be at least 1")
+        if self.context_window is None or self.context_window < 0:
+            raise ValueError("context_window must be non-negative")
+        if self.trunk_layers is None or self.trunk_layers < 0:
+            raise ValueError("trunk_layers must be non-negative")
         return self
 
     @classmethod
@@ -199,6 +223,11 @@ class DecoderConfig(TransformerConfig):
 
     The decoder is a causal token transformer conditioned on latent hints.  It
     sees the last ``sliding_window`` tokens and generates tokens one at a time.
+
+    ``tie_embeddings`` shares the token embedding table with the output
+    projection.  ``hint_every_layer`` re-injects the latent hint into the
+    residual stream before every transformer layer instead of only adding it
+    to the token embeddings.
     """
 
     model_type = "jepa_decoder"
@@ -208,6 +237,8 @@ class DecoderConfig(TransformerConfig):
         vocab_size: int | None = None,
         pad_token_id: int | None = None,
         sliding_window: int = 96,
+        tie_embeddings: bool = False,
+        hint_every_layer: bool = False,
         **kwargs,
     ):
         kwargs.setdefault("is_causal", True)
@@ -217,6 +248,18 @@ class DecoderConfig(TransformerConfig):
         # Maximum number of past tokens visible to each decoder position.
         # Grammar is local; the latent hints carry the longer-range semantics.
         self.sliding_window = sliding_window
+        # Share ``embedding.weight`` with ``lm_head.weight`` (one table, and
+        # both gradient paths accumulate into it).  Off by default so old
+        # checkpoints keep their separate tables.
+        self.tie_embeddings = tie_embeddings
+        # ``PreTrainedModel``'s tying machinery (``post_init``,
+        # ``from_pretrained``, ``save_pretrained``) reads
+        # ``config.tie_word_embeddings``, so mirror our flag into it.  The flag
+        # above stays the source of truth; this only keeps HF in sync.
+        self.tie_word_embeddings = tie_embeddings
+        # Add a zero-initialized per-layer projection of the hint before each
+        # layer (see DecoderModel._run).
+        self.hint_every_layer = hint_every_layer
 
     def validate(self) -> "DecoderConfig":
         super().validate()

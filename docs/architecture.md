@@ -7,7 +7,7 @@ reloaded alone. `JepaConfig` composes them for the full stack.
 | Config            | Model            | Input                         | Output                        |
 | ----------------- | ---------------- | ----------------------------- | ----------------------------- |
 | `EncoderConfig`   | `EncodeTransformer` | token ids                 | latent sequence `(B, T, H)`   |
-| `PredictorConfig` | `PredictorModel`    | `z_t`                     | `P` candidate `z_{t+k}` + scores |
+| `PredictorConfig` | `PredictorModel`    | latent sequence (+ last `context_window` latents) | `P` candidate `z_{t+k}` + scores |
 | `DecoderConfig`   | `DecoderModel`      | token context, latent waypoints | next-token logits        |
 | `VISRegConfig`    | `VISRegLoss`        | candidates, scores, targets, encoder latents | scalar JEPA loss |
 | `JepaConfig`      | `JepaModel` / `JepaDecodeModel` | composed stack | loss / tokens     |
@@ -50,13 +50,16 @@ encoder = EncodeTransformer.from_pretrained("checkpoints/encoder")
 latents = encoder(tokens, attention_mask=mask)
 
 # Predictor: derive the width/vocab fields from the encoder, override the rest
-pred_cfg = PredictorConfig.from_encoder(enc_cfg, num_hidden_layers=2)
+pred_cfg = PredictorConfig.from_encoder(
+    enc_cfg, num_hidden_layers=2, trunk_layers=6
+)
 predictor = PredictorModel(pred_cfg)
 predictor.save_pretrained("checkpoints/predictor")
 
 # Decoder: causal token transformer with a 96-token sliding window
 dec_cfg = DecoderConfig.from_encoder(
-    enc_cfg, num_hidden_layers=2, sliding_window=96
+    enc_cfg, num_hidden_layers=4, sliding_window=96,
+    tie_embeddings=True, hint_every_layer=True,
 )
 decoder = DecoderModel(dec_cfg)
 decoder.save_pretrained("checkpoints/decoder")
@@ -162,7 +165,12 @@ directory produced by `jepa.data.train_tokenizer`.
 directory. The collate function accepts pre-tokenized `input_ids` examples,
 so the FineWeb chunks are not tokenized again on every epoch.
 
-FineWeb chunks are long. The default is `--batch-size 32`; lower it if memory
+FineWeb chunks are long. The default is `--batch-size 24` (3 epochs, peak LR
+`6e-4`, set by `BATCH_SIZE` / `EPOCHS` / `LEARNING_RATE` in
+`jepa/training/train.py`; rescale the LR by about the square root of the batch
+ratio if you change the batch size). A checkpoint is written to `runs/jepa/`
+every `SAVE_EVERY_STEPS = 2000` steps and at each epoch end, so `verify` can be
+run on a partially trained model. Lower the batch size if memory
 runs out on a 24 GB L4 or 48 GB L40S.
 
 ## Training
@@ -179,7 +187,9 @@ transformer with a sliding window. Its loss only updates the decoder; the JEPA
 loss updates the encoder and predictor. The decoder sees the last
 `DECODER_SLIDING_WINDOW` tokens and a latent hint for the current `k`-token
 block: the real latent at the block start and the predictor's selected
-waypoint at the block end. At inference the waypoint is sampled from the
+waypoint at the block end. The hint is added to the token embeddings and, with
+`DECODER_HINT_EVERY_LAYER`, re-injected through a zero-initialized per-layer
+projection before every layer. At inference the waypoint is sampled from the
 predictor's scores.
 
 The learning rate warms up linearly over the first 1% of optimizer steps, then
@@ -205,7 +215,13 @@ checkpoints in `runs/jepa/encoder`, `runs/jepa/predictor`, and `runs/jepa/decode
 | `USE_AMP` | `True` | Runs the model forward under `torch.autocast`. On an L4/Ada GPU, `AMP_DTYPE="auto"` selects **bf16** (no gradient scaler needed). Falls back to fp16 with a scaler, and is disabled on CPU/MPS. |
 | `COMPILE_MODEL` | `True` | Wraps the model in `torch.compile(..., dynamic=True)`. Compilation is amortized over a full run. If the backend fails, `suppress_errors` falls back to eager instead of aborting. |
 | `COMPILE_MODE` | `"default"` | Passed to `torch.compile`; `"max-autotune"` can be faster but has a much longer warm-up. |
-| `DECODER_HIDDEN_LAYERS` | `2` | Depth of the autoregressive token decoder. |
+| `PREDICTOR_CONTEXT_WINDOW` | `0` | The predictor's candidate slots and score head attend to the last `W` encoder latents `z_{t-W+1..t}` (extra non-causal tokens with a learned offset embedding; missing positions at the sequence start are masked). `0` = only `z_t`. Superseded by the trunk: with `PREDICTOR_TRUNK_LAYERS > 0` the trunk already carries the temporal context. |
+| `PREDICTOR_TRUNK_LAYERS` | `6` | Causal transformer layers over the latent sequence, run before the per-position candidate head. Each position then sees the whole prefix through attention (temporal RoPE, fused causal SDPA). `0` = the legacy position-independent predictor. |
+| `PREDICTOR_HIDDEN_LAYERS` | `2` | Layers of the candidate head (the expansion slots, not time steps). |
+| `PREDICTOR_PREDICTION_COUNT` | `8` | Candidate futures per position. The old value was 24, but analysis found only ~5 distinct candidate groups. |
+| `DECODER_HIDDEN_LAYERS` | `4` | Depth of the autoregressive token decoder. |
+| `DECODER_TIE_EMBEDDINGS` | `True` | Share the decoder's token embedding with its `lm_head`. The encoder keeps a separate table, so the decoder loss cannot update the encoder. |
+| `DECODER_HINT_EVERY_LAYER` | `True` | Re-inject the latent hint before every decoder layer through a zero-initialized `Linear` (start equivalent to input-only injection). |
 | `DECODER_SLIDING_WINDOW` | `96` | Number of past tokens visible to each decoder position. Lower it for cheaper generation; the latent hints carry longer-range semantics. |
 | `DECODER_LOSS_CHUNK_SIZE` | `256` | Computes the token loss in position chunks so the full `(B, S, vocab)` logits tensor is never materialized. Mathematically identical; set to `None` to disable. |
 | `PAD_TO_MULTIPLE_OF` | `64` | Right-pads each batch to a tensor-core-friendly length and limits the number of compiled shapes. |

@@ -19,4 +19,8 @@ if [ -f "$VENV/bin/activate" ]; then
     source "$VENV/bin/activate"
 fi
 
+# Grow allocator segments instead of fragmenting fixed blocks; avoids
+# near-OOM allocator thrashing with the dynamic-shape batches.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 python -u -m jepa train "$@"

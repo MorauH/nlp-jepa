@@ -56,8 +56,11 @@ DEFAULT_OUTPUT_DIR = DEFAULT_DECODER_RUN_DIR
 # Decoder / training shape
 # ---------------------------------------------------------------------------
 MODEL_MAX_LENGTH = 1024
-DECODER_HIDDEN_LAYERS = 2
+# Kept in sync with jepa/training/train.py (see the comments there).
+DECODER_HIDDEN_LAYERS = 4
 DECODER_SLIDING_WINDOW = 96
+DECODER_TIE_EMBEDDINGS = True
+DECODER_HINT_EVERY_LAYER = True
 DECODER_LOSS_CHUNK_SIZE = 256
 PAD_TO_MULTIPLE_OF = 64
 
@@ -144,6 +147,8 @@ def build_decoder_model(args: argparse.Namespace) -> JepaDecodeModel:
         encoder.config,
         num_hidden_layers=DECODER_HIDDEN_LAYERS,
         sliding_window=DECODER_SLIDING_WINDOW,
+        tie_embeddings=DECODER_TIE_EMBEDDINGS,
+        hint_every_layer=DECODER_HINT_EVERY_LAYER,
     )
     config = JepaConfig.from_encoder(
         encoder.config,

@@ -30,7 +30,8 @@ class DecoderModel(PreTrainedModel):
     ``z_t`` (the latent at the block start) and ``z_future`` (the latent at the
     block end). The hint is added to every token embedding in the block, so the
     token transformer keeps the grammar while the latent supplies the semantic
-    waypoint.
+    waypoint.  With ``DecoderConfig.hint_every_layer`` it is also re-injected
+    (through a zero-initialized per-layer projection) before every layer.
     """
 
     config_class = DecoderConfig
@@ -56,11 +57,38 @@ class DecoderModel(PreTrainedModel):
         self.norm = RMSNorm(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # Optional per-layer hint injection.  Zero-initialized so a fresh model
+        # is exactly equivalent to input-only injection and the projections
+        # only pick up a signal when the hint is useful.
+        if config.hint_every_layer:
+            self.hint_proj = nn.ModuleList(
+                [
+                    nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+                    for _ in range(config.num_hidden_layers)
+                ]
+            )
+            for projection in self.hint_proj:
+                nn.init.zeros_(projection.weight)
+        else:
+            self.hint_proj = None
+
+        # Optional input/output embedding tying.  Declare the mapping so HF's
+        # save/load deduplicates the shared tensor instead of failing on it.
+        self.tie_embeddings = config.tie_embeddings
+        if self.tie_embeddings:
+            self._tied_weights_keys = {"lm_head.weight": "embedding.weight"}
+
         self.post_init()
+
+        if self.tie_embeddings:
+            # ``post_init`` already ties via ``config.tie_word_embeddings``, but
+            # assign explicitly so sharing does not depend on HF internals.
+            self.lm_head.weight = self.embedding.weight
 
     def _init_weights(self, module):
         # The decoder has no custom-initialized head that must survive
-        # post_init; keep the constructor initialization.
+        # post_init; keep the constructor initialization.  This also keeps the
+        # zero-initialized per-layer hint projections at zero.
         return
 
     def _hint(self, z_t, z_future):
@@ -83,7 +111,13 @@ class DecoderModel(PreTrainedModel):
                 hidden_states.dtype
             ).min
 
-        for decoder in self.decoders:
+        for index, decoder in enumerate(self.decoders):
+            if self.hint_proj is not None:
+                # Re-inject the hint right before each layer so it does not
+                # have to survive the whole residual stream.  Shared by the
+                # training forward and generate() because both go through
+                # here.
+                hidden_states = hidden_states + self.hint_proj[index](hint)
             hidden_states = decoder(
                 hidden_states,
                 rope_rotations,

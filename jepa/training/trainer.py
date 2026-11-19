@@ -58,6 +58,7 @@ class JepaTrainer:
         pad_to_multiple_of: int = 64,
         log_every: int = 10,
         right_padded: bool = False,
+        save_every_steps: int | None = None,
     ):
         # Keep an uncompiled reference: ``torch.compile`` wraps the module and
         # prefixes state-dict keys with ``_orig_mod.``, so checkpoints must be
@@ -81,6 +82,12 @@ class JepaTrainer:
         self.decoder_loss_chunk_size = decoder_loss_chunk_size
         self.pad_to_multiple_of = pad_to_multiple_of
         self.log_every = max(1, int(log_every))
+        # Also checkpoint every N optimizer steps (not only at epoch end), so
+        # a crash/timeout loses at most N steps and `verify` can be run on a
+        # partially trained model.  None or 0 disables mid-epoch saves.
+        self.save_every_steps = (
+            int(save_every_steps) if save_every_steps else None
+        )
 
         # Set True when the tokenizer pads on the right (jepa/training/train.py does).
         # For right-aligned padding, a causal encoder never lets a real token
@@ -342,6 +349,7 @@ class JepaTrainer:
             )
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         self.model.train()
+        global_step = 0
 
         for epoch in range(num_epochs):
             batch_sampler = getattr(train_loader, "batch_sampler", None)
@@ -408,6 +416,32 @@ class JepaTrainer:
                         lr=f"{scheduler.get_last_lr()[0]:.2e}",
                     )
 
+                global_step += 1
+                if (
+                    self.save_every_steps
+                    and global_step % self.save_every_steps == 0
+                ):
+                    mean_loss, mean_jepa, mean_decoder = (
+                        running / n_batches
+                    ).tolist()
+                    # Epoch-level history stays untouched; this records where
+                    # the mid-epoch checkpoint was taken and the running
+                    # train losses at that point.
+                    self.history["last_checkpoint"] = {
+                        "epoch": epoch + 1,
+                        "epoch_step": n_batches,
+                        "global_step": global_step,
+                        "total_steps": total_steps,
+                        "train_loss": mean_loss,
+                        "train_jepa_loss": mean_jepa,
+                        "train_decoder_loss": mean_decoder,
+                    }
+                    pbar.write(
+                        f"step {global_step}/{total_steps}: saving checkpoint "
+                        f"to {args.output_dir}"
+                    )
+                    self._save(args.output_dir)
+
             mean_loss, mean_jepa, mean_decoder = (
                 running / max(1, n_batches)
             ).tolist()
@@ -452,6 +486,13 @@ class JepaTrainer:
                 )
 
             print(f"Saving to {args.output_dir}.")
+            self.history["last_checkpoint"] = {
+                "epoch": epoch + 1,
+                "epoch_step": n_batches,
+                "global_step": global_step,
+                "total_steps": total_steps,
+                "end_of_epoch": True,
+            }
             self._save(args.output_dir)
         return self.history
 
