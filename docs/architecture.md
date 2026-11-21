@@ -57,6 +57,7 @@ predictor = PredictorModel(pred_cfg)
 predictor.save_pretrained("checkpoints/predictor")
 
 # Decoder: causal token transformer with a 96-token sliding window
+# (jepa/training/train.py uses 32)
 dec_cfg = DecoderConfig.from_encoder(
     enc_cfg, num_hidden_layers=4, sliding_window=96,
     tie_embeddings=True, hint_every_layer=True,
@@ -166,7 +167,7 @@ directory. The collate function accepts pre-tokenized `input_ids` examples,
 so the FineWeb chunks are not tokenized again on every epoch.
 
 FineWeb chunks are long. The default is `--batch-size 24` (3 epochs, peak LR
-`6e-4`, set by `BATCH_SIZE` / `EPOCHS` / `LEARNING_RATE` in
+set by `LEARNING_RATE`, from `BATCH_SIZE` / `EPOCHS` / `LEARNING_RATE` in
 `jepa/training/train.py`; rescale the LR by about the square root of the batch
 ratio if you change the batch size). A checkpoint is written to `runs/jepa/`
 every `SAVE_EVERY_STEPS = 2000` steps and at each epoch end, so `verify` can be
@@ -175,8 +176,11 @@ runs out on a 24 GB L4 or 48 GB L40S.
 
 ## Training
 
-`jepa/training/trainer.py` contains `JepaTrainer`, a minimal training loop. It computes
-both objectives in one backward pass:
+`jepa/training/trainer.py` contains `JepaTrainer`, the single training loop used
+by both entry points (`train` and `train-decoder`). Its knobs are a small
+`TrainConfig` dataclass (output directory, batch size, epochs, LR, weight
+decay, seed, device); everything else is a module-level constant in
+`jepa/training/train.py`. It computes both objectives in one backward pass:
 
 ```
 loss = jepa_loss_weight * jepa["loss"] + decoder_loss_weight * decoder_out["loss"]
@@ -184,13 +188,23 @@ loss = jepa_loss_weight * jepa["loss"] + decoder_loss_weight * decoder_out["loss
 
 The decoder is fed detached hints and trained as an autoregressive token
 transformer with a sliding window. Its loss only updates the decoder; the JEPA
-loss updates the encoder and predictor. The decoder sees the last
+loss updates the encoder and predictor. When the model is frozen
+(`JepaDecodeModel.freeze_jepa()`), its forward returns no JEPA loss and the same
+loop optimizes the decoder loss alone. The decoder sees the last
 `DECODER_SLIDING_WINDOW` tokens and a latent hint for the current `k`-token
 block: the real latent at the block start and the predictor's selected
 waypoint at the block end. The hint is added to the token embeddings and, with
 `DECODER_HINT_EVERY_LAYER`, re-injected through a zero-initialized per-layer
 projection before every layer. At inference the waypoint is sampled from the
 predictor's scores.
+
+During training the block-end waypoint is the **hindsight-best** candidate
+(the one closest to the real future latent) with probability
+`DECODER_HINDSIGHT_PROB` (default `1.0`), else the score-selected one. The
+hindsight choice carries information about the actual continuation, so the
+decoder learns to use the hint; it is still a predictor output, so it does not
+leak the block's last token the way the raw block-end latent would. Validation
+always uses the score-selected waypoint (the inference condition).
 
 The learning rate warms up linearly over the first 1% of optimizer steps, then
 decays with a cosine schedule to 10% of the base LR. The current LR is shown in
@@ -206,9 +220,50 @@ python -m jepa train
 It writes the full checkpoint to `runs/jepa/`, plus standalone component
 checkpoints in `runs/jepa/encoder`, `runs/jepa/predictor`, and `runs/jepa/decoder`.
 
+### Training modes
+
+| Mode | Command | Trains | Decoder |
+| --- | --- | --- | --- |
+| Joint | `python -m jepa train` | encoder + predictor + decoder | trained on the moving hints |
+| JEPA only | `python -m jepa train --jepa-only` | encoder + predictor | never run; saved unchanged |
+| Decoder only | `python -m jepa train-decoder` | decoder (fresh; `--resume` keeps the saved one) | trained on frozen hints |
+
+`--jepa-only` (`JepaDecodeModel.skip_decoder()`) returns no decoder output from
+the forward, so the decoder and its `lm_head` never run (about 25% faster per
+step) and only JEPA losses are logged. The checkpoint keeps its decoder
+unchanged (random for a fresh run), so the usual two-stage workflow is
+`train --jepa-only` followed by `train-decoder`: the decoder then trains on
+the final, stable hints from its first step instead of on the noisy hints of
+an untrained encoder/predictor. `--jepa-only` combines with `--resume`.
+
+### Decoder-only training
+
+`python -m jepa train-decoder` adapts a fresh decoder to an existing checkpoint.
+It loads the encoder and predictor from `--model-dir`, freezes them
+(no gradients, kept in eval mode, encoder/predictor forward under
+`torch.no_grad()`), attaches a new decoder and runs the same `JepaTrainer` in
+frozen mode. AMP, `torch.compile`, the warmup+cosine schedule, length-bucketed
+loaders, the chunked decoder loss and mid-epoch/last-epoch saves are therefore
+identical to `train`.
+
+```bash
+python -m jepa train-decoder
+```
+
+By default it reads and writes `runs/jepa` (`--model-dir` / `--output-dir`):
+the checkpoint is rewritten with the unchanged frozen encoder/predictor and
+the new decoder, replacing the jointly trained one, and stays usable with
+`generate`. Its loss history goes to `history_decoder.json` (decoder keys
+only), so the joint run's `history.json`, which `train --resume` reads, is
+kept. Decoder-only defaults are `--batch-size 24`,
+`--lr 6e-4`, `--epochs 1` (the `DECODER_*` constants in
+`jepa/training/train_decoder.py`); the shared shape/performance constants come
+from `jepa/training/train.py`.
+
 ### Performance knobs
 
-`jepa/training/train.py` exposes the main throughput switches:
+`jepa/training/train.py` exposes the main throughput switches (both commands use
+them):
 
 | Setting | Default | Effect |
 | --- | --- | --- |
@@ -222,7 +277,10 @@ checkpoints in `runs/jepa/encoder`, `runs/jepa/predictor`, and `runs/jepa/decode
 | `DECODER_HIDDEN_LAYERS` | `4` | Depth of the autoregressive token decoder. |
 | `DECODER_TIE_EMBEDDINGS` | `True` | Share the decoder's token embedding with its `lm_head`. The encoder keeps a separate table, so the decoder loss cannot update the encoder. |
 | `DECODER_HINT_EVERY_LAYER` | `True` | Re-inject the latent hint before every decoder layer through a zero-initialized `Linear` (start equivalent to input-only injection). |
-| `DECODER_SLIDING_WINDOW` | `96` | Number of past tokens visible to each decoder position. Lower it for cheaper generation; the latent hints carry longer-range semantics. |
+| `PREDICTOR_NORMALIZE_CANDIDATES` | `True` | RMS-normalize every candidate to the encoder-latent scale (norm ≈ √hidden). The loss compares directions only, so otherwise unused slots drift to huge norms where their gradient vanishes (an earlier run kept only 2 of 8 slots alive). |
+| `VISREG_MH_TEMPERATURE_START` / `VISREG_MH_ANNEAL_FRACTION` | `1.0` / `0.3` | Annealed winner-takes-all: the assignment temperature starts soft (every slot shares every target) and decays geometrically to `mh_temperature` (0.1) over the first 30% of steps. Driven by the trainer through a buffer, so `torch.compile` does not recompile. |
+| `VISREG_DIVERSITY_MARGIN` | `0.5` | Only candidate pairs with cosine above the margin (near-duplicates) are penalized, so a slot gains nothing by pointing orthogonal to everything. |
+| `DECODER_SLIDING_WINDOW` | `32` | Number of past tokens visible to each decoder position. Kept short so the decoder relies on the latent hints for longer-range semantics (at 96 it learned to ignore them). |
 | `DECODER_LOSS_CHUNK_SIZE` | `256` | Computes the token loss in position chunks so the full `(B, S, vocab)` logits tensor is never materialized. Mathematically identical; set to `None` to disable. |
 | `PAD_TO_MULTIPLE_OF` | `64` | Right-pads each batch to a tensor-core-friendly length and limits the number of compiled shapes. |
 | `LENGTH_BUCKET_WINDOW` | `100` | Training batches are built by sorting within windows of 100 batches (`jepa/training/data.py`), so each batch holds similarly long chunks. Cuts padding from ~1.5x to ~1.04x on the FineWeb chunks. |

@@ -152,6 +152,11 @@ class PredictorConfig(TransformerConfig):
     per-position predictor (same parameters and state-dict keys); ``> 0``
     lets each position read the whole prefix through attention, which makes
     ``context_window`` redundant.
+
+    ``normalize_candidates`` RMS-normalizes every candidate to the encoder
+    latent scale.  The multi-hypothesis loss compares directions only, so the
+    candidate norm is otherwise unconstrained, and slots that drift to large
+    norms stop receiving gradient.
     """
 
     model_type = "jepa_predictor"
@@ -162,6 +167,7 @@ class PredictorConfig(TransformerConfig):
         prediction_count: int = 16,
         context_window: int = 0,
         trunk_layers: int = 0,
+        normalize_candidates: bool = False,
         pad_token_id: int | None = None,
         is_causal: bool = False,
         **kwargs,
@@ -175,6 +181,9 @@ class PredictorConfig(TransformerConfig):
         self.prediction_count = prediction_count
         # Number of past latents (ending at z_t) appended as context tokens.
         self.context_window = context_window
+        # RMS-normalize each candidate (z_t + delta) to the encoder-latent
+        # scale.  False keeps the legacy, unbounded candidate norm.
+        self.normalize_candidates = normalize_candidates
         # Causal transformer layers over the latent sequence, run before the
         # candidate head.  0 = legacy, position-independent predictor.
         self.trunk_layers = trunk_layers
@@ -312,7 +321,10 @@ class VISRegConfig(PretrainedConfig):
         move_w: float = 1.0,
         score_w: float = 0.1,
         diversity_w: float = 0.01,
+        diversity_margin: float = 0.0,
         mh_temperature: float = 0.1,
+        mh_temperature_start: float | None = None,
+        mh_anneal_fraction: float = 0.3,
         mh_eps: float = 0.05,
         normalize_distance: bool = True,
         eps: float = 1e-4,
@@ -328,8 +340,21 @@ class VISRegConfig(PretrainedConfig):
         self.score_w = score_w
         # Weight of the pairwise candidate-diversity penalty.
         self.diversity_w = diversity_w
+        # Only candidate pairs with cosine above this margin are penalized
+        # (near-duplicates).  0.0 = legacy: any positive cosine is penalized,
+        # which lets unused slots "hide" by pointing orthogonal to everything.
+        self.diversity_margin = diversity_margin
         # Soft-assignment temperature, relative to the mean candidate distance.
+        # With annealing this is the final value.
         self.mh_temperature = mh_temperature
+        # Annealed winner-takes-all: when set, the temperature multiplier
+        # starts here and decays geometrically to ``mh_temperature`` over the
+        # first ``mh_anneal_fraction`` of training (driven by the trainer via
+        # ``VISRegLoss.set_anneal_progress``).  A high start shares every
+        # target across all slots so each slot finds a region before they
+        # specialize.  None = no annealing (legacy constant temperature).
+        self.mh_temperature_start = mh_temperature_start
+        self.mh_anneal_fraction = mh_anneal_fraction
         # Uniform smoothing of the soft assignment (relaxed WTA).
         self.mh_eps = mh_eps
         # Compare unit-normalized latents instead of raw L2 distance.
@@ -356,6 +381,12 @@ class VISRegConfig(PretrainedConfig):
             raise ValueError("mh_temperature must be positive")
         if self.mh_eps is None or not 0.0 <= self.mh_eps <= 1.0:
             raise ValueError("mh_eps must be in [0, 1]")
+        if self.mh_temperature_start is not None and self.mh_temperature_start <= 0:
+            raise ValueError("mh_temperature_start must be positive (or None)")
+        if self.mh_anneal_fraction is None or not 0.0 < self.mh_anneal_fraction <= 1.0:
+            raise ValueError("mh_anneal_fraction must be in (0, 1]")
+        if self.diversity_margin is None or not -1.0 <= self.diversity_margin < 1.0:
+            raise ValueError("diversity_margin must be in [-1, 1)")
         return self
 
 

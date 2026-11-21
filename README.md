@@ -97,13 +97,23 @@ python -m jepa train                  # prepared FineWeb-Edu chunks
 python -m jepa train --resume         # continue from runs/jepa
 ```
 
-For decoder-only fine-tuning against a frozen encoder and predictor:
+For decoder-only fine-tuning against a frozen encoder and predictor (same
+trainer, AMP, compile and checkpoint machinery as `train`, minus the JEPA loss):
 
 ```bash
-python -m jepa train-decoder \
-    --model-dir runs/jepa \
-    --output-dir runs/jepa-decoder
+python -m jepa train-decoder    # reads and writes runs/jepa
 ```
+
+Two-stage training (decoder trained only once the hints are stable):
+
+```bash
+python -m jepa train --jepa-only   # encoder + predictor; the decoder is never run
+python -m jepa train-decoder       # fresh decoder on the frozen encoder/predictor
+python -m jepa train-decoder --resume --epochs 2   # keep training that decoder
+```
+
+It replaces the decoder in `runs/jepa` (encoder/predictor stay unchanged) and
+logs to `runs/jepa/history_decoder.json`, leaving the joint `history.json`.
 
 ## Generation
 

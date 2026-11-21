@@ -1,5 +1,5 @@
 """Training loops, batching, and optimizer helpers."""
 
-from .trainer import JepaTrainer
+from .trainer import JepaTrainer, TrainConfig
 
-__all__ = ["JepaTrainer"]
+__all__ = ["JepaTrainer", "TrainConfig"]

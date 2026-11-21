@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from ..config import JepaConfig
 from .decoder import DecoderModel
@@ -47,6 +48,43 @@ def select_waypoints(preds, scores):
     ).squeeze(2)
 
 
+def hindsight_waypoints(preds, target, normalize: bool = True):
+    """Select the candidate closest to the real future latent ("hindsight").
+
+    ``preds`` is ``(batch, positions, prediction_count, hidden)`` and
+    ``target`` the real ``(batch, positions, hidden)`` latents ``k`` steps
+    ahead.  Uses the same distance as the multi-hypothesis loss (cosine-style
+    when ``normalize``).  The result is still a predictor output, so feeding it
+    to the decoder carries information about the actual future without leaking
+    the raw block-end latent (which contains the last target token).
+    """
+    if normalize:
+        preds_cmp = F.normalize(preds.float(), dim=-1)
+        target_cmp = F.normalize(target.float(), dim=-1)
+        best = torch.einsum("btpd,btd->btp", preds_cmp, target_cmp).argmax(-1)
+    else:
+        best = (preds.float() - target.float().unsqueeze(2)).pow(2).sum(-1).argmin(-1)
+    return preds.gather(
+        2, best[..., None, None].expand(-1, -1, 1, preds.shape[-1])
+    ).squeeze(2)
+
+
+def mix_waypoints(selected, hindsight, hindsight_prob: float):
+    """Per position, use ``hindsight`` with probability ``hindsight_prob``.
+
+    ``1.0`` always uses the hindsight-best candidate, ``0.0`` always the
+    score-selected one (the inference condition).  Mixing per base position
+    means each decoder block gets one or the other, since a block's hint is
+    read from its block-start position.
+    """
+    if hindsight_prob >= 1.0:
+        return hindsight
+    if hindsight_prob <= 0.0:
+        return selected
+    use = torch.rand(selected.shape[:2], device=selected.device) < hindsight_prob
+    return torch.where(use.unsqueeze(-1), hindsight, selected)
+
+
 class JepaDecodeModel(JepaModel):
     """JEPA encoder/predictor plus the autoregressive decoder.
 
@@ -61,6 +99,7 @@ class JepaDecodeModel(JepaModel):
     against a frozen encoder/predictor::
 
         model = JepaDecodeModel(config, encoder=encoder, predictor=predictor)
+        model.freeze_jepa()
     """
 
     config_class = JepaConfig
@@ -77,7 +116,96 @@ class JepaDecodeModel(JepaModel):
 
         self.decoder = decoder if decoder is not None else DecoderModel(config.decoder)
 
+        # Probability that a decoder block is trained on the hindsight-best
+        # candidate (closest to the real future) instead of the score-selected
+        # one.  A runtime training knob set by the training script, not saved
+        # in the config; 0.0 = the original behaviour.  Only used in train
+        # mode: in eval mode the decoder always gets the score-selected
+        # waypoint, so validation measures the inference condition.
+        self.decoder_hindsight_prob = 0.0
+
+        # Decoder-only training (``freeze_jepa``): forward then runs the
+        # encoder/predictor under ``no_grad`` and computes no JEPA loss.
+        self.frozen_jepa = False
+        # JEPA-only training (``skip_decoder``): forward returns no decoder
+        # output, so the decoder is never run.
+        self.decoder_skipped = False
+
         self.post_init()
+
+    def freeze_jepa(self) -> None:
+        """Freeze the encoder/predictor for decoder-only training.
+
+        Their parameters stop requiring gradients, so the optimizer only sees
+        the decoder, and they stay in eval mode even when the trainer calls
+        ``model.train()``.  :meth:`forward` then skips the JEPA loss: the
+        hindsight waypoint comes from :func:`hindsight_waypoints` instead of
+        the loss's winner.
+        """
+        if self.decoder_skipped:
+            raise ValueError("freeze_jepa() and skip_decoder() leave nothing to train")
+        self.frozen_jepa = True
+        for module in (self.encoder, self.predictor):
+            module.requires_grad_(False)
+            module.eval()
+
+    def skip_decoder(self) -> None:
+        """Train only the encoder/predictor (JEPA loss); never run the decoder.
+
+        The decoder stays in the model (and in saved checkpoints) untouched:
+        its parameters stop requiring gradients, so the optimizer and gradient
+        clipping ignore it, and :meth:`forward` returns ``decoder_out=None`` in
+        training mode.  A decoder can be trained afterwards with
+        ``python -m jepa train-decoder``.  Generation is unaffected.
+        """
+        if self.frozen_jepa:
+            raise ValueError("freeze_jepa() and skip_decoder() leave nothing to train")
+        self.decoder_skipped = True
+        self.decoder.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.frozen_jepa:
+            # The trainer switches the whole model to train mode each epoch;
+            # the frozen backbone must stay in eval mode.
+            self.encoder.eval()
+            self.predictor.eval()
+        return self
+
+    @torch.no_grad()
+    def _frozen_jepa_forward(self, labels, attention_mask, right_padded):
+        """Encoder/predictor outputs without the VISReg loss (frozen mode).
+
+        Mirrors the training branch of :meth:`JepaModel.forward`; the loss is
+        pointless when neither encoder nor predictor can change.
+        """
+        latents = self._encode(labels, attention_mask, right_padded)
+        horizon = self.pred_horizon
+        if latents.shape[1] <= horizon:
+            raise ValueError(
+                f"sequence length ({latents.shape[1]}) must exceed "
+                f"pred_horizon ({horizon})"
+            )
+        preds, scores = self.predictor(
+            latents[:, :-horizon, :], return_all_timesteps=True
+        )
+        # The VISReg loss computes the same candidate-target distance in fp32
+        # (it disables autocast internally); matching that keeps the frozen and
+        # joint paths' decoder hints identical under bf16 autocast.
+        device_type = "cuda" if latents.is_cuda else "cpu"
+        with torch.autocast(device_type, enabled=False):
+            z_future = hindsight_waypoints(
+                preds,
+                latents[:, horizon:, :],
+                normalize=self.config.visreg.normalize_distance,
+            )
+        return {
+            "loss": None,
+            "latents": latents,
+            "preds": preds,
+            "scores": scores,
+            "z_future": z_future,
+        }
 
     def forward(
         self,
@@ -105,15 +233,22 @@ class JepaDecodeModel(JepaModel):
 
         Returns:
             Training: ``(jepa_out, decoder_out)`` where ``jepa_out`` contains the
-                      VISReg loss and ``decoder_out`` contains the token loss.
+                      VISReg loss (``None`` when the JEPA part is frozen) and
+                      ``decoder_out`` contains the token loss (``decoder_out``
+                      is ``None`` after :meth:`skip_decoder`).
             Inference: generated token ids of shape (batch, k).
         """
-        jepa_out = super().forward(
-            labels,
-            attention_mask=attention_mask,
-            training=training,
-            right_padded=right_padded,
-        )
+        if self.frozen_jepa and training:
+            jepa_out = self._frozen_jepa_forward(
+                labels, attention_mask, right_padded
+            )
+        else:
+            jepa_out = super().forward(
+                labels,
+                attention_mask=attention_mask,
+                training=training,
+                right_padded=right_padded,
+            )
 
         if not training:
             return self.decoder.generate(
@@ -125,13 +260,24 @@ class JepaDecodeModel(JepaModel):
                 top_k=top_k,
             )
 
+        if self.decoder_skipped:
+            return jepa_out, None
+
         # The decoder is trained on frozen predictor waypoints.  For each token
-        # position, the hint is the real latent at its block start and the
-        # predictor's selected waypoint at the block end.  Using the predictor
-        # here matches inference and avoids leaking the final target token.
+        # position, the hint is the real latent at its block start and a
+        # predictor candidate at the block end.  Using a predictor output (not
+        # the raw block-end latent) avoids leaking the final target token.
+        #
+        # In training, the candidate is the hindsight-best one (closest to the
+        # real future; ``jepa_out["z_future"]``) with probability
+        # ``decoder_hindsight_prob``, else the score-selected one.  The
+        # hindsight choice correlates with the actual continuation, so the
+        # decoder learns that the hint is informative instead of ignoring it.
         latents = jepa_out["latents"]
-        predicted_future = select_waypoints(
-            jepa_out["preds"], jepa_out["scores"]
+        selected = select_waypoints(jepa_out["preds"], jepa_out["scores"])
+        hindsight_prob = self.decoder_hindsight_prob if self.training else 0.0
+        predicted_future = mix_waypoints(
+            selected, jepa_out["z_future"], hindsight_prob
         ).detach()
         z_t, z_future = build_block_hints(
             latents,

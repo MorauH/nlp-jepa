@@ -4,6 +4,10 @@ Builds a :class:`jepa.JepaDecodeModel` from component configs and hands it to
 :class:`jepa.JepaTrainer`, which optimizes the VISReg (JEPA) loss and the
 decoder token loss together.
 
+This module owns the shared training constants and CLI helpers; the decoder-only
+entry point (`jepa/training/train_decoder.py`) imports them and runs the same
+trainer against a frozen stack.
+
 Run from the repository root::
 
     python -m jepa train
@@ -17,7 +21,7 @@ import json
 from pathlib import Path
 
 from datasets import load_from_disk
-from transformers import TrainingArguments, set_seed
+from transformers import set_seed
 
 from ..config import (
     DecoderConfig,
@@ -29,12 +33,16 @@ from ..config import (
 from ..data.tokenizer import load_tokenizer
 from ..models.stack import JepaDecodeModel
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
-from .trainer import JepaTrainer
+from .trainer import JepaTrainer, TrainConfig
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 OUTPUT_DIR = DEFAULT_RUN_DIR
+
+# --subset trains on this many examples (smoke test).
+SUBSET_TRAIN = 4
+SUBSET_VAL = 2
 
 # ---------------------------------------------------------------------------
 # Model shape
@@ -59,12 +67,30 @@ PREDICTOR_PREDICTION_COUNT = 8
 # 0 = only z_t.  The trunk already carries the temporal context, so a separate
 # window only adds tokens and activations.
 PREDICTOR_CONTEXT_WINDOW = 0
-PRED_HORIZON = 5
+# Tokens between z_t and the predicted latent, and the decoder's block length
+# (one waypoint per block).  At k=5 the latents became too smooth
+# (cos(z_t, z_t+5) ~0.90): the future was nearly copyable, only 2 of 8
+# candidates were used, and the waypoint added little beyond z_t.  A longer
+# horizon makes the future genuinely uncertain, which is what the candidates
+# and the waypoint hint are for.  Stored in the checkpoint config, so it only
+# applies to fresh models (`--resume` and `train-decoder` keep the saved k).
+PRED_HORIZON = 20
 
 # Deeper token decoder.  Its tables are tied (below) and the hint is injected
 # at every layer, so the extra depth buys grammar, not capacity in the tables.
 DECODER_HIDDEN_LAYERS = 4
-DECODER_SLIDING_WINDOW = 96
+# Past tokens visible to each decoder position.  Short on purpose: with 96
+# tokens of context the decoder learned to ignore the latent hint (verify:
+# predicted ~ shuffled hint), so a narrower window makes it lean on the hint
+# for anything beyond local grammar.
+DECODER_SLIDING_WINDOW = 32
+# Probability that a decoder block is trained on the hindsight-best predictor
+# candidate (closest to the real future) instead of the score-selected one.
+# The hindsight choice carries real information about the continuation, which
+# teaches the decoder to use the hint.  Validation always uses the
+# score-selected waypoint (the inference condition), so a train/val decoder
+# loss gap shows how much the decoder relies on the hint.  0.0 = old behaviour.
+DECODER_HINDSIGHT_PROB = 1.0
 # Share the decoder input embedding with the lm_head: one table instead of two
 # (the encoder keeps its own, so the decoder loss cannot touch the encoder).
 DECODER_TIE_EMBEDDINGS = True
@@ -78,11 +104,32 @@ VISREG_NUM_SLICES = 256
 VISREG_DIVERSITY_W = 0.5
 VISREG_SCORE_W = 1.0
 
+# Candidate-collapse fixes.  In the previous run only 2 of 8 slots were ever
+# used: the other 6 drifted to norms ~50x z_t (the loss compares directions,
+# so norm was free), where the gradient through the loss's normalization
+# vanishes; the diversity penalty let them hide orthogonal to everything; and
+# the sharp assignment gave them ~zero weight.
+# 1. Fix every candidate to the encoder-latent scale (architecture; saved in
+#    the predictor config).
+PREDICTOR_NORMALIZE_CANDIDATES = True
+# 2. Annealed winner-takes-all: the assignment-temperature multiplier starts
+#    at VISREG_MH_TEMPERATURE_START (every slot shares every target, so each
+#    finds a region) and decays geometrically to the final value (0.1, the
+#    VISRegConfig default) over the first VISREG_MH_ANNEAL_FRACTION of steps.
+VISREG_MH_TEMPERATURE_START = 1.0
+VISREG_MH_ANNEAL_FRACTION = 0.3
+# 3. Only penalize near-duplicate candidates (cosine above the margin), so an
+#    unused slot gains nothing by pointing orthogonal to everything.
+VISREG_DIVERSITY_MARGIN = 0.5
+# Items 2-3 are applied on resume too (like the weights above).
+
 # Relative weights of the two objectives in the backward pass.
 JEPA_LOSS_WEIGHT = 2.0
 DECODER_LOSS_WEIGHT = 1.0
 
 SEED = 42
+WEIGHT_DECAY = 0.01
+MAX_GRAD_NORM = 1.0
 
 # ---------------------------------------------------------------------------
 # Optimization
@@ -95,7 +142,9 @@ EPOCHS = 3
 # 3e-4 stable at batch 3-6; square-root scaling to batch 24 gives 6e-4.  We
 # stay at the conservative end (not 8e-4+) because the 6-layer predictor
 # trunk is new and untested.  Rescale (~sqrt) if you change BATCH_SIZE.
-LEARNING_RATE = 6e-4
+# 10 batch => 4e-4
+# 24 batch => 6e-4
+LEARNING_RATE = 4e-4
 
 # Save a checkpoint (full stack + components + history.json, overwriting
 # OUTPUT_DIR) every N optimizer steps, in addition to the end of each epoch.
@@ -135,21 +184,19 @@ LOG_EVERY = 10
 RIGHT_PADDED = True
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="python -m jepa train", description=__doc__
-    )
+def add_dataset_args(
+    parser: argparse.ArgumentParser,
+    *,
+    batch_size: int = BATCH_SIZE,
+    epochs: int = EPOCHS,
+) -> None:
+    """Add the data/batch/epoch flags shared with `train-decoder`."""
     parser.add_argument(
         "--fineweb-dir",
         type=Path,
         default=FINEWEB_DIR,
         help="Prepared token chunks to train on (the default). Produced by "
         "`python -m jepa prepare-data`.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help=f"Continue from the checkpoint in {OUTPUT_DIR}.",
     )
     parser.add_argument(
         "--subset",
@@ -161,15 +208,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=TOKENIZER_DIR,
         help="Tokenizer directory trained by `python -m jepa train-tokenizer`. "
-        "Must match the model when --resume is used.",
+        "Must match the checkpoint's vocabulary.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=BATCH_SIZE,
+        default=batch_size,
         help="LEARNING_RATE is tuned for the default; rescale it if you change this.",
     )
-    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--epochs", type=int, default=epochs)
+
+
+def load_training_tokenizer(tokenizer_dir: Path):
+    """Load the tokenizer and cap its sequence length at MODEL_MAX_LENGTH."""
+    tokenizer = load_tokenizer(tokenizer_dir)
+    tokenizer.model_max_length = min(
+        tokenizer.model_max_length or MODEL_MAX_LENGTH, MODEL_MAX_LENGTH
+    )
+    tokenizer("test")  # warm any encoding cache
+    return tokenizer
+
+
+def load_datasets(fineweb_dir: Path, subset: bool = False):
+    """Load the prepared train/validation chunks (a tiny slice for --subset)."""
+    if not fineweb_dir.is_dir():
+        raise FileNotFoundError(
+            f"{fineweb_dir} not found. "
+            "Run `python -m jepa prepare-data` first."
+        )
+    dataset = load_from_disk(str(fineweb_dir))
+    train_dataset = dataset["train"]
+    val_dataset = dataset["validation"]
+    if subset:
+        train_dataset = train_dataset.select(
+            range(min(SUBSET_TRAIN, len(train_dataset)))
+        )
+        val_dataset = val_dataset.select(range(min(SUBSET_VAL, len(val_dataset))))
+    return train_dataset, val_dataset
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m jepa train", description=__doc__
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=f"Continue from the checkpoint in {OUTPUT_DIR}.",
+    )
+    parser.add_argument(
+        "--jepa-only",
+        action="store_true",
+        help="Train only the encoder + predictor (JEPA loss); the decoder is "
+        "never run and is saved unchanged. Train it afterwards with "
+        "`python -m jepa train-decoder`.",
+    )
+    add_dataset_args(parser)
     return parser.parse_args(argv)
 
 
@@ -198,6 +292,7 @@ def build_model(tokenizer) -> JepaDecodeModel:
         trunk_layers=PREDICTOR_TRUNK_LAYERS,
         prediction_count=PREDICTOR_PREDICTION_COUNT,
         context_window=PREDICTOR_CONTEXT_WINDOW,
+        normalize_candidates=PREDICTOR_NORMALIZE_CANDIDATES,
     )
     decoder_config = DecoderConfig.from_encoder(
         encoder_config,
@@ -210,6 +305,9 @@ def build_model(tokenizer) -> JepaDecodeModel:
         num_slices=VISREG_NUM_SLICES,
         diversity_w=VISREG_DIVERSITY_W,
         score_w=VISREG_SCORE_W,
+        diversity_margin=VISREG_DIVERSITY_MARGIN,
+        mh_temperature_start=VISREG_MH_TEMPERATURE_START,
+        mh_anneal_fraction=VISREG_MH_ANNEAL_FRACTION,
     )
 
     config = JepaConfig.from_encoder(
@@ -227,20 +325,8 @@ def main(argv: list[str] | None = None) -> None:
     set_seed(SEED)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = load_tokenizer(args.tokenizer)
-    tokenizer.model_max_length = min(
-        tokenizer.model_max_length or MODEL_MAX_LENGTH, MODEL_MAX_LENGTH
-    )
-    tokenizer("test")  # warm any encoding cache
-
-    if not args.fineweb_dir.is_dir():
-        raise FileNotFoundError(
-            f"{args.fineweb_dir} not found. "
-            "Run `python -m jepa prepare-data` first."
-        )
-    dataset = load_from_disk(str(args.fineweb_dir))
-    train_dataset = dataset["train"]
-    val_dataset = dataset["validation"]
+    tokenizer = load_training_tokenizer(args.tokenizer)
+    train_dataset, val_dataset = load_datasets(args.fineweb_dir, args.subset)
     print(
         f"train examples: {len(train_dataset):,} | "
         f"val examples: {len(val_dataset):,}"
@@ -261,6 +347,13 @@ def main(argv: list[str] | None = None) -> None:
         model.criterion.score_w = VISREG_SCORE_W
         model.config.visreg.diversity_w = VISREG_DIVERSITY_W
         model.config.visreg.score_w = VISREG_SCORE_W
+        for name, value in (
+            ("diversity_margin", VISREG_DIVERSITY_MARGIN),
+            ("mh_temperature_start", VISREG_MH_TEMPERATURE_START),
+            ("mh_anneal_fraction", VISREG_MH_ANNEAL_FRACTION),
+        ):
+            setattr(model.criterion, name, value)
+            setattr(model.config.visreg, name, value)
         history_path = OUTPUT_DIR / "history.json"
         history = None
         if history_path.exists():
@@ -270,7 +363,20 @@ def main(argv: list[str] | None = None) -> None:
         model = build_model(tokenizer)
         history = None
 
+    # Runtime training knob (not saved in the config), so set it for both a
+    # fresh model and a resumed one.
+    model.decoder_hindsight_prob = DECODER_HINDSIGHT_PROB
+    if args.jepa_only:
+        model.skip_decoder()
+
     print("Model loaded")
+    if args.jepa_only:
+        print("Mode: JEPA only (encoder + predictor); the decoder is not run")
+    else:
+        print(
+            f"Decoder window: {model.decoder.sliding_window} | "
+            f"hindsight waypoint prob: {model.decoder_hindsight_prob}"
+        )
     print("Parameters:", f"{sum(p.numel() for p in model.parameters()):,}")
     print("  encoder:  ", f"{sum(p.numel() for p in model.encoder.parameters()):,}")
     print("  predictor:", f"{sum(p.numel() for p in model.predictor.parameters()):,}")
@@ -278,34 +384,22 @@ def main(argv: list[str] | None = None) -> None:
 
     # FineWeb chunks are long, so keep an eye on memory. For batch 20, raise
     # the LR to 6e-4-8e-4.
-    train_args = TrainingArguments(
-        output_dir=str(OUTPUT_DIR),
-        optim="adamw_torch",
-        eval_strategy="epoch",
-        learning_rate=LEARNING_RATE,
-        weight_decay=0.01,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        report_to=[],
-        seed=SEED,
-    )
-
-    N_TRAIN = 4
-    N_VAL = 2
-    train_subset = train_dataset.select(range(min(N_TRAIN, len(train_dataset))))
-    val_subset = val_dataset.select(range(min(N_VAL, len(val_dataset))))
-
     trainer = JepaTrainer(
         model=model,
-        args=train_args,
-        train_dataset=train_subset if args.subset else train_dataset,
-        eval_dataset=val_subset if args.subset else val_dataset,
-        processing_class=tokenizer,
+        config=TrainConfig(
+            output_dir=str(OUTPUT_DIR),
+            learning_rate=LEARNING_RATE,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            weight_decay=WEIGHT_DECAY,
+            seed=SEED,
+        ),
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=tokenizer,
         jepa_loss_weight=JEPA_LOSS_WEIGHT,
         decoder_loss_weight=DECODER_LOSS_WEIGHT,
-        max_grad_norm=1.0,
-        save_components=True,
+        max_grad_norm=MAX_GRAD_NORM,
         history=history,
         use_amp=USE_AMP,
         amp_dtype=AMP_DTYPE,

@@ -50,10 +50,49 @@ class VISRegLoss(nn.Module):
         self.move_w = config.move_w
         self.score_w = config.score_w
         self.diversity_w = config.diversity_w
+        self.diversity_margin = config.diversity_margin
         self.mh_temperature = config.mh_temperature
+        self.mh_temperature_start = config.mh_temperature_start
+        self.mh_anneal_fraction = config.mh_anneal_fraction
         self.mh_eps = config.mh_eps
         self.normalize_distance = config.normalize_distance
         self.eps = config.eps
+
+        # Current temperature multiplier.  A tensor buffer, not a Python
+        # float: torch.compile guards on float attributes and would recompile
+        # every step while it anneals, whereas buffer values are graph inputs.
+        # Non-persistent, so checkpoints are unchanged; it starts at the final
+        # value, which is what evaluation of a trained model should use.
+        self.register_buffer(
+            "mh_temperature_now",
+            torch.tensor(float(config.mh_temperature)),
+            persistent=False,
+        )
+
+    @torch.no_grad()
+    def reset_annealing(self) -> None:
+        """Set the temperature multiplier back to its final value.
+
+        Called after loading (see ``JepaModel._init_weights``): the buffer is
+        not saved, so a loaded model would otherwise hold uninitialized memory.
+        """
+        self.mh_temperature_now.fill_(float(self.mh_temperature))
+
+    @torch.no_grad()
+    def set_anneal_progress(self, progress: float) -> None:
+        """Set the annealed temperature for training progress in ``[0, 1]``.
+
+        Decays geometrically from ``mh_temperature_start`` to
+        ``mh_temperature`` over the first ``mh_anneal_fraction`` of training,
+        then stays at ``mh_temperature``.  No-op without annealing.
+        """
+        if self.mh_temperature_start is None:
+            return
+        t = min(1.0, max(0.0, progress / self.mh_anneal_fraction))
+        value = self.mh_temperature_start * (
+            self.mh_temperature / self.mh_temperature_start
+        ) ** t
+        self.mh_temperature_now.fill_(value)
 
     def _reg_terms(self, z):
         """Returns (scale, shape, center) losses for a single tensor."""
@@ -136,7 +175,9 @@ class VISRegLoss(nn.Module):
         # Adaptive temperature: relative differences stay usable even as the
         # overall distance shrinks during training.
         d_mean = (d.detach() * valid_f.unsqueeze(-1)).sum() / (denom * count)
-        temperature = (self.mh_temperature * d_mean).clamp_min(1e-6)
+        temperature = (
+            self.mh_temperature_now.to(d_mean.dtype) * d_mean
+        ).clamp_min(1e-6)
 
         # Relaxed winner-takes-all assignment.  The uniform smoothing keeps
         # every candidate alive instead of only the current winner.
@@ -155,8 +196,10 @@ class VISRegLoss(nn.Module):
         l_score = (l_score * valid_f).sum() / denom
 
         # Optional repulsion between candidates.  Off-diagonal cosine
-        # similarity is penalized only when positive, i.e. only when two
-        # candidates point in the same direction.
+        # similarity is penalized only above ``diversity_margin``, i.e. only
+        # for near-duplicates.  With margin 0 any positive cosine costs,
+        # and pointing orthogonal to everything becomes a free hiding place
+        # for unused slots.
         if self.diversity_w > 0 and count > 1:
             dirs = (
                 cand_cmp if self.normalize_distance
@@ -171,7 +214,9 @@ class VISRegLoss(nn.Module):
             sim = torch.bmm(dirs, dirs.transpose(1, 2))  # (N, P, P)
             off_diag = 1.0 - torch.eye(count, device=device, dtype=sim.dtype)
             mask_div = valid_f.reshape(-1, 1, 1)
-            l_div = (F.relu(sim) * off_diag * mask_div).sum() / (
+            l_div = (
+                F.relu(sim - self.diversity_margin) * off_diag * mask_div
+            ).sum() / (
                 (n_valid * count * (count - 1)).clamp_min(1)
             )
         else:

@@ -32,7 +32,7 @@ from .models.jepa import JepaModel
 from .models.losses import VISRegLoss
 from .models.predictor import PredictorModel
 from .models.stack import JepaDecodeModel
-from .training.trainer import JepaTrainer
+from .training.trainer import JepaTrainer, TrainConfig
 
 __all__ = [
     # Configs
@@ -52,4 +52,5 @@ __all__ = [
     "VISRegLoss",
     # Training
     "JepaTrainer",
+    "TrainConfig",
 ]

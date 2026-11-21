@@ -10,7 +10,6 @@ dependencies = [
   "pyarrow",
   "tokenizers",
   "tqdm",
-  "accelerate>=1.1.0",
 ]
 
 [tool.uv]

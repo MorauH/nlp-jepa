@@ -47,7 +47,24 @@ class JepaModel(PreTrainedModel):
     def _init_weights(self, module):
         # Sub-modules initialize themselves (and may have been loaded from a
         # checkpoint); re-initializing them here would discard that.
-        return
+        #
+        # Exception: the loss's non-persistent temperature buffer is not in
+        # the checkpoint, so with meta-device loading it comes back as
+        # uninitialized memory.  transformers calls this hook for exactly such
+        # modules, so restore the buffer's default value here.
+        if isinstance(module, VISRegLoss):
+            module.reset_annealing()
+
+    def _encode(self, labels, attention_mask, right_padded: bool):
+        """Encode tokens, dropping the padding mask when that is safe.
+
+        Dropping the mask is only valid for right-aligned padding *and* a
+        causal encoder: then no real query can see a pad key.
+        """
+        skip_mask = right_padded and self.encoder.config.is_causal
+        return self.encoder(
+            labels, attention_mask=None if skip_mask else attention_mask
+        )
 
     def forward(
         self,
@@ -74,11 +91,7 @@ class JepaModel(PreTrainedModel):
               inference: ``latents``, ``z_t``, ``preds``, ``scores``,
                          ``z_future``
         """
-        # Dropping the mask is only valid for right-aligned padding *and* a
-        # causal encoder: then no real query can see a pad key.
-        skip_mask = right_padded and self.encoder.config.is_causal
-        enc_mask = None if skip_mask else attention_mask
-        enc_hidden = self.encoder(labels, attention_mask=enc_mask)
+        enc_hidden = self._encode(labels, attention_mask, right_padded)
 
         k = self.pred_horizon
         seq_len = enc_hidden.shape[1]

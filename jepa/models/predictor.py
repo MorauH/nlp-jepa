@@ -395,6 +395,20 @@ class PredictorModel(PreTrainedModel):
 
         predictions = input_flat.unsqueeze(1) + pred_deltas  # (B*seq, prediction_count, target_dim)
 
+        if self.config.normalize_candidates:
+            # Fix every candidate to the encoder-latent scale (per-dim RMS 1,
+            # i.e. norm ~sqrt(target_dim)).  The loss compares directions only,
+            # so without this a candidate's norm is free; unused slots drifted
+            # to norms ~50x z_t, where the gradient through the loss's
+            # normalization (~1/norm) vanishes and they could never recover.
+            # No learnable gain: it would reintroduce the free scale.  Runs in
+            # fp32 for precise statistics, like the other norms.
+            predictions = F.rms_norm(
+                predictions.float(),
+                (target_dim,),
+                eps=self.config.rms_norm_eps,
+            ).to(predictions.dtype)
+
         if return_all_timesteps:
             return (
                 predictions.view(batch_size, seq_len, prediction_count, target_dim),

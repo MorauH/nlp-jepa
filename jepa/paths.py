@@ -18,4 +18,3 @@ FINEWEB_DIR = DATA_DIR / "fineweb_edu_500m_32k"
 
 RUNS_DIR = PROJECT_ROOT / "runs"
 DEFAULT_RUN_DIR = RUNS_DIR / "jepa"
-DEFAULT_DECODER_RUN_DIR = RUNS_DIR / "jepa-decoder"
