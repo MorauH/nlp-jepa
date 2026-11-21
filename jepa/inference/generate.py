@@ -51,7 +51,9 @@ def sample_direction(
     """Sample one candidate per batch row from ``scores``.
 
     candidates: (batch, prediction_count, target_dim)
-    scores:     (batch, prediction_count) logits
+    scores:     (batch, prediction_count) negated predicted distances, so
+                ``temperature`` is in distance units (differences are small;
+                try ~0.02-0.1).  0 picks the smallest predicted distance.
     Returns:    (batch, target_dim)
     """
     if temperature <= 0:
@@ -80,7 +82,7 @@ def generate(
     *,
     temperature: float = 0.8,
     top_k: int | None = 50,
-    direction_temperature: float = 1.0,
+    direction_temperature: float = 0.0,
     direction_top_k: int | None = 0,
     device: torch.device,
 ) -> tuple[str, list[int]]:
@@ -115,8 +117,7 @@ def generate(
         latents = model.encoder(enc_ids)
         z_t = latents[:, -1, :]
 
-        # Pass the whole latent sequence: the predictor reads z_t from the
-        # last position and its context window from the ones before it.
+        # The predictor reads only the last latent (z_t).
         candidates, scores = model.predictor(latents, return_all_timesteps=False)
         z_future = sample_direction(
             candidates,
@@ -173,8 +174,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--direction-temperature",
         type=float,
-        default=1.0,
-        help="Temperature for sampling a future direction; 0 means greedy.",
+        default=0.0,
+        help="Temperature for sampling a future direction, in units of "
+        "predicted distance (try 0.02-0.1); 0 picks the candidate with the "
+        "smallest predicted distance.",
     )
     parser.add_argument(
         "--direction-top-k",

@@ -53,20 +53,14 @@ INTERMEDIATE_SIZE = 896
 NUM_ATTENTION_HEADS = 8
 NUM_HIDDEN_LAYERS = 8
 
-# Shared causal trunk over the latent sequence, run before the per-position
-# candidate head.  Six layers let every position read the whole prefix through
-# attention, so the predictor is no longer limited to z_t (or a fixed window).
-PREDICTOR_TRUNK_LAYERS = 6
-# Layers of the candidate head itself (expansion slots only, not time steps).
+# The predictor reads only z_t: the causal encoder already summarizes the
+# prefix there, and a trunk over past latents let the predictor do the
+# encoder's job.  Layers of the candidate head (expansion slots, not time).
 PREDICTOR_HIDDEN_LAYERS = 2
 # Candidate futures per position.  Analysis of the old 24-candidate head found
 # only ~5 distinct candidate groups, so 8 keeps the useful diversity at a third
 # of the head's slot/score cost.
 PREDICTOR_PREDICTION_COUNT = 8
-# Past latents z_{t-W+1..t} the predictor slots (and score head) attend to.
-# 0 = only z_t.  The trunk already carries the temporal context, so a separate
-# window only adds tokens and activations.
-PREDICTOR_CONTEXT_WINDOW = 0
 # Tokens between z_t and the predicted latent, and the decoder's block length
 # (one waypoint per block).  At k=5 the latents became too smooth
 # (cos(z_t, z_t+5) ~0.90): the future was nearly copyable, only 2 of 8
@@ -99,7 +93,8 @@ DECODER_TIE_EMBEDDINGS = True
 # extension of input-only injection.
 DECODER_HINT_EVERY_LAYER = True
 VISREG_NUM_SLICES = 256
-# Push the predictor candidates apart and make the score head discriminative.
+# Push the predictor candidates apart.  VISREG_SCORE_W weights the value head's
+# distance regression (MSE on cosine-style distances in [0, 4]).
 # These are applied on resume too, so old checkpoints pick up the new weights.
 VISREG_DIVERSITY_W = 0.5
 VISREG_SCORE_W = 1.0
@@ -140,8 +135,8 @@ BATCH_SIZE = 24
 EPOCHS = 3
 # Peak AdamW LR (1% linear warmup, cosine decay to 10%).  Earlier runs found
 # 3e-4 stable at batch 3-6; square-root scaling to batch 24 gives 6e-4.  We
-# stay at the conservative end (not 8e-4+) because the 6-layer predictor
-# trunk is new and untested.  Rescale (~sqrt) if you change BATCH_SIZE.
+# stay at the conservative end (not 8e-4+).  Rescale (~sqrt) if you change
+# BATCH_SIZE.
 # 10 batch => 4e-4
 # 24 batch => 6e-4
 LEARNING_RATE = 4e-4
@@ -289,9 +284,7 @@ def build_model(tokenizer) -> JepaDecodeModel:
     predictor_config = PredictorConfig.from_encoder(
         encoder_config,
         num_hidden_layers=PREDICTOR_HIDDEN_LAYERS,
-        trunk_layers=PREDICTOR_TRUNK_LAYERS,
         prediction_count=PREDICTOR_PREDICTION_COUNT,
-        context_window=PREDICTOR_CONTEXT_WINDOW,
         normalize_candidates=PREDICTOR_NORMALIZE_CANDIDATES,
     )
     decoder_config = DecoderConfig.from_encoder(

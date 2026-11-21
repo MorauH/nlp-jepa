@@ -40,7 +40,8 @@ def select_waypoints(preds, scores):
     """Select the highest-scoring candidate at each base position.
 
     ``preds`` is ``(batch, positions, prediction_count, hidden)`` and
-    ``scores`` is ``(batch, positions, prediction_count)``.
+    ``scores`` is ``(batch, positions, prediction_count)``: negated predicted
+    distances, so this picks the smallest expected distance.
     """
     best = scores.argmax(dim=-1)
     return preds.gather(

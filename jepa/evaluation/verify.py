@@ -8,7 +8,8 @@ It loads a validation batch, runs the frozen encoder,
 and reports:
 
 * representation health (scale, mean, effective rank, temporal cosine),
-* predictor candidate diversity and score-head calibration,
+* predictor candidate diversity and value-head fit (R^2 of the predicted
+  distances), selection vs. the best constant slot vs. the oracle,
 * the `win` histogram,
 * a teacher-forced hint ablation: predicted vs shuffled vs null vs raw
   block-end latent, overall and per block offset.
@@ -19,7 +20,6 @@ Expected ranges are printed alongside the results.
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 
 import torch
@@ -109,10 +109,12 @@ def flag_candidate_cos(value: float) -> str:
     return "WARN"
 
 
-def flag_score(value: float, log_p: float) -> str:
-    if value < log_p - 0.1:
+def flag_value_r2(value: float) -> str:
+    if value > 0.3:
         return "OK"
-    return "UNIFORM"
+    if value > 0.05:
+        return "WEAK"
+    return "UNINFORMATIVE"
 
 
 def flag_win(top_share: float, prediction_count: int) -> str:
@@ -192,7 +194,6 @@ def main(argv: list[str] | None = None) -> None:
 
     k = model.pred_horizon
     prediction_count = model.config.predictor.prediction_count
-    log_p = math.log(prediction_count)
     window = model.decoder.sliding_window
 
     print("=" * 78)
@@ -260,8 +261,12 @@ def main(argv: list[str] | None = None) -> None:
             candidate_cos = torch.ones((), device=device)
 
         best_d = distances.min(dim=-1).values[valid].mean()
-        score_std = scores.std()
-        loss_score = jepa_out["stats"]["loss_score"]
+        # Value head = regression of every candidate's distance.  R^2 against
+        # the true distances: 0 = no better than predicting the mean distance.
+        predicted_d = -scores.float()
+        true_d = distances.float()[valid]
+        value_mse = (predicted_d[valid] - true_d).pow(2).mean()
+        value_r2 = 1 - value_mse / true_d.var(unbiased=False).clamp_min(1e-12)
 
         print("\n--- representation health ---")
         print(
@@ -281,7 +286,7 @@ def main(argv: list[str] | None = None) -> None:
             f"[{flag_cos(float(temporal_cos.mean()))}; 0.5-0.85 healthy]"
         )
 
-        print("\n--- predictor / score head ---")
+        print("\n--- predictor / value head ---")
         print(
             f"candidate pair cos: {fmt(candidate_cos)}  "
             f"[{flag_candidate_cos(float(candidate_cos))}; <0.7 diverse]"
@@ -291,13 +296,10 @@ def main(argv: list[str] | None = None) -> None:
             f"[{flag_delta(float(delta.mean() / z_t.norm(dim=-1).mean()))}; >0.2 meaningful]"
         )
         print(f"best_d:             {fmt(best_d)}  [lower is better; <0.1 easy, >0.3 hard]")
+        print(f"value MSE:          {fmt(value_mse)}")
         print(
-            f"score logit std:    {fmt(score_std)}  "
-            "[>1 discriminative; <0.5 near uniform]"
-        )
-        print(
-            f"loss_score:         {fmt(loss_score)}  vs log(P)={fmt(log_p)}  "
-            f"[{flag_score(float(loss_score), log_p)}]"
+            f"value R^2:          {fmt(value_r2)}  "
+            f"[{flag_value_r2(float(value_r2))}; >0.3 informative]"
         )
 
         # ---------------------------------------------------------------
@@ -310,8 +312,14 @@ def main(argv: list[str] | None = None) -> None:
             best_index[..., None, None].expand(-1, -1, 1, preds.shape[-1]),
         ).squeeze(2)
 
+        # Best constant slot: the single index with the lowest mean distance.
+        # A value head that cannot beat this is not selecting anything.
+        fixed_index = distances[valid].mean(dim=0).argmin()
+        fixed = preds[:, :, fixed_index, :]
+
         query_copy = z_t[valid]
         query_selected = selected[valid]
+        query_fixed = fixed[valid]
         query_oracle = oracle[valid]
         retrieval_keys = z_future[valid]
 
@@ -325,6 +333,7 @@ def main(argv: list[str] | None = None) -> None:
 
         d_copy = float(norm_distance(query_copy))
         d_selected = float(norm_distance(query_selected))
+        d_fixed = float(norm_distance(query_fixed))
         d_oracle = float(norm_distance(query_oracle))
 
         print("\n--- oracle vs selected waypoint ---")
@@ -336,6 +345,7 @@ def main(argv: list[str] | None = None) -> None:
         for name, query in (
             ("copy z_t", query_copy),
             ("selected", query_selected),
+            (f"fixed slot {int(fixed_index)}", query_fixed),
             ("oracle best", query_oracle),
         ):
             top1, top5, mean_rank, retrieval_pool = retrieval_metrics(
@@ -352,6 +362,14 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(f"oracle improvement over copy:   {fmt(d_copy - d_oracle)}")
         print(f"selected improvement over copy: {fmt(d_copy - d_selected)}")
+        print(
+            f"selected vs best fixed slot:    {fmt(d_fixed - d_selected)}  "
+            "[>0 = the value head beats a constant index]"
+        )
+        print(
+            f"oracle gain over fixed slot:    {fmt(d_fixed - d_oracle)}  "
+            "[small = multiple candidates barely help at this horizon]"
+        )
 
         oracle_good = d_oracle < d_copy - 0.1
         selected_good = d_selected < d_copy - 0.1
@@ -504,8 +522,8 @@ def main(argv: list[str] | None = None) -> None:
     print("candidate pair cos: <0.7 diverse; >0.9 candidates collapsed")
     print("delta/z:            >0.2 meaningful movement; <0.05 predictor copying")
     print("best_d:             lower is better; <0.1 easy, >0.3 hard")
-    print("score logit std:    >1 discriminative; <0.5 near uniform")
-    print("loss_score:         below log(P)-0.1 meaningful; near log(P) = uniform")
+    print("value R^2:          >0.3 informative; ~0 = no better than the mean distance")
+    print("selected vs fixed:  >0 value head beats the best constant slot")
     print("win share:          uniform ~1/P; >25% concentrated; >50% collapse")
     print("oracle vs selected: oracle << copy and selected ~ copy = scorer problem;")
     print("                    oracle and selected << copy = hint useful;")

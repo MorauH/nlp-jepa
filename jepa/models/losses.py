@@ -16,12 +16,14 @@ class VISRegLoss(nn.Module):
     VISReg regularization plus a multi-hypothesis prediction objective.
 
     The predictor returns a set of candidate latents with per-candidate
-    scores.  The single-prediction invariance term is replaced by:
+    scores (negated predicted distances).  The single-prediction invariance
+    term is replaced by:
 
     * a relaxed winner-takes-all move loss that pulls each target toward its
       nearest candidate (with a small uniform component so no candidate dies),
-    * a cross-entropy that trains the score head to predict the same soft
-      assignment from the candidate features alone,
+    * a value regression that trains the predictor to predict each
+      candidate's distance to the target from ``z_t`` alone, so selection
+      minimizes the expected distance,
     * an optional diversity penalty that stops candidates collapsing onto the
       same direction.
 
@@ -133,11 +135,14 @@ class VISRegLoss(nn.Module):
     def _multi_hypothesis_loss(
         self, candidates, target, scores, mask, reg_source, reg_mask
     ):
-        """Loss for ``(B, T, P, D)`` candidate latents and ``(B, T, P)`` logits.
+        """Loss for ``(B, T, P, D)`` candidate latents and ``(B, T, P)`` scores.
 
         ``r`` is the detached soft assignment derived from the true
-        candidate-target distances.  It therefore acts as a teacher for the
-        score head while the move loss only pulls candidates through ``d``.
+        candidate-target distances; the move loss pulls candidates through
+        ``d``.  ``scores`` are negated predicted distances, regressed onto the
+        detached ``d``: the value head learns ``E[d_i | z_t]``, not how often
+        candidate ``i`` wins (the argmax of win frequency can have a worse
+        average distance than a constant choice).
 
         ``reg_source`` holds the online encoder latents that VISReg acts on.
         Regularizing those directly prevents the predictor from satisfying
@@ -154,7 +159,7 @@ class VISRegLoss(nn.Module):
 
         cand = candidates.float()
         tgt = target.float()
-        logits = scores.float()
+        predicted_d = -scores.float()
         valid_f = valid.to(cand.dtype)
         denom = valid_f.sum().clamp_min(1.0)
 
@@ -189,11 +194,18 @@ class VISRegLoss(nn.Module):
         l_move = (r * d).sum(-1)  # (B, T)
         l_move = (l_move * valid_f).sum() / denom
 
-        # The score head sees only the candidate features, so this teaches it
-        # to rank candidates without access to the target.
-        log_probs = F.log_softmax(logits, dim=-1)
-        l_score = -(r * log_probs).sum(-1)  # (B, T)
-        l_score = (l_score * valid_f).sum() / denom
+        # Value regression: the head sees only z_t, so it learns the expected
+        # distance of every candidate, and argmin d̂ minimizes the expected
+        # distance of the selected waypoint.  All candidates are supervised
+        # (not only the winner), so dead slots still get calibrated values.
+        d_target = d.detach()
+        l_value = (predicted_d - d_target).pow(2).mean(-1)  # (B, T)
+        l_value = (l_value * valid_f).sum() / denom
+
+        # Distance of the value-selected candidate (the inference choice).
+        picked = predicted_d.detach().argmin(dim=-1, keepdim=True)
+        selected_d = d_target.gather(-1, picked).squeeze(-1)
+        selected_d = (selected_d * valid_f).sum() / denom
 
         # Optional repulsion between candidates.  Off-diagonal cosine
         # similarity is penalized only above ``diversity_margin``, i.e. only
@@ -239,7 +251,7 @@ class VISRegLoss(nn.Module):
 
         loss = (
             self.move_w * l_move
-            + self.score_w * l_score
+            + self.score_w * l_value
             + self.diversity_w * l_div
             + self.scale_w * l_scale
             + self.shape_w * l_shape
@@ -248,12 +260,13 @@ class VISRegLoss(nn.Module):
 
         stats = {
             "loss_move": l_move.detach(),
-            "loss_score": l_score.detach(),
+            "loss_value": l_value.detach(),
             "loss_diversity": l_div.detach(),
             "loss_scale": l_scale.detach(),
             "loss_shape": l_shape.detach(),
             "loss_center": l_center.detach(),
             "best_d": (d.detach().min(-1).values * valid_f).sum() / denom,
+            "selected_d": selected_d,
             "temperature": temperature.detach(),
             "win": win,
         }
@@ -274,7 +287,7 @@ class VISRegLoss(nn.Module):
             pred: (B, T, P, D) candidate predictions.
             target: (B, T, D)
             mask: (B, T), 1 => valid prediction position
-            scores: (B, T, P) candidate logits.
+            scores: (B, T, P) negated predicted candidate-target distances.
             reg_source: (B, S, D) online encoder latents for VISReg.
             reg_mask: (B, S), 1 => valid token in ``reg_source``.
             return_stats: also return detached diagnostics for logging.

@@ -18,7 +18,6 @@ from jepa import (
 def tiny_config(
     *,
     with_decoder: bool = True,
-    trunk_layers: int = 0,
     tie_embeddings: bool = False,
     hint_every_layer: bool = False,
 ) -> JepaConfig:
@@ -34,7 +33,6 @@ def tiny_config(
         encoder,
         prediction_count=4,
         num_hidden_layers=1,
-        trunk_layers=trunk_layers,
     )
     decoder = (
         DecoderConfig.from_encoder(
@@ -72,15 +70,14 @@ def test_full_stack_forward():
     assert jepa_out["preds"].shape == (2, 10, 4, 32)
 
 
-def test_predictor_context_window_matches_single_step():
-    """All-timestep windows equal the single-step path and never look ahead."""
+def test_predictor_reads_only_z_t():
+    """Each position's output depends on its own latent and nothing else."""
     from jepa import PredictorModel
 
     torch.manual_seed(0)
-    encoder = tiny_config().encoder
     predictor = PredictorModel(
         PredictorConfig.from_encoder(
-            encoder, prediction_count=4, num_hidden_layers=1, context_window=3
+            tiny_config().encoder, prediction_count=4, num_hidden_layers=1
         )
     ).eval()
     latents = torch.randn(2, 6, 32)
@@ -89,30 +86,31 @@ def test_predictor_context_window_matches_single_step():
         preds, scores = predictor(latents, return_all_timesteps=True)
         assert preds.shape == (2, 6, 4, 32)
         assert scores.shape == (2, 6, 4)
-        # t = 0, 1 have a partial (masked) window; t >= 2 a full one.
+        # The single-step path on z_t alone matches every position.
         for t in range(6):
-            p, s = predictor(latents[:, : t + 1], return_all_timesteps=False)
+            p, s = predictor(latents[:, t : t + 1], return_all_timesteps=False)
             torch.testing.assert_close(p, preds[:, t], atol=1e-5, rtol=1e-4)
             torch.testing.assert_close(s, scores[:, t], atol=1e-5, rtol=1e-4)
 
-        # The context changes the output (the window is actually used).
+        # Changing one latent changes only that position.
         shifted = latents.clone()
         shifted[:, 3] += 1.0
-        _, s2 = predictor(shifted, return_all_timesteps=True)
-        assert not torch.allclose(s2[:, 4], scores[:, 4])
-        torch.testing.assert_close(s2[:, :3], scores[:, :3])  # no look-ahead
+        shifted_preds, shifted_scores = predictor(shifted, return_all_timesteps=True)
+        keep = [0, 1, 2, 4, 5]
+        torch.testing.assert_close(shifted_preds[:, keep], preds[:, keep])
+        torch.testing.assert_close(shifted_scores[:, keep], scores[:, keep])
+        assert not torch.allclose(shifted_preds[:, 3], preds[:, 3])
 
 
-def test_full_stack_forward_with_context_window():
-    config = tiny_config()
-    config.predictor.context_window = 3
-    model = JepaDecodeModel(config)
-    labels = torch.randint(1, 64, (2, 12))
-    jepa_out, decoder_out = model(
-        labels=labels, attention_mask=torch.ones_like(labels), training=True
-    )
-    assert jepa_out["preds"].shape == (2, 10, 4, 32)
-    assert torch.isfinite(jepa_out["loss"]) and torch.isfinite(decoder_out["loss"])
+def test_removed_predictor_options():
+    """Old configs with the options off still load; enabled ones fail loudly."""
+    encoder = tiny_config().encoder
+    config = PredictorConfig.from_encoder(encoder, trunk_layers=0, context_window=0)
+    assert not hasattr(config, "trunk_layers")
+    assert "context_window" not in config.to_dict()
+    for name in ("trunk_layers", "context_window"):
+        with pytest.raises(ValueError, match=name):
+            PredictorConfig.from_encoder(encoder, **{name: 2})
 
 
 def test_jepa_inference_without_decoder():
@@ -156,14 +154,43 @@ def test_visreg_dot_product_distance_matches_reference():
     div_ref = (F.relu(sim) * off_diag).sum() / (dirs.shape[0] * 4 * 3)
     torch.testing.assert_close(stats["loss_diversity"], div_ref.detach())
 
+    # Value head: MSE of the predicted distances (-scores) onto d, and the
+    # value-selected candidate is the one with the highest score.
+    value_ref = ((-scores - d_ref.detach()).pow(2).mean(-1) * mask).sum() / mask.sum()
+    torch.testing.assert_close(stats["loss_value"], value_ref)
+    picked = d_ref.detach().gather(-1, scores.argmax(-1, keepdim=True)).squeeze(-1)
+    torch.testing.assert_close(
+        stats["selected_d"], (picked * mask).sum() / mask.sum()
+    )
+
+
+def test_value_loss_trains_scores_toward_distances():
+    """The value gradient moves -scores toward the true distances only."""
+    from jepa.models.losses import VISRegLoss
+
+    torch.manual_seed(0)
+    criterion = VISRegLoss(
+        VISRegConfig(num_slices=4, move_w=0.0, diversity_w=0.0, scale_w=0.0,
+                     shape_w=0.0, center_w=0.0, score_w=1.0)
+    )
+    cand = torch.randn(1, 3, 4, 16, requires_grad=True)
+    tgt = torch.randn(1, 3, 16)
+    scores = torch.zeros(1, 3, 4, requires_grad=True)
+    loss = criterion(cand, tgt, scores=scores, reg_source=tgt)
+    loss.backward()
+    # Predicted distance 0 is below every true distance, so the gradient
+    # raises the predicted distance, i.e. lowers the score.
+    assert (scores.grad > 0).all()
+    # The regression target is detached: candidates get no value gradient.
+    assert cand.grad is None or torch.count_nonzero(cand.grad) == 0
+
 
 # ---------------------------------------------------------------------------
-# Predictor trunk
+# Predictor parameters
 # ---------------------------------------------------------------------------
 
-# Parameters of the legacy (trunk_layers=0) predictor for the tiny config.
-# Frozen on purpose: old checkpoints must keep loading into the same keys.
-LEGACY_PREDICTOR_KEYS = [
+# Parameters of the z_t-only predictor for the tiny config.
+PREDICTOR_KEYS = [
     "hidden_expansion.weights",
     "hidden_expansion.bias",
     "transformer.decoders.0.attn.w_q_norm.0.weight",
@@ -179,23 +206,20 @@ LEGACY_PREDICTOR_KEYS = [
     "transformer.decoders.0.mlp_norm.rms_norm.weight",
     "delta_head.weights",
     "delta_head.bias",
-    "score_head.weights",
-    "score_head.bias",
+    "value_head.weights",
+    "value_head.bias",
 ]
 
 
 def test_new_config_fields_default_to_legacy_behaviour():
     encoder = tiny_config().encoder
-    predictor = PredictorConfig.from_encoder(encoder)
-    assert predictor.trunk_layers == 0
-
     decoder = DecoderConfig.from_encoder(encoder)
     assert decoder.tie_embeddings is False
     assert decoder.hint_every_layer is False
     assert decoder.tie_word_embeddings is False
 
 
-def test_predictor_trunk_off_keeps_legacy_parameters():
+def test_predictor_parameters():
     from jepa import PredictorModel
 
     predictor = PredictorModel(
@@ -203,68 +227,7 @@ def test_predictor_trunk_off_keeps_legacy_parameters():
             tiny_config().encoder, prediction_count=4, num_hidden_layers=1
         )
     )
-    assert list(predictor.state_dict()) == LEGACY_PREDICTOR_KEYS
-    assert not any("trunk" in key for key in predictor.state_dict())
-
-
-def test_predictor_trunk_causality():
-    from jepa import PredictorModel
-
-    torch.manual_seed(0)
-    predictor = PredictorModel(
-        PredictorConfig.from_encoder(
-            tiny_config().encoder,
-            prediction_count=4,
-            num_hidden_layers=1,
-            trunk_layers=2,
-        )
-    ).eval()
-    latents = torch.randn(2, 6, 32)
-
-    with torch.no_grad():
-        preds, scores = predictor(latents, return_all_timesteps=True)
-        assert preds.shape == (2, 6, 4, 32)
-        assert scores.shape == (2, 6, 4)
-
-        # The trunk summarises the prefix, so a prefix-only single-step run
-        # matches the all-timesteps output at that position.
-        for t in range(6):
-            p, s = predictor(latents[:, : t + 1], return_all_timesteps=False)
-            torch.testing.assert_close(p, preds[:, t], atol=1e-5, rtol=1e-4)
-            torch.testing.assert_close(s, scores[:, t], atol=1e-5, rtol=1e-4)
-
-        # Perturbing a latent only affects that position and later ones.
-        shifted = latents.clone()
-        shifted[:, 3] += 1.0
-        shifted_preds, shifted_scores = predictor(
-            shifted, return_all_timesteps=True
-        )
-        torch.testing.assert_close(shifted_preds[:, :3], preds[:, :3])
-        torch.testing.assert_close(shifted_scores[:, :3], scores[:, :3])
-        assert not torch.allclose(shifted_preds[:, 3], preds[:, 3])
-        assert not torch.allclose(shifted_scores[:, 4], scores[:, 4])
-
-
-def test_predictor_trunk_with_context_window():
-    """The trunk can be combined with the legacy context window."""
-    from jepa import PredictorModel
-
-    torch.manual_seed(0)
-    predictor = PredictorModel(
-        PredictorConfig.from_encoder(
-            tiny_config().encoder,
-            prediction_count=4,
-            num_hidden_layers=1,
-            trunk_layers=1,
-            context_window=2,
-        )
-    ).eval()
-    latents = torch.randn(2, 5, 32)
-
-    with torch.no_grad():
-        preds, _ = predictor(latents, return_all_timesteps=True)
-        p, _ = predictor(latents[:, :3], return_all_timesteps=False)
-        torch.testing.assert_close(p, preds[:, 2], atol=1e-5, rtol=1e-4)
+    assert list(predictor.state_dict()) == PREDICTOR_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +371,7 @@ def test_hint_every_layer_matches_generate_path():
 
 def test_full_stack_forward_with_all_new_options():
     model = JepaDecodeModel(
-        tiny_config(trunk_layers=2, tie_embeddings=True, hint_every_layer=True)
+        tiny_config(tie_embeddings=True, hint_every_layer=True)
     )
     labels = torch.randint(1, 64, (2, 12))
     jepa_out, decoder_out = model(
@@ -423,9 +386,10 @@ def test_full_stack_forward_with_all_new_options():
     (2 * jepa_out["loss"] + decoder_out["loss"]).backward()
     grads = dict(model.named_parameters())
     for name in (
-        "predictor.trunk_in.weight",
-        "predictor.trunk.0.attn.w_v.weight",
-        "predictor.trunk_norm.rms_norm.weight",
+        "predictor.hidden_expansion.weights",
+        "predictor.transformer.decoders.0.attn.w_v.weight",
+        "predictor.delta_head.weights",
+        "predictor.value_head.weights",
         "decoder.hint_proj.0.weight",
         "decoder.embedding.weight",
         "encoder.embedding.weight",
@@ -438,7 +402,7 @@ def test_full_stack_forward_with_all_new_options():
 
 def test_decoder_loss_does_not_update_encoder_or_predictor():
     model = JepaDecodeModel(
-        tiny_config(trunk_layers=1, tie_embeddings=True, hint_every_layer=True)
+        tiny_config(tie_embeddings=True, hint_every_layer=True)
     )
     labels = torch.randint(1, 64, (2, 12))
     _, decoder_out = model(
@@ -447,7 +411,7 @@ def test_decoder_loss_does_not_update_encoder_or_predictor():
     decoder_out["loss"].backward()
 
     assert model.encoder.embedding.weight.grad is None
-    assert model.predictor.trunk_in.weight.grad is None
+    assert all(p.grad is None for p in model.predictor.parameters())
     # The decoder's own (tied) table does receive the decoder gradient.
     assert model.decoder.embedding.weight.grad is not None
     assert model.decoder.lm_head.weight.grad is not None
@@ -741,7 +705,7 @@ def test_frozen_decoder_loss_matches_joint_mode(amp_dtype):
     from contextlib import nullcontext
 
     torch.manual_seed(0)
-    joint = JepaDecodeModel(tiny_config(trunk_layers=1, hint_every_layer=True))
+    joint = JepaDecodeModel(tiny_config(hint_every_layer=True))
     joint.decoder_hindsight_prob = 1.0
     frozen = copy.deepcopy(joint)
     frozen.freeze_jepa()

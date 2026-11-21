@@ -12,6 +12,7 @@ data/                         generated datasets and tokenizer
 docs/
   architecture.md             model, data, training, and generation details
   verification.md             collapse / latent-usage test notes
+  vision.md                   long-term predictor direction (not implemented)
 jepa/
   __main__.py                 `python -m jepa <command>`
   cli.py                      command dispatcher

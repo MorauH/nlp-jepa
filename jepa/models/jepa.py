@@ -147,8 +147,9 @@ class JepaModel(PreTrainedModel):
 
         preds, scores = self.predictor(enc_hidden, return_all_timesteps=False)
 
-        # Greedy commitment by default.  Callers that want stochastic
-        # directions can sample from ``scores`` themselves.
+        # Greedy commitment by default: scores are negated predicted
+        # distances, so argmax is the smallest expected distance.  Callers
+        # that want stochastic directions can sample from ``scores``.
         best = scores.argmax(dim=-1)  # (B,)
         z_future = preds[
             torch.arange(preds.shape[0], device=preds.device), best

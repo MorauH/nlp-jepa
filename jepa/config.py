@@ -136,22 +136,14 @@ class PredictorConfig(TransformerConfig):
     encoder's ``hidden_size``.
 
     ``prediction_count`` is the number of candidate future latents the
-    predictor proposes from one input latent.  Each candidate gets its own
-    score, so a single direction can be sampled later (like sampling a token
-    from logits).
+    predictor proposes from one input latent.  Each candidate gets a predicted
+    distance to the real future (its value), so the best candidate can be
+    selected, or one sampled, later.
 
-    ``context_window`` is the number of most recent encoder latents
-    ``z_{t-W+1..t}`` that the candidate slots can attend to.  They are
-    appended to the predictor sequence as extra tokens, so the candidates and
-    the score head can use recent context instead of the single vector
-    ``z_t``.  ``0`` disables this (legacy behaviour: the predictor only sees
-    ``z_t`` through the expansion layer).
-
-    ``trunk_layers`` adds a causal transformer trunk over the latent sequence
-    before the per-position candidate head.  ``0`` keeps the legacy
-    per-position predictor (same parameters and state-dict keys); ``> 0``
-    lets each position read the whole prefix through attention, which makes
-    ``context_window`` redundant.
+    The predictor only sees the latest latent ``z_t``: the causal encoder
+    already summarizes the prefix there.  The former ``trunk_layers`` and
+    ``context_window`` options (extra access to past latents) were removed;
+    loading a config that enabled them raises ``ValueError``.
 
     ``normalize_candidates`` RMS-normalizes every candidate to the encoder
     latent scale.  The multi-hypothesis loss compares directions only, so the
@@ -165,13 +157,20 @@ class PredictorConfig(TransformerConfig):
         self,
         target_dim: int | None = None,
         prediction_count: int = 16,
-        context_window: int = 0,
-        trunk_layers: int = 0,
         normalize_candidates: bool = False,
         pad_token_id: int | None = None,
         is_causal: bool = False,
         **kwargs,
     ):
+        # Removed options.  Old configs store them as 0 when unused; drop
+        # those so they are not re-saved.  Anything else is a checkpoint whose
+        # predictor read past latents and cannot be loaded into this one.
+        for removed in ("trunk_layers", "context_window"):
+            if kwargs.pop(removed, 0):
+                raise ValueError(
+                    f"PredictorConfig.{removed} was removed: the predictor now "
+                    "only reads z_t. This checkpoint's predictor cannot be loaded."
+                )
         super().__init__(is_causal=is_causal, **kwargs)
         self.target_dim = target_dim
         # Number of candidate predictions created from one latent vector
@@ -179,14 +178,9 @@ class PredictorConfig(TransformerConfig):
         # not time steps, which is why the predictor defaults to non-causal
         # attention.
         self.prediction_count = prediction_count
-        # Number of past latents (ending at z_t) appended as context tokens.
-        self.context_window = context_window
         # RMS-normalize each candidate (z_t + delta) to the encoder-latent
         # scale.  False keeps the legacy, unbounded candidate norm.
         self.normalize_candidates = normalize_candidates
-        # Causal transformer layers over the latent sequence, run before the
-        # candidate head.  0 = legacy, position-independent predictor.
-        self.trunk_layers = trunk_layers
         self.pad_token_id = pad_token_id
 
     def validate(self) -> "PredictorConfig":
@@ -195,10 +189,6 @@ class PredictorConfig(TransformerConfig):
             raise ValueError("target_dim must be set (use from_encoder(...))")
         if self.prediction_count is None or self.prediction_count < 1:
             raise ValueError("prediction_count must be at least 1")
-        if self.context_window is None or self.context_window < 0:
-            raise ValueError("context_window must be non-negative")
-        if self.trunk_layers is None or self.trunk_layers < 0:
-            raise ValueError("trunk_layers must be non-negative")
         return self
 
     @classmethod
@@ -305,9 +295,9 @@ class VISRegConfig(PretrainedConfig):
     """Weights of the VISReg + multi-hypothesis objective.
 
     The single-prediction invariance term is replaced by a relaxed
-    winner-takes-all move loss plus a cross-entropy that trains the score
-    head.  The scale/shape/center regularizers are unchanged; they are
-    evaluated on the target latents and on the winning prediction.
+    winner-takes-all move loss plus a regression that trains the predictor's
+    value head to predict each candidate's distance to the target.  The
+    scale/shape/center regularizers act on the online encoder latents.
     """
 
     model_type = "jepa_visreg"
@@ -336,7 +326,7 @@ class VISRegConfig(PretrainedConfig):
         self.shape_w = shape_w
         self.center_w = center_w
         self.move_w = move_w
-        # Weight of the score-head cross-entropy.
+        # Weight of the value-head distance regression (MSE).
         self.score_w = score_w
         # Weight of the pairwise candidate-diversity penalty.
         self.diversity_w = diversity_w

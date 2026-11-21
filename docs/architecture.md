@@ -7,7 +7,7 @@ reloaded alone. `JepaConfig` composes them for the full stack.
 | Config            | Model            | Input                         | Output                        |
 | ----------------- | ---------------- | ----------------------------- | ----------------------------- |
 | `EncoderConfig`   | `EncodeTransformer` | token ids                 | latent sequence `(B, T, H)`   |
-| `PredictorConfig` | `PredictorModel`    | latent sequence (+ last `context_window` latents) | `P` candidate `z_{t+k}` + scores |
+| `PredictorConfig` | `PredictorModel`    | latents, each `z_t` used on its own | `P` candidate `z_{t+k}` + scores (negated predicted distances) |
 | `DecoderConfig`   | `DecoderModel`      | token context, latent waypoints | next-token logits        |
 | `VISRegConfig`    | `VISRegLoss`        | candidates, scores, targets, encoder latents | scalar JEPA loss |
 | `JepaConfig`      | `JepaModel` / `JepaDecodeModel` | composed stack | loss / tokens     |
@@ -51,7 +51,7 @@ latents = encoder(tokens, attention_mask=mask)
 
 # Predictor: derive the width/vocab fields from the encoder, override the rest
 pred_cfg = PredictorConfig.from_encoder(
-    enc_cfg, num_hidden_layers=2, trunk_layers=6
+    enc_cfg, num_hidden_layers=2, prediction_count=8
 )
 predictor = PredictorModel(pred_cfg)
 predictor.save_pretrained("checkpoints/predictor")
@@ -195,8 +195,17 @@ loop optimizes the decoder loss alone. The decoder sees the last
 block: the real latent at the block start and the predictor's selected
 waypoint at the block end. The hint is added to the token embeddings and, with
 `DECODER_HINT_EVERY_LAYER`, re-injected through a zero-initialized per-layer
-projection before every layer. At inference the waypoint is sampled from the
-predictor's scores.
+projection before every layer. At inference the waypoint is the candidate with
+the smallest predicted distance (or sampled from the scores with
+`--direction-temperature`).
+
+The predictor's value head predicts, from `z_t` alone, each candidate's
+distance to the real future (MSE onto the loss's distance, weighted by
+`VISREG_SCORE_W`). `scores` are the negated predictions, so `argmax` selects
+the lowest expected distance. This replaced a cross-entropy against the soft
+winner assignment, which learned how often a slot wins rather than how close
+it is on average. `python -m jepa verify` reports the value head's R² and
+compares the selected waypoint with the best constant slot and the oracle.
 
 During training the block-end waypoint is the **hindsight-best** candidate
 (the one closest to the real future latent) with probability
@@ -270,9 +279,7 @@ them):
 | `USE_AMP` | `True` | Runs the model forward under `torch.autocast`. On an L4/Ada GPU, `AMP_DTYPE="auto"` selects **bf16** (no gradient scaler needed). Falls back to fp16 with a scaler, and is disabled on CPU/MPS. |
 | `COMPILE_MODEL` | `True` | Wraps the model in `torch.compile(..., dynamic=True)`. Compilation is amortized over a full run. If the backend fails, `suppress_errors` falls back to eager instead of aborting. |
 | `COMPILE_MODE` | `"default"` | Passed to `torch.compile`; `"max-autotune"` can be faster but has a much longer warm-up. |
-| `PREDICTOR_CONTEXT_WINDOW` | `0` | The predictor's candidate slots and score head attend to the last `W` encoder latents `z_{t-W+1..t}` (extra non-causal tokens with a learned offset embedding; missing positions at the sequence start are masked). `0` = only `z_t`. Superseded by the trunk: with `PREDICTOR_TRUNK_LAYERS > 0` the trunk already carries the temporal context. |
-| `PREDICTOR_TRUNK_LAYERS` | `6` | Causal transformer layers over the latent sequence, run before the per-position candidate head. Each position then sees the whole prefix through attention (temporal RoPE, fused causal SDPA). `0` = the legacy position-independent predictor. |
-| `PREDICTOR_HIDDEN_LAYERS` | `2` | Layers of the candidate head (the expansion slots, not time steps). |
+| `PREDICTOR_HIDDEN_LAYERS` | `2` | Layers of the candidate head (the expansion slots, not time steps). The predictor reads only `z_t`: the causal encoder already summarizes the prefix there. |
 | `PREDICTOR_PREDICTION_COUNT` | `8` | Candidate futures per position. The old value was 24, but analysis found only ~5 distinct candidate groups. |
 | `DECODER_HIDDEN_LAYERS` | `4` | Depth of the autoregressive token decoder. |
 | `DECODER_TIE_EMBEDDINGS` | `True` | Share the decoder's token embedding with its `lm_head`. The encoder keeps a separate table, so the decoder loss cannot update the encoder. |
@@ -332,7 +339,9 @@ waypoint. Grammar comes from the token context; the waypoint supplies the
 semantic direction. Generated tokens are fed back into the encoder between
 blocks, and the context is capped at the encoder's `max_position_embeddings`.
 Use `--direction-temperature` / `--direction-top-k` to control waypoint
-sampling and `--temperature` / `--top-k` to control token sampling.
+sampling (default `0`: the smallest predicted distance; the temperature is in
+distance units, so try 0.02-0.1) and `--temperature` / `--top-k` to control
+token sampling.
 
 ## Saved layout
 
