@@ -82,24 +82,66 @@ def test_predictor_reads_only_z_t():
     ).eval()
     latents = torch.randn(2, 6, 32)
 
+    # mu starts at exactly 0; give it non-zero output weights so the test
+    # exercises it.
+    torch.nn.init.normal_(predictor.mean_head[-1].weight)
+
     with torch.no_grad():
-        preds, scores = predictor(latents, return_all_timesteps=True)
+        preds, scores, mean = predictor(latents, return_all_timesteps=True)
         assert preds.shape == (2, 6, 4, 32)
         assert scores.shape == (2, 6, 4)
+        assert mean.shape == (2, 6, 32)
         # The single-step path on z_t alone matches every position.
         for t in range(6):
-            p, s = predictor(latents[:, t : t + 1], return_all_timesteps=False)
+            p, s, m = predictor(latents[:, t : t + 1], return_all_timesteps=False)
             torch.testing.assert_close(p, preds[:, t], atol=1e-5, rtol=1e-4)
             torch.testing.assert_close(s, scores[:, t], atol=1e-5, rtol=1e-4)
+            torch.testing.assert_close(m, mean[:, t], atol=1e-5, rtol=1e-4)
 
         # Changing one latent changes only that position.
         shifted = latents.clone()
         shifted[:, 3] += 1.0
-        shifted_preds, shifted_scores = predictor(shifted, return_all_timesteps=True)
+        shifted_preds, shifted_scores, shifted_mean = predictor(
+            shifted, return_all_timesteps=True
+        )
         keep = [0, 1, 2, 4, 5]
         torch.testing.assert_close(shifted_preds[:, keep], preds[:, keep])
         torch.testing.assert_close(shifted_scores[:, keep], scores[:, keep])
+        torch.testing.assert_close(shifted_mean[:, keep], mean[:, keep])
         assert not torch.allclose(shifted_preds[:, 3], preds[:, 3])
+        assert not torch.allclose(shifted_mean[:, 3], mean[:, 3])
+
+
+def test_mean_head_starts_at_zero_and_is_detached():
+    """mu starts at 0 and its loss never reaches z_t (it is an instrument)."""
+    from jepa import PredictorModel
+
+    torch.manual_seed(0)
+    predictor = PredictorModel(
+        PredictorConfig.from_encoder(
+            tiny_config().encoder, prediction_count=4, num_hidden_layers=1
+        )
+    )
+    latents = torch.randn(2, 5, 32, requires_grad=True)
+    _, _, mean = predictor(latents)
+    assert torch.count_nonzero(mean) == 0
+
+    torch.nn.init.normal_(predictor.mean_head[-1].weight)
+    _, _, mean = predictor(latents)
+    mean.pow(2).sum().backward()
+    assert latents.grad is None
+    assert predictor.mean_head[0].weight.grad is not None
+
+
+def test_expected_distances_identity():
+    """2 - 2 ĉ·mu equals the actual distance when mu is the unit target."""
+    from jepa.models.predictor import expected_distances
+
+    torch.manual_seed(0)
+    cand = torch.randn(3, 4, 16)
+    target = F.normalize(torch.randn(3, 16), dim=-1)
+    actual = (F.normalize(cand, dim=-1) - target[:, None]).pow(2).sum(-1)
+    torch.testing.assert_close(expected_distances(cand, target), actual)
 
 
 def test_removed_predictor_options():
@@ -136,8 +178,9 @@ def test_visreg_dot_product_distance_matches_reference():
     mask = torch.ones(2, 5)
     mask[1, 3:] = 0
 
+    mean = torch.randn(2, 5, 16)
     _, stats = criterion(
-        cand, tgt, mask=mask, scores=scores,
+        cand, tgt, mask=mask, scores=scores, mean=mean,
         reg_source=tgt, reg_mask=mask, return_stats=True,
     )
 
@@ -154,35 +197,28 @@ def test_visreg_dot_product_distance_matches_reference():
     div_ref = (F.relu(sim) * off_diag).sum() / (dirs.shape[0] * 4 * 3)
     torch.testing.assert_close(stats["loss_diversity"], div_ref.detach())
 
-    # Value head: MSE of the predicted distances (-scores) onto d, and the
-    # value-selected candidate is the one with the highest score.
-    value_ref = ((-scores - d_ref.detach()).pow(2).mean(-1) * mask).sum() / mask.sum()
-    torch.testing.assert_close(stats["loss_value"], value_ref)
-    picked = d_ref.detach().gather(-1, scores.argmax(-1, keepdim=True)).squeeze(-1)
+    def masked(values):
+        return (values * mask).sum() / mask.sum()
+
+    # pi: cross-entropy against the relaxed WTA assignment r.
+    d = d_ref.detach()
+    temperature = 0.1 * masked(d.mean(-1))
+    r = 0.95 * F.softmax(-d / temperature, dim=-1) + 0.05 / 4
+    score_ref = masked(-(r * F.log_softmax(scores, dim=-1)).sum(-1))
+    torch.testing.assert_close(stats["loss_score"], score_ref)
+    picked = d.gather(-1, scores.argmax(-1, keepdim=True)).squeeze(-1)
+    torch.testing.assert_close(stats["selected_d"], masked(picked))
+
+    # mu: squared error onto the normalized target; its direction's distance.
+    tgt_unit = F.normalize(tgt, dim=-1)
     torch.testing.assert_close(
-        stats["selected_d"], (picked * mask).sum() / mask.sum()
+        stats["loss_mean"], masked((mean - tgt_unit).pow(2).sum(-1))
     )
-
-
-def test_value_loss_trains_scores_toward_distances():
-    """The value gradient moves -scores toward the true distances only."""
-    from jepa.models.losses import VISRegLoss
-
-    torch.manual_seed(0)
-    criterion = VISRegLoss(
-        VISRegConfig(num_slices=4, move_w=0.0, diversity_w=0.0, scale_w=0.0,
-                     shape_w=0.0, center_w=0.0, score_w=1.0)
+    torch.testing.assert_close(stats["mean_norm"], masked(mean.norm(dim=-1)))
+    torch.testing.assert_close(
+        stats["mean_dir_d"],
+        masked((F.normalize(mean, dim=-1) - tgt_unit).pow(2).sum(-1)),
     )
-    cand = torch.randn(1, 3, 4, 16, requires_grad=True)
-    tgt = torch.randn(1, 3, 16)
-    scores = torch.zeros(1, 3, 4, requires_grad=True)
-    loss = criterion(cand, tgt, scores=scores, reg_source=tgt)
-    loss.backward()
-    # Predicted distance 0 is below every true distance, so the gradient
-    # raises the predicted distance, i.e. lowers the score.
-    assert (scores.grad > 0).all()
-    # The regression target is detached: candidates get no value gradient.
-    assert cand.grad is None or torch.count_nonzero(cand.grad) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -206,8 +242,12 @@ PREDICTOR_KEYS = [
     "transformer.decoders.0.mlp_norm.rms_norm.weight",
     "delta_head.weights",
     "delta_head.bias",
-    "value_head.weights",
-    "value_head.bias",
+    "score_head.weights",
+    "score_head.bias",
+    "mean_head.0.weight",
+    "mean_head.0.bias",
+    "mean_head.2.weight",
+    "mean_head.2.bias",
 ]
 
 
@@ -389,7 +429,8 @@ def test_full_stack_forward_with_all_new_options():
         "predictor.hidden_expansion.weights",
         "predictor.transformer.decoders.0.attn.w_v.weight",
         "predictor.delta_head.weights",
-        "predictor.value_head.weights",
+        "predictor.score_head.weights",
+        "predictor.mean_head.2.weight",
         "decoder.hint_proj.0.weight",
         "decoder.embedding.weight",
         "encoder.embedding.weight",
@@ -532,7 +573,7 @@ def test_normalize_candidates_fixes_scale():
     )
     # No new parameters: old checkpoints keep loading.
     assert legacy.state_dict().keys() == normed.state_dict().keys()
-    preds, _ = normed(torch.randn(2, 5, 32) * 7.0)
+    preds, _, _ = normed(torch.randn(2, 5, 32) * 7.0)
     rms = preds.pow(2).mean(-1).sqrt()
     torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-3, rtol=1e-3)
 

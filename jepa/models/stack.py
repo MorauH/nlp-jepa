@@ -40,8 +40,8 @@ def select_waypoints(preds, scores):
     """Select the highest-scoring candidate at each base position.
 
     ``preds`` is ``(batch, positions, prediction_count, hidden)`` and
-    ``scores`` is ``(batch, positions, prediction_count)``: negated predicted
-    distances, so this picks the smallest expected distance.
+    ``scores`` is ``(batch, positions, prediction_count)``: win-probability
+    logits, so this picks the most likely future.
     """
     best = scores.argmax(dim=-1)
     return preds.gather(
@@ -187,7 +187,7 @@ class JepaDecodeModel(JepaModel):
                 f"sequence length ({latents.shape[1]}) must exceed "
                 f"pred_horizon ({horizon})"
             )
-        preds, scores = self.predictor(
+        preds, scores, mean = self.predictor(
             latents[:, :-horizon, :], return_all_timesteps=True
         )
         # The VISReg loss computes the same candidate-target distance in fp32
@@ -205,6 +205,7 @@ class JepaDecodeModel(JepaModel):
             "latents": latents,
             "preds": preds,
             "scores": scores,
+            "mean": mean,
             "z_future": z_future,
         }
 

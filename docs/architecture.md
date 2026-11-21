@@ -7,7 +7,7 @@ reloaded alone. `JepaConfig` composes them for the full stack.
 | Config            | Model            | Input                         | Output                        |
 | ----------------- | ---------------- | ----------------------------- | ----------------------------- |
 | `EncoderConfig`   | `EncodeTransformer` | token ids                 | latent sequence `(B, T, H)`   |
-| `PredictorConfig` | `PredictorModel`    | latents, each `z_t` used on its own | `P` candidate `z_{t+k}` + scores (negated predicted distances) |
+| `PredictorConfig` | `PredictorModel`    | latents, each `z_t` used on its own | `P` candidate `z_{t+k}`, win-probability logits (π), mean future (μ) |
 | `DecoderConfig`   | `DecoderModel`      | token context, latent waypoints | next-token logits        |
 | `VISRegConfig`    | `VISRegLoss`        | candidates, scores, targets, encoder latents | scalar JEPA loss |
 | `JepaConfig`      | `JepaModel` / `JepaDecodeModel` | composed stack | loss / tokens     |
@@ -195,17 +195,28 @@ loop optimizes the decoder loss alone. The decoder sees the last
 block: the real latent at the block start and the predictor's selected
 waypoint at the block end. The hint is added to the token embeddings and, with
 `DECODER_HINT_EVERY_LAYER`, re-injected through a zero-initialized per-layer
-projection before every layer. At inference the waypoint is the candidate with
-the smallest predicted distance (or sampled from the scores with
-`--direction-temperature`).
+projection before every layer. At inference the waypoint is sampled from the
+predictor's win-probability head (π).
 
-The predictor's value head predicts, from `z_t` alone, each candidate's
-distance to the real future (MSE onto the loss's distance, weighted by
-`VISREG_SCORE_W`). `scores` are the negated predictions, so `argmax` selects
-the lowest expected distance. This replaced a cross-entropy against the soft
-winner assignment, which learned how often a slot wins rather than how close
-it is on average. `python -m jepa verify` reports the value head's R² and
-compares the selected waypoint with the best constant slot and the oracle.
+The predictor has two heads besides the candidates:
+
+- **π** (`scores`, `score_head`): per-candidate logits of "this candidate is
+  the closest to the real future", trained by cross-entropy against the loss's
+  soft winner assignment (`VISREG_SCORE_W`). Generation samples from it, so it
+  is judged by likelihood, not by distance: it picks a *likely* future, which
+  is generally not the one closest on average.
+- **μ** (`mean`, `mean_head`): a 2-layer MLP from `z_t` to `E[ŷ | z_t]`, the
+  mean normalized future, regressed onto the normalized target
+  (`VISREG_MEAN_W`). Its input is detached, so it never changes the encoder
+  or the candidates. Under the normalized metric `E[d_i | z_t] = 2 − 2 ĉ_i·μ`
+  (`expected_distances` in `jepa/models/predictor.py`), so μ's direction is
+  the best possible single prediction and `|μ|` measures how divergent the
+  futures are. It is an instrument (uncertainty, single-head baseline, a
+  future head-growth signal; see `docs/vision.md`), not the selector.
+
+`python -m jepa verify` reports π's likelihood gain over a constant
+distribution, `|μ|`, and compares the π-argmax, μ-safe, μ-direction,
+best-fixed-slot and oracle waypoints.
 
 During training the block-end waypoint is the **hindsight-best** candidate
 (the one closest to the real future latent) with probability
@@ -339,9 +350,8 @@ waypoint. Grammar comes from the token context; the waypoint supplies the
 semantic direction. Generated tokens are fed back into the encoder between
 blocks, and the context is capped at the encoder's `max_position_embeddings`.
 Use `--direction-temperature` / `--direction-top-k` to control waypoint
-sampling (default `0`: the smallest predicted distance; the temperature is in
-distance units, so try 0.02-0.1) and `--temperature` / `--top-k` to control
-token sampling.
+sampling from π (`0` = the most likely future) and `--temperature` /
+`--top-k` to control token sampling.
 
 ## Saved layout
 

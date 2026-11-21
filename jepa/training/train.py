@@ -93,11 +93,13 @@ DECODER_TIE_EMBEDDINGS = True
 # extension of input-only injection.
 DECODER_HINT_EVERY_LAYER = True
 VISREG_NUM_SLICES = 256
-# Push the predictor candidates apart.  VISREG_SCORE_W weights the value head's
-# distance regression (MSE on cosine-style distances in [0, 4]).
+# Push the predictor candidates apart.  VISREG_SCORE_W weights the
+# win-probability (pi) cross-entropy; VISREG_MEAN_W the mean-future (mu)
+# regression (mu's input is detached, so it only trains the mean head).
 # These are applied on resume too, so old checkpoints pick up the new weights.
 VISREG_DIVERSITY_W = 0.5
 VISREG_SCORE_W = 1.0
+VISREG_MEAN_W = 1.0
 
 # Candidate-collapse fixes.  In the previous run only 2 of 8 slots were ever
 # used: the other 6 drifted to norms ~50x z_t (the loss compares directions,
@@ -298,6 +300,7 @@ def build_model(tokenizer) -> JepaDecodeModel:
         num_slices=VISREG_NUM_SLICES,
         diversity_w=VISREG_DIVERSITY_W,
         score_w=VISREG_SCORE_W,
+        mean_w=VISREG_MEAN_W,
         diversity_margin=VISREG_DIVERSITY_MARGIN,
         mh_temperature_start=VISREG_MH_TEMPERATURE_START,
         mh_anneal_fraction=VISREG_MH_ANNEAL_FRACTION,
@@ -341,6 +344,7 @@ def main(argv: list[str] | None = None) -> None:
         model.config.visreg.diversity_w = VISREG_DIVERSITY_W
         model.config.visreg.score_w = VISREG_SCORE_W
         for name, value in (
+            ("mean_w", VISREG_MEAN_W),
             ("diversity_margin", VISREG_DIVERSITY_MARGIN),
             ("mh_temperature_start", VISREG_MH_TEMPERATURE_START),
             ("mh_anneal_fraction", VISREG_MH_ANNEAL_FRACTION),

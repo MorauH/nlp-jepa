@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -10,6 +12,40 @@ from transformers import PreTrainedModel
 
 from ..config import PredictorConfig
 from .blocks import DecoderLayer, RMSNorm
+
+
+class PredictorOutput(NamedTuple):
+    """What :class:`PredictorModel` returns (unpacks as a 3-tuple).
+
+    Shapes are for ``return_all_timesteps=True``; with ``False`` the ``seq``
+    dimension is dropped.
+
+    candidates: (batch, seq, P, D) candidate future latents.
+    scores:     (batch, seq, P) win-probability logits (pi): how likely each
+                candidate is the closest one to the real future.  Sample from
+                these to commit to one future.
+    mean:       (batch, seq, D) mu, the predicted mean of the *normalized*
+                future latent.  Its norm measures how spread the real futures
+                are (~1 = predictable, short = divergent); see
+                :func:`expected_distances`.
+    """
+
+    candidates: torch.Tensor
+    scores: torch.Tensor
+    mean: torch.Tensor
+
+
+def expected_distances(candidates, mean):
+    """Expected candidate-target distance under the loss's normalized metric.
+
+    For unit vectors ``d = 2 - 2 c·y``, and the candidate is fixed given
+    ``z_t``, so ``E[d_i | z_t] = 2 - 2 ĉ_i · E[ŷ | z_t] = 2 - 2 ĉ_i · mu``.
+    Valid for ``VISRegConfig.normalize_distance=True`` (the default).
+
+    candidates: (..., P, D), mean: (..., D) -> (..., P)
+    """
+    directions = F.normalize(candidates.float(), dim=-1)
+    return 2.0 - 2.0 * torch.einsum("...pd,...d->...p", directions, mean.float())
 
 
 class MatrixExpansion(nn.Module):
@@ -123,18 +159,18 @@ class PredictorModel(PreTrainedModel):
     non-causal transformer across the slots, and turned into
 
     * candidates ``z_t + delta_i`` (residual in latent space), and
-    * a value per candidate: the predicted distance ``d̂_i`` between that
-      candidate and the real future (same distance as the loss).
+    * win-probability logits ``scores`` (pi): which candidate is likely the
+      closest to the real future.  Generation samples from these.
 
-    The values are returned as ``scores = -d̂`` so that "higher is better"
-    holds everywhere: ``scores.argmax`` selects the candidate with the
-    smallest expected distance, and a softmax over ``scores / T`` samples
-    with a temperature ``T`` in distance units.
+    Separately, the mean head maps ``z_t`` to ``mu ≈ E[ŷ | z_t]``, the mean
+    normalized future.  It is an auxiliary instrument (uncertainty, a
+    single-head baseline, a future head-growth signal), not the selector.
+    Its input is detached, so it never changes the encoder or candidates.
 
     Configured by :class:`jepa.config.PredictorConfig` and usable on its own::
 
         predictor = PredictorModel(PredictorConfig.from_encoder(enc_config))
-        predictions, scores = predictor(latents, return_all_timesteps=False)
+        candidates, scores, mean = predictor(latents, return_all_timesteps=False)
     """
 
     config_class = PredictorConfig
@@ -158,14 +194,26 @@ class PredictorModel(PreTrainedModel):
             out_size=config.target_dim
         )
 
-        # Predicted candidate-target distance (the "value" of each candidate).
-        self.value_head = PerDimLinear(
+        # Win-probability logit of each candidate (pi).
+        self.score_head = PerDimLinear(
             dims=config.prediction_count,
             in_size=config.hidden_size,
             out_size=1
         )
 
+        # mu: predicted mean of the normalized future latent, from z_t.
+        self.mean_head = nn.Sequential(
+            nn.Linear(config.target_dim, config.hidden_size),
+            nn.SiLU(),
+            nn.Linear(config.hidden_size, config.target_dim),
+        )
+
         self.post_init()
+
+        # Start mu at 0 ("no knowledge", norm 0) instead of a random vector.
+        # After post_init, which would otherwise re-initialize the Linear.
+        nn.init.zeros_(self.mean_head[-1].weight)
+        nn.init.zeros_(self.mean_head[-1].bias)
 
     def forward(self, input, return_all_timesteps: bool = True):
         """Predict k steps into the future from each latent in ``input``.
@@ -176,13 +224,10 @@ class PredictorModel(PreTrainedModel):
                                   independently.  If False, predict only from
                                   the final latent (the others are ignored).
         Returns:
-            ``(predictions, scores)`` where ``predictions`` has shape
-            (batch, seq, prediction_count, target_dim) and ``scores`` has
-            shape (batch, seq, prediction_count) when
-            ``return_all_timesteps`` is True, or
-            (batch, prediction_count, target_dim) and
-            (batch, prediction_count) otherwise.  ``scores`` is the negated
-            predicted distance of each candidate to the real future.
+            :class:`PredictorOutput` ``(candidates, scores, mean)`` with shapes
+            (batch, seq, P, D), (batch, seq, P), (batch, seq, D) when
+            ``return_all_timesteps`` is True, or (batch, P, D), (batch, P),
+            (batch, D) otherwise.
         """
         assert input.ndim == 3, (
             f"Expected 3D tensor (batch, seq, target_dim), got shape {input.shape}"
@@ -201,8 +246,9 @@ class PredictorModel(PreTrainedModel):
         hidden_states = self.transformer(hidden_states)
 
         pred_deltas = self.delta_head(hidden_states)  # (N, prediction_count, target_dim)
-        values = self.value_head(hidden_states).squeeze(-1)  # (N, prediction_count)
-        scores = -values
+        scores = self.score_head(hidden_states).squeeze(-1)  # (N, prediction_count)
+        # Detached: mu is a measuring instrument and must not shape z_t.
+        mean = self.mean_head(z_t.detach())  # (N, target_dim)
 
         predictions = z_t.unsqueeze(1) + pred_deltas  # (N, prediction_count, target_dim)
 
@@ -221,9 +267,10 @@ class PredictorModel(PreTrainedModel):
             ).to(predictions.dtype)
 
         if return_all_timesteps:
-            return (
+            return PredictorOutput(
                 predictions.view(batch_size, seq_len, prediction_count, target_dim),
                 scores.view(batch_size, seq_len, prediction_count),
+                mean.view(batch_size, seq_len, target_dim),
             )
 
-        return predictions, scores
+        return PredictorOutput(predictions, scores, mean)

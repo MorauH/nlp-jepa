@@ -136,9 +136,9 @@ class PredictorConfig(TransformerConfig):
     encoder's ``hidden_size``.
 
     ``prediction_count`` is the number of candidate future latents the
-    predictor proposes from one input latent.  Each candidate gets a predicted
-    distance to the real future (its value), so the best candidate can be
-    selected, or one sampled, later.
+    predictor proposes from one input latent.  Each candidate gets a
+    win-probability logit, so one future can be sampled later (like sampling a
+    token from logits).
 
     The predictor only sees the latest latent ``z_t``: the causal encoder
     already summarizes the prefix there.  The former ``trunk_layers`` and
@@ -295,9 +295,10 @@ class VISRegConfig(PretrainedConfig):
     """Weights of the VISReg + multi-hypothesis objective.
 
     The single-prediction invariance term is replaced by a relaxed
-    winner-takes-all move loss plus a regression that trains the predictor's
-    value head to predict each candidate's distance to the target.  The
-    scale/shape/center regularizers act on the online encoder latents.
+    winner-takes-all move loss, a cross-entropy that trains the predictor's
+    win-probability head (pi), and a regression of the mean-future head (mu)
+    onto the normalized target.  The scale/shape/center regularizers act on
+    the online encoder latents.
     """
 
     model_type = "jepa_visreg"
@@ -310,6 +311,7 @@ class VISRegConfig(PretrainedConfig):
         center_w: float = 1.0,
         move_w: float = 1.0,
         score_w: float = 0.1,
+        mean_w: float = 1.0,
         diversity_w: float = 0.01,
         diversity_margin: float = 0.0,
         mh_temperature: float = 0.1,
@@ -326,8 +328,11 @@ class VISRegConfig(PretrainedConfig):
         self.shape_w = shape_w
         self.center_w = center_w
         self.move_w = move_w
-        # Weight of the value-head distance regression (MSE).
+        # Weight of the win-probability (pi) cross-entropy.
         self.score_w = score_w
+        # Weight of the mean-future (mu) regression.  mu's input is detached,
+        # so this only scales the mean head's own learning rate.
+        self.mean_w = mean_w
         # Weight of the pairwise candidate-diversity penalty.
         self.diversity_w = diversity_w
         # Only candidate pairs with cosine above this margin are penalized
@@ -362,6 +367,7 @@ class VISRegConfig(PretrainedConfig):
             "center_w",
             "move_w",
             "score_w",
+            "mean_w",
             "diversity_w",
         ):
             value = getattr(self, name)

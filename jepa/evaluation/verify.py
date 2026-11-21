@@ -8,8 +8,8 @@ It loads a validation batch, runs the frozen encoder,
 and reports:
 
 * representation health (scale, mean, effective rank, temporal cosine),
-* predictor candidate diversity and value-head fit (R^2 of the predicted
-  distances), selection vs. the best constant slot vs. the oracle,
+* predictor candidate diversity, the win-probability head (pi) against a
+  constant distribution, |mu|, and pi / mu / fixed-slot / oracle waypoints,
 * the `win` histogram,
 * a teacher-forced hint ablation: predicted vs shuffled vs null vs raw
   block-end latent, overall and per block offset.
@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from datasets import load_from_disk
 
 from ..data.tokenizer import load_tokenizer
+from ..models.predictor import expected_distances
 from ..models.stack import JepaDecodeModel, build_block_hints, select_waypoints
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
 
@@ -109,10 +110,10 @@ def flag_candidate_cos(value: float) -> str:
     return "WARN"
 
 
-def flag_value_r2(value: float) -> str:
-    if value > 0.3:
-        return "OK"
+def flag_pi_gain(value: float) -> str:
     if value > 0.05:
+        return "OK"
+    if value > 0.0:
         return "WEAK"
     return "UNINFORMATIVE"
 
@@ -238,7 +239,7 @@ def main(argv: list[str] | None = None) -> None:
             dim=-1,
         )
 
-        preds, scores = model.predictor(
+        preds, scores, mean_future = model.predictor(
             latents[:, :-k, :], return_all_timesteps=True
         )
         distances = (
@@ -261,12 +262,23 @@ def main(argv: list[str] | None = None) -> None:
             candidate_cos = torch.ones((), device=device)
 
         best_d = distances.min(dim=-1).values[valid].mean()
-        # Value head = regression of every candidate's distance.  R^2 against
-        # the true distances: 0 = no better than predicting the mean distance.
-        predicted_d = -scores.float()
-        true_d = distances.float()[valid]
-        value_mse = (predicted_d[valid] - true_d).pow(2).mean()
-        value_r2 = 1 - value_mse / true_d.var(unbiased=False).clamp_min(1e-12)
+
+        # pi = a probability head over "which candidate is closest", so judge
+        # it by likelihood, against the best constant distribution (the
+        # marginal win shares on this batch): information gained from z_t.
+        hard_win = distances.argmin(dim=-1)[valid]
+        log_pi = F.log_softmax(scores.float(), dim=-1)[valid]
+        pi_nll = -log_pi.gather(-1, hard_win[:, None]).mean()
+        marginal = torch.bincount(hard_win, minlength=prediction_count).float()
+        marginal = marginal / marginal.sum().clamp_min(1)
+        marginal_nll = -(marginal * marginal.clamp_min(1e-12).log()).sum()
+        pi_gain = marginal_nll - pi_nll
+        pi_accuracy = (log_pi.argmax(-1) == hard_win).float().mean()
+        majority_accuracy = marginal.max()
+
+        # mu = predicted mean normalized future.  Its norm: ~1 predictable,
+        # short = divergent futures.
+        mean_norm = mean_future.float().norm(dim=-1)[valid].mean()
 
         print("\n--- representation health ---")
         print(
@@ -286,7 +298,7 @@ def main(argv: list[str] | None = None) -> None:
             f"[{flag_cos(float(temporal_cos.mean()))}; 0.5-0.85 healthy]"
         )
 
-        print("\n--- predictor / value head ---")
+        print("\n--- predictor / pi and mu heads ---")
         print(
             f"candidate pair cos: {fmt(candidate_cos)}  "
             f"[{flag_candidate_cos(float(candidate_cos))}; <0.7 diverse]"
@@ -296,10 +308,17 @@ def main(argv: list[str] | None = None) -> None:
             f"[{flag_delta(float(delta.mean() / z_t.norm(dim=-1).mean()))}; >0.2 meaningful]"
         )
         print(f"best_d:             {fmt(best_d)}  [lower is better; <0.1 easy, >0.3 hard]")
-        print(f"value MSE:          {fmt(value_mse)}")
         print(
-            f"value R^2:          {fmt(value_r2)}  "
-            f"[{flag_value_r2(float(value_r2))}; >0.3 informative]"
+            f"pi NLL:             {fmt(pi_nll)}  vs constant {fmt(marginal_nll)}  "
+            f"gain {fmt(pi_gain)} nats  [{flag_pi_gain(float(pi_gain))}; >0 = pi uses z_t]"
+        )
+        print(
+            f"pi accuracy:        {fmt(pi_accuracy)}  vs majority slot "
+            f"{fmt(majority_accuracy)}"
+        )
+        print(
+            f"|mu|:               {fmt(mean_norm)}  "
+            "[~1 predictable future; short = divergent futures]"
         )
 
         # ---------------------------------------------------------------
@@ -313,13 +332,20 @@ def main(argv: list[str] | None = None) -> None:
         ).squeeze(2)
 
         # Best constant slot: the single index with the lowest mean distance.
-        # A value head that cannot beat this is not selecting anything.
         fixed_index = distances[valid].mean(dim=0).argmin()
         fixed = preds[:, :, fixed_index, :]
+        # mu-safe: the candidate with the lowest expected distance.
+        safe_index = expected_distances(preds, mean_future).argmin(dim=-1)
+        safe = preds.gather(
+            2, safe_index[..., None, None].expand(-1, -1, 1, preds.shape[-1])
+        ).squeeze(2)
 
         query_copy = z_t[valid]
         query_selected = selected[valid]
         query_fixed = fixed[valid]
+        query_safe = safe[valid]
+        # mu's direction = the optimal single-head prediction.
+        query_mean = mean_future[valid]
         query_oracle = oracle[valid]
         retrieval_keys = z_future[valid]
 
@@ -333,7 +359,7 @@ def main(argv: list[str] | None = None) -> None:
 
         d_copy = float(norm_distance(query_copy))
         d_selected = float(norm_distance(query_selected))
-        d_fixed = float(norm_distance(query_fixed))
+        d_mean = float(norm_distance(query_mean))
         d_oracle = float(norm_distance(query_oracle))
 
         print("\n--- oracle vs selected waypoint ---")
@@ -344,7 +370,9 @@ def main(argv: list[str] | None = None) -> None:
         retrieval_pool = 0
         for name, query in (
             ("copy z_t", query_copy),
-            ("selected", query_selected),
+            ("pi argmax", query_selected),
+            ("mu-safe", query_safe),
+            ("mu dir", query_mean),
             (f"fixed slot {int(fixed_index)}", query_fixed),
             ("oracle best", query_oracle),
         ):
@@ -363,12 +391,13 @@ def main(argv: list[str] | None = None) -> None:
         print(f"oracle improvement over copy:   {fmt(d_copy - d_oracle)}")
         print(f"selected improvement over copy: {fmt(d_copy - d_selected)}")
         print(
-            f"selected vs best fixed slot:    {fmt(d_fixed - d_selected)}  "
-            "[>0 = the value head beats a constant index]"
+            f"oracle gain over mu dir:        {fmt(d_mean - d_oracle)}  "
+            "[what P candidates buy over the best single prediction; "
+            "small = multiple candidates barely help at this horizon]"
         )
         print(
-            f"oracle gain over fixed slot:    {fmt(d_fixed - d_oracle)}  "
-            "[small = multiple candidates barely help at this horizon]"
+            "pi argmax is a likely future, not the closest on average: "
+            "expect it at or above mu-safe/mu dir in distance."
         )
 
         oracle_good = d_oracle < d_copy - 0.1
@@ -522,8 +551,9 @@ def main(argv: list[str] | None = None) -> None:
     print("candidate pair cos: <0.7 diverse; >0.9 candidates collapsed")
     print("delta/z:            >0.2 meaningful movement; <0.05 predictor copying")
     print("best_d:             lower is better; <0.1 easy, >0.3 hard")
-    print("value R^2:          >0.3 informative; ~0 = no better than the mean distance")
-    print("selected vs fixed:  >0 value head beats the best constant slot")
+    print("pi gain:            NLL below the constant win distribution; >0 = pi uses z_t")
+    print("|mu|:               ~1 predictable future; short = divergent futures")
+    print("oracle gain over mu dir: small = one prediction is about as good as P")
     print("win share:          uniform ~1/P; >25% concentrated; >50% collapse")
     print("oracle vs selected: oracle << copy and selected ~ copy = scorer problem;")
     print("                    oracle and selected << copy = hint useful;")

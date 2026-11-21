@@ -87,9 +87,11 @@ class JepaModel(PreTrainedModel):
         Returns:
             dict with:
               training: ``loss``, ``latents``, ``preds``, ``scores``,
-                        ``z_future``, ``valid``, ``stats``
+                        ``mean``, ``z_future``, ``valid``, ``stats``
               inference: ``latents``, ``z_t``, ``preds``, ``scores``,
-                         ``z_future``
+                         ``mean``, ``z_future``
+            ``scores`` are win-probability logits (pi); ``mean`` is mu, the
+            predicted mean normalized future (auxiliary).
         """
         enc_hidden = self._encode(labels, attention_mask, right_padded)
 
@@ -111,12 +113,13 @@ class JepaModel(PreTrainedModel):
                 valid = None
 
             # From each hidden[i, t, :] predict hidden[i, t+k, :]
-            preds, scores = self.predictor(X, return_all_timesteps=True)
+            preds, scores, mean = self.predictor(X, return_all_timesteps=True)
             loss, stats = self.criterion(
                 preds,
                 Y,
                 mask=valid,
                 scores=scores,
+                mean=mean,
                 reg_source=enc_hidden,
                 reg_mask=attention_mask,
                 return_stats=True,
@@ -136,6 +139,7 @@ class JepaModel(PreTrainedModel):
                 "latents": enc_hidden,
                 "preds": preds,
                 "scores": scores,
+                "mean": mean,
                 "z_future": z_future,
                 "valid": valid,
                 "stats": stats,
@@ -145,11 +149,10 @@ class JepaModel(PreTrainedModel):
             "Inference expects no padding at the end of the sequence"
         )
 
-        preds, scores = self.predictor(enc_hidden, return_all_timesteps=False)
+        preds, scores, mean = self.predictor(enc_hidden, return_all_timesteps=False)
 
-        # Greedy commitment by default: scores are negated predicted
-        # distances, so argmax is the smallest expected distance.  Callers
-        # that want stochastic directions can sample from ``scores``.
+        # Greedy commitment by default: the most likely future under pi.
+        # Callers that want stochastic directions can sample from ``scores``.
         best = scores.argmax(dim=-1)  # (B,)
         z_future = preds[
             torch.arange(preds.shape[0], device=preds.device), best
@@ -160,5 +163,6 @@ class JepaModel(PreTrainedModel):
             "z_t": enc_hidden[:, -1, :],
             "preds": preds,
             "scores": scores,
+            "mean": mean,
             "z_future": z_future,
         }
