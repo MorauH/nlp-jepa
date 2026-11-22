@@ -125,6 +125,7 @@ def build_model(model_dir: Path) -> JepaDecodeModel:
         predictor=predictor.config,
         decoder=decoder_config,
         visreg=base_config.visreg,
+        commitment=base_config.commitment,
         pred_horizon=base_config.pred_horizon,
     )
     model = JepaDecodeModel(config, encoder=encoder, predictor=predictor)

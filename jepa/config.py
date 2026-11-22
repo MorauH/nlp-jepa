@@ -11,7 +11,8 @@ saved and reloaded without the rest of the stack::
     DecoderConfig   -> DecoderModel        token context, latent hints -> next-token logits
 
 The full model is described by :class:`JepaConfig`, which composes those
-configs (plus the VISReg objective) and links the dimensions that must agree.
+configs (plus the VISReg regularizer and the commitment loss) and links the
+dimensions that must agree.
 
 Dimension ownership
 -------------------
@@ -274,13 +275,11 @@ class DecoderConfig(TransformerConfig):
 
 
 class VISRegConfig(PretrainedConfig):
-    """Weights of the VISReg + multi-hypothesis objective.
+    """Weights of the VISReg anti-collapse regularizer.
 
-    The single-prediction invariance term is replaced by a relaxed
-    winner-takes-all move loss, a cross-entropy that trains the predictor's
-    win-probability head (pi), and a regression of the mean-future head (mu)
-    onto the normalized target.  The scale/shape/center regularizers act on
-    the online encoder latents.
+    The scale/shape/center terms act on the online encoder latents, so they
+    shape the representation the predictor consumes rather than the predictor
+    output.
     """
 
     model_type = "jepa_visreg"
@@ -291,15 +290,6 @@ class VISRegConfig(PretrainedConfig):
         scale_w: float = 1.0,
         shape_w: float = 1.0,
         center_w: float = 1.0,
-        move_w: float = 1.0,
-        score_w: float = 1.0,
-        mean_w: float = 1.0,
-        diversity_w: float = 0.5,
-        diversity_margin: float = 0.5,
-        mh_temperature: float = 0.1,
-        mh_temperature_start: float = 1.0,
-        mh_anneal_fraction: float = 0.3,
-        mh_eps: float = 0.05,
         eps: float = 1e-4,
         **kwargs,
     ):
@@ -308,30 +298,6 @@ class VISRegConfig(PretrainedConfig):
         self.scale_w = scale_w
         self.shape_w = shape_w
         self.center_w = center_w
-        self.move_w = move_w
-        # Weight of the win-probability (pi) cross-entropy.
-        self.score_w = score_w
-        # Weight of the mean-future (mu) regression.  mu's input is detached,
-        # so this only scales the mean head's own learning rate.
-        self.mean_w = mean_w
-        # Weight of the pairwise candidate-diversity penalty.
-        self.diversity_w = diversity_w
-        # Only candidate pairs with cosine above this margin are penalized
-        # (near-duplicates).
-        self.diversity_margin = diversity_margin
-        # Soft-assignment temperature, relative to the mean candidate distance.
-        # With annealing this is the final value.
-        self.mh_temperature = mh_temperature
-        # Annealed winner-takes-all: the temperature multiplier starts here and
-        # decays geometrically to ``mh_temperature`` over the first
-        # ``mh_anneal_fraction`` of training (driven by the trainer via
-        # ``VISRegLoss.set_anneal_progress``).  A high start shares every
-        # target across all slots so each slot finds a region before they
-        # specialize.
-        self.mh_temperature_start = mh_temperature_start
-        self.mh_anneal_fraction = mh_anneal_fraction
-        # Uniform smoothing of the soft assignment (relaxed WTA).
-        self.mh_eps = mh_eps
         self.eps = eps
 
     def validate(self) -> "VISRegConfig":
@@ -339,26 +305,76 @@ class VISRegConfig(PretrainedConfig):
             raise ValueError("num_slices must be at least 1")
         if self.eps is None or self.eps <= 0:
             raise ValueError("eps must be positive")
-        for name in (
-            "scale_w",
-            "shape_w",
-            "center_w",
-            "move_w",
-            "score_w",
-            "mean_w",
-            "diversity_w",
-        ):
+        for name in ("scale_w", "shape_w", "center_w"):
             value = getattr(self, name)
             if value is None or value < 0:
                 raise ValueError(f"{name} must be non-negative")
-        if self.mh_temperature is None or self.mh_temperature <= 0:
-            raise ValueError("mh_temperature must be positive")
-        if self.mh_eps is None or not 0.0 <= self.mh_eps <= 1.0:
-            raise ValueError("mh_eps must be in [0, 1]")
-        if self.mh_temperature_start is None or self.mh_temperature_start <= 0:
-            raise ValueError("mh_temperature_start must be positive")
-        if self.mh_anneal_fraction is None or not 0.0 < self.mh_anneal_fraction <= 1.0:
-            raise ValueError("mh_anneal_fraction must be in (0, 1]")
+        return self
+
+
+class CommitmentLossConfig(PretrainedConfig):
+    """Weights and annealing of the commitment loss.
+
+    The objective trains the predictor's proposal: a relaxed winner-takes-all
+    move loss pulls candidates toward their targets, a cross-entropy trains
+    the win-probability distribution pi, a regression trains the mean-future
+    head mu, and an optional penalty keeps candidates apart.
+    """
+
+    model_type = "jepa_commitment"
+
+    def __init__(
+        self,
+        move_w: float = 1.0,
+        pi_w: float = 1.0,
+        mu_w: float = 1.0,
+        diversity_w: float = 0.5,
+        diversity_margin: float = 0.5,
+        temperature: float = 0.1,
+        temperature_start: float = 1.0,
+        anneal_fraction: float = 0.3,
+        smoothing: float = 0.05,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        # Weight of the relaxed winner-takes-all move loss.
+        self.move_w = move_w
+        # Weight of the pi (win probability) cross-entropy.
+        self.pi_w = pi_w
+        # Weight of the mu (mean future) regression.  mu's input is detached,
+        # so this only scales the mean head's own learning rate.
+        self.mu_w = mu_w
+        # Weight of the pairwise candidate-diversity penalty.
+        self.diversity_w = diversity_w
+        # Only candidate pairs with cosine above this margin are penalized
+        # (near-duplicates).
+        self.diversity_margin = diversity_margin
+        # Soft-assignment temperature, relative to the mean candidate distance.
+        # With annealing this is the final value.
+        self.temperature = temperature
+        # Annealed winner-takes-all: the temperature multiplier starts here and
+        # decays geometrically to ``temperature`` over the first
+        # ``anneal_fraction`` of training (driven by the trainer through the
+        # ``progress`` argument).  A high start shares every target across all
+        # slots so each slot finds a region before they specialize.
+        self.temperature_start = temperature_start
+        self.anneal_fraction = anneal_fraction
+        # Uniform smoothing of the soft assignment (relaxed WTA).
+        self.smoothing = smoothing
+
+    def validate(self) -> "CommitmentLossConfig":
+        for name in ("move_w", "pi_w", "mu_w", "diversity_w"):
+            value = getattr(self, name)
+            if value is None or value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.temperature is None or self.temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if self.smoothing is None or not 0.0 <= self.smoothing <= 1.0:
+            raise ValueError("smoothing must be in [0, 1]")
+        if self.temperature_start is None or self.temperature_start <= 0:
+            raise ValueError("temperature_start must be positive")
+        if self.anneal_fraction is None or not 0.0 < self.anneal_fraction <= 1.0:
+            raise ValueError("anneal_fraction must be in (0, 1]")
         if self.diversity_margin is None or not -1.0 <= self.diversity_margin < 1.0:
             raise ValueError("diversity_margin must be in [-1, 1)")
         return self
@@ -380,6 +396,7 @@ class JepaConfig(PretrainedConfig):
         predictor: PredictorConfig | dict | None = None,
         decoder: DecoderConfig | dict | None = None,
         visreg: VISRegConfig | dict | None = None,
+        commitment: CommitmentLossConfig | dict | None = None,
         pred_horizon: int = 20,
         **kwargs,
     ):
@@ -397,6 +414,9 @@ class JepaConfig(PretrainedConfig):
         self.visreg = self._coerce(VISRegConfig, visreg)
         if self.visreg is None:
             self.visreg = VISRegConfig()
+        self.commitment = self._coerce(CommitmentLossConfig, commitment)
+        if self.commitment is None:
+            self.commitment = CommitmentLossConfig()
         self.pred_horizon = pred_horizon
 
         # Fill in derived predictor values before validating it.
@@ -445,6 +465,7 @@ class JepaConfig(PretrainedConfig):
         with_decoder: bool = True,
         pred_horizon: int = 20,
         visreg: VISRegConfig | None = None,
+        commitment: CommitmentLossConfig | None = None,
         **kwargs,
     ) -> "JepaConfig":
         """Derive a full JEPA config from an encoder config.
@@ -462,6 +483,7 @@ class JepaConfig(PretrainedConfig):
             predictor=predictor,
             decoder=decoder,
             visreg=visreg,
+            commitment=commitment,
             pred_horizon=pred_horizon,
             **kwargs,
         )
@@ -508,6 +530,7 @@ class JepaConfig(PretrainedConfig):
             )
 
         self.visreg.validate()
+        self.commitment.validate()
         return self
 
     @staticmethod

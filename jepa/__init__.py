@@ -19,6 +19,7 @@ The full stack takes a single composed config::
 """
 
 from .config import (
+    CommitmentLossConfig,
     DecoderConfig,
     EncoderConfig,
     JepaConfig,
@@ -29,7 +30,7 @@ from .config import (
 from .models.decoder import DecoderModel
 from .models.encoder import EncodeTransformer
 from .models.jepa import JepaModel
-from .models.losses import VISRegLoss
+from .models.losses import CommitmentLoss, LossOutput, VISReg
 from .models.predictor import PredictorModel
 from .models.stack import JepaDecodeModel
 
@@ -40,6 +41,7 @@ __all__ = [
     "PredictorConfig",
     "DecoderConfig",
     "VISRegConfig",
+    "CommitmentLossConfig",
     "JepaConfig",
     # Models
     "EncodeTransformer",
@@ -48,5 +50,7 @@ __all__ = [
     "JepaModel",
     "JepaDecodeModel",
     # Loss
-    "VISRegLoss",
+    "VISReg",
+    "CommitmentLoss",
+    "LossOutput",
 ]

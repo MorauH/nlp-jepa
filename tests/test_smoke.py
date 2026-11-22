@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from jepa import (
+    CommitmentLossConfig,
     DecoderConfig,
     EncoderConfig,
     JepaConfig,
@@ -146,13 +147,13 @@ def test_jepa_inference_without_decoder():
     assert out["committed"].shape == (2, 32)
 
 
-def test_visreg_dot_product_distance_matches_reference():
-    """The dot-product distance and masked diversity equal the direct formulas."""
+def test_commitment_loss_matches_reference():
+    """The dot-product distance, pi, mu and diversity equal the direct formulas."""
     from jepa.models.commitment import Futures
-    from jepa.models.losses import VISRegLoss
+    from jepa.models.losses import CommitmentLoss
 
     torch.manual_seed(0)
-    criterion = VISRegLoss(VISRegConfig(num_slices=8, diversity_w=0.5))
+    loss_fn = CommitmentLoss(CommitmentLossConfig(diversity_w=0.5))
     cand = torch.randn(2, 5, 4, 16, requires_grad=True)
     tgt = torch.randn(2, 5, 16)
     scores = torch.randn(2, 5, 4)
@@ -160,23 +161,20 @@ def test_visreg_dot_product_distance_matches_reference():
     mask[1, 3:] = 0
 
     mean = torch.randn(2, 5, 16)
-    _, stats = criterion(
-        Futures(cand, scores, mean), tgt, mask=mask,
-        reg_source=tgt, reg_mask=mask, return_stats=True,
-    )
+    out = loss_fn(Futures(cand, scores, mean), tgt, mask=mask)
 
     valid = mask.bool()
     d_ref = (
         F.normalize(cand, dim=-1) - F.normalize(tgt, dim=-1).unsqueeze(2)
     ).pow(2).sum(-1)
     best_ref = (d_ref.min(-1).values * mask).sum() / mask.sum()
-    torch.testing.assert_close(stats["best_d"], best_ref.detach())
+    torch.testing.assert_close(out.diagnostics["best_d"], best_ref.detach())
 
     dirs = F.normalize(cand[valid], dim=-1)
     sim = torch.bmm(dirs, dirs.transpose(1, 2))
     off_diag = 1.0 - torch.eye(4)
     div_ref = (F.relu(sim - 0.5) * off_diag).sum() / (dirs.shape[0] * 4 * 3)
-    torch.testing.assert_close(stats["loss_diversity"], div_ref.detach())
+    torch.testing.assert_close(out.terms["diversity"], div_ref.detach())
 
     def masked(values):
         return (values * mask).sum() / mask.sum()
@@ -185,19 +183,21 @@ def test_visreg_dot_product_distance_matches_reference():
     d = d_ref.detach()
     temperature = 0.1 * masked(d.mean(-1))
     r = 0.95 * F.softmax(-d / temperature, dim=-1) + 0.05 / 4
-    score_ref = masked(-(r * F.log_softmax(scores, dim=-1)).sum(-1))
-    torch.testing.assert_close(stats["loss_score"], score_ref)
+    pi_ref = masked(-(r * F.log_softmax(scores, dim=-1)).sum(-1))
+    torch.testing.assert_close(out.terms["pi"], pi_ref)
     picked = d.gather(-1, scores.argmax(-1, keepdim=True)).squeeze(-1)
-    torch.testing.assert_close(stats["selected_d"], masked(picked))
+    torch.testing.assert_close(out.diagnostics["pi_argmax_d"], masked(picked))
 
     # mu: squared error onto the normalized target; its direction's distance.
     tgt_unit = F.normalize(tgt, dim=-1)
     torch.testing.assert_close(
-        stats["loss_mean"], masked((mean - tgt_unit).pow(2).sum(-1))
+        out.terms["mu"], masked((mean - tgt_unit).pow(2).sum(-1))
     )
-    torch.testing.assert_close(stats["mean_norm"], masked(mean.norm(dim=-1)))
     torch.testing.assert_close(
-        stats["mean_dir_d"],
+        out.diagnostics["mu_norm"], masked(mean.norm(dim=-1))
+    )
+    torch.testing.assert_close(
+        out.diagnostics["mu_dir_d"],
         masked((F.normalize(mean, dim=-1) - tgt_unit).pow(2).sum(-1)),
     )
 
@@ -484,32 +484,72 @@ def test_candidates_are_rms_normalized():
     torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-3, rtol=1e-3)
 
 
-def test_annealed_temperature_schedule_and_loading(tmp_path):
-    from jepa.models.losses import VISRegLoss
+def test_loss_outputs_are_weighted_sums_of_their_terms():
+    """loss == sum(weights[name] * terms[name]) for both modules."""
+    from jepa.models.commitment import Futures
+    from jepa.models.losses import CommitmentLoss, VISReg
 
-    loss = VISRegLoss(
-        VISRegConfig(mh_temperature=0.1, mh_temperature_start=1.0, mh_anneal_fraction=0.5)
+    torch.manual_seed(0)
+    visreg = VISReg(
+        VISRegConfig(num_slices=4, scale_w=0.5, shape_w=2.0, center_w=3.0)
     )
-    # Starts (and evaluates) at the final value until the trainer drives it.
-    assert loss.mh_temperature_now.item() == pytest.approx(0.1)
-    for progress, expected in ((0.0, 1.0), (0.25, 0.1 ** 0.5), (0.5, 0.1), (0.9, 0.1)):
-        loss.set_anneal_progress(progress)
-        assert loss.mh_temperature_now.item() == pytest.approx(expected, rel=1e-5)
-    assert "mh_temperature_now" not in loss.state_dict()
+    out = visreg(torch.randn(8, 6))
+    assert set(out.terms) == set(visreg.weights) == {"scale", "shape", "center"}
+    expected = sum(visreg.weights[name] * out.terms[name] for name in out.terms)
+    torch.testing.assert_close(out.loss, expected)
 
-    # The non-persistent buffer must survive from_pretrained (meta-device init).
-    config = tiny_config()
-    config.visreg.mh_temperature_start = 1.0
-    model = JepaDecodeModel(config)
-    model.save_pretrained(tmp_path)
-    loaded = JepaDecodeModel.from_pretrained(str(tmp_path))
-    assert loaded.criterion.mh_temperature_now.item() == pytest.approx(0.1)
-    assert loaded.criterion.mh_temperature_start == 1.0
+    commitment = CommitmentLoss(
+        CommitmentLossConfig(
+            move_w=0.5, pi_w=2.0, mu_w=3.0, diversity_w=4.0
+        )
+    )
+    futures = Futures(
+        torch.randn(2, 3, 4, 6), torch.randn(2, 3, 4), torch.randn(2, 3, 6)
+    )
+    out = commitment(futures, torch.randn(2, 3, 6))
+    assert set(out.terms) == set(commitment.weights) == {
+        "move",
+        "pi",
+        "mu",
+        "diversity",
+    }
+    expected = sum(
+        commitment.weights[name] * out.terms[name] for name in out.terms
+    )
+    torch.testing.assert_close(out.loss, expected)
+
+
+def test_temperature_diagnostic_anneals_and_is_final_without_progress():
+    from jepa.models.commitment import Futures
+    from jepa.models.losses import CommitmentLoss
+
+    loss_fn = CommitmentLoss(
+        CommitmentLossConfig(
+            temperature=0.1, temperature_start=1.0, anneal_fraction=0.5
+        )
+    )
+    futures = Futures(
+        torch.randn(1, 1, 2, 4), torch.randn(1, 1, 2), torch.randn(1, 1, 4)
+    )
+    target = torch.randn(1, 1, 4)
+
+    cases = (
+        (torch.tensor(0.0), 1.0),
+        (torch.tensor(0.25), 0.1**0.5),
+        (torch.tensor(0.5), 0.1),
+        (torch.tensor(0.9), 0.1),
+        (None, 0.1),
+    )
+    for progress, expected in cases:
+        temperature = loss_fn(
+            futures, target, progress=progress
+        ).diagnostics["temperature"]
+        assert temperature.item() == pytest.approx(expected, rel=1e-5)
 
 
 def test_diversity_margin_ignores_dissimilar_pairs():
     from jepa.models.commitment import Futures
-    from jepa.models.losses import VISRegLoss
+    from jepa.models.losses import CommitmentLoss
 
     torch.manual_seed(0)
     # Two candidates at cosine 0.3, two at ~0.99.
@@ -520,24 +560,23 @@ def test_diversity_margin_ignores_dissimilar_pairs():
     near = torch.stack([a, F.normalize(a + 0.05 * b, dim=0)])
 
     def div(cands, margin):
-        crit = VISRegLoss(VISRegConfig(num_slices=4, diversity_w=1.0, diversity_margin=margin))
+        crit = CommitmentLoss(
+            CommitmentLossConfig(diversity_w=1.0, diversity_margin=margin)
+        )
         futures = Futures(
             cands[None, None],
             torch.zeros(1, 1, 2),
             torch.randn(1, 1, 16),
         )
-        _, stats = crit(
-            futures, torch.randn(1, 1, 16),
-            reg_source=torch.randn(1, 4, 16), return_stats=True,
-        )
-        return stats["loss_diversity"].item()
+        out = crit(futures, torch.randn(1, 1, 16))
+        return out.terms["diversity"].item()
 
     assert div(far, 0.0) == pytest.approx(0.3, abs=1e-4)
     assert div(far, 0.5) == 0.0
     assert div(near, 0.5) > 0.4
 
 
-def test_trainer_drives_temperature_annealing(tmp_path):
+def test_trainer_anneals_temperature(tmp_path):
     from types import SimpleNamespace
 
     from datasets import Dataset
@@ -546,21 +585,21 @@ def test_trainer_drives_temperature_annealing(tmp_path):
 
     torch.manual_seed(0)
     config = tiny_config()
-    config.visreg.mh_temperature_start = 1.0
-    config.visreg.mh_anneal_fraction = 0.5
+    config.commitment.temperature_start = 1.0
+    config.commitment.anneal_fraction = 0.5
     model = JepaDecodeModel(config)
     seen = []
-    original = model.criterion.set_anneal_progress
+    original = model.commitment_loss.forward
 
-    def record(progress):
-        original(progress)
-        seen.append(model.criterion.mh_temperature_now.item())
+    def record(futures, target, mask=None, progress=None):
+        seen.append(None if progress is None else progress.item())
+        return original(futures, target, mask=mask, progress=progress)
 
-    model.criterion.set_anneal_progress = record
+    model.commitment_loss.forward = record
     data = Dataset.from_dict(
         {"input_ids": [torch.randint(1, 64, (12,)).tolist() for _ in range(8)]}
     )
-    JepaTrainer(
+    history = JepaTrainer(
         model=model,
         config=TrainConfig(
             output_dir=str(tmp_path),
@@ -575,10 +614,14 @@ def test_trainer_drives_temperature_annealing(tmp_path):
         use_amp=False,
     ).train()
 
-    assert len(seen) == 4
-    assert seen[0] == pytest.approx(1.0)
-    assert seen == sorted(seen, reverse=True)
-    assert seen[-1] == pytest.approx(0.1)  # 3/4 progress > anneal fraction
+    # Four training steps get an increasing 0-dim progress tensor; the single
+    # validation batch gets None, i.e. the final temperature.
+    assert seen[:4] == [0.0, 0.25, 0.5, 0.75]
+    assert seen[4:] == [None]
+    assert history["train_jepa_temperature"][0] == pytest.approx(
+        (1.0 + 0.1**0.5 + 0.1 + 0.1) / 4, rel=1e-5
+    )
+    assert history["val_jepa_temperature"][0] == pytest.approx(0.1, rel=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +905,56 @@ def test_jepa_only_never_runs_the_decoder(tmp_path):
     assert all(
         torch.equal(p, before_decoder[n]) for n, p in reloaded.decoder.named_parameters()
     )
+
+
+def test_jepa_only_logs_every_term_and_diagnostic(tmp_path):
+    """Every JEPA term/diagnostic is in the history and sums to the total."""
+    from types import SimpleNamespace
+
+    from datasets import Dataset
+
+    from jepa.training.trainer import JepaTrainer, TrainConfig
+
+    torch.manual_seed(0)
+    model = JepaDecodeModel(tiny_config())
+    model.skip_decoder()
+
+    data = Dataset.from_dict(
+        {"input_ids": [torch.randint(1, 64, (12,)).tolist() for _ in range(4)]}
+    )
+    history = JepaTrainer(
+        model=model,
+        config=TrainConfig(
+            output_dir=str(tmp_path),
+            learning_rate=1e-3,
+            batch_size=2,
+            epochs=1,
+            device="cpu",
+        ),
+        train_dataset=data,
+        eval_dataset=data.select(range(2)),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        use_amp=False,
+        save_every_steps=1,
+    ).train()
+
+    terms = set(model.visreg.weights) | set(model.commitment_loss.weights)
+    diagnostics = {"best_d", "pi_argmax_d", "mu_norm", "mu_dir_d", "temperature"}
+    assert terms == {"scale", "shape", "center", "move", "pi", "mu", "diversity"}
+
+    for prefix in ("train", "val"):
+        for name in terms | diagnostics:
+            key = f"{prefix}_jepa_{name}"
+            assert isinstance(history[key], list) and len(history[key]) == 1, key
+        # Diagnostics are separate from the loss keys.
+        assert not any(name in terms for name in diagnostics)
+
+    weights = {**model.visreg.weights, **model.commitment_loss.weights}
+    weighted = sum(
+        weights[name] * history[f"val_jepa_{name}"][0] for name in terms
+    )
+    assert weighted == pytest.approx(history["val_jepa_loss"][0], rel=1e-5)
+    assert not any("decoder" in key or "perplexity" in key for key in history)
 
 
 def test_freeze_jepa_and_skip_decoder_are_exclusive():

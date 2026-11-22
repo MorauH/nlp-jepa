@@ -149,6 +149,7 @@ class JepaDecodeModel(JepaModel):
         loss_chunk_size: int | None = None,
         temperature: float = 0.0,
         top_k: int | None = None,
+        progress=None,
     ):
         """
         Args:
@@ -164,10 +165,13 @@ class JepaDecodeModel(JepaModel):
                       so the full (B, S, vocab) logits tensor is never held.
             temperature: Token sampling temperature for inference; 0 = greedy.
             top_k: Optional top-k cutoff for inference.
+            progress: 0-dim tensor with the fraction of training completed,
+                      used to anneal the commitment temperature.  None means
+                      the final temperature (evaluation).
 
         Returns:
             Training: ``(jepa_out, decoder_out)`` where ``jepa_out`` contains the
-                      VISReg loss (``None`` when the JEPA part is frozen) and
+                      JEPA loss (``None`` when the JEPA part is frozen) and
                       ``decoder_out`` contains the token loss (``decoder_out``
                       is ``None`` after :meth:`skip_decoder`).
             Inference: generated token ids of shape (batch, k).
@@ -182,6 +186,7 @@ class JepaDecodeModel(JepaModel):
                 attention_mask=attention_mask,
                 training=training,
                 right_padded=right_padded,
+                progress=progress,
             )
 
         if not training:

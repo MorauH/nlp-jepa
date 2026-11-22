@@ -1,38 +1,53 @@
-"""VISReg regularization and the multi-hypothesis JEPA objective."""
+"""The JEPA objective: VISReg regularization and the commitment loss.
+
+The two modules are independent:
+
+* :class:`VISReg` is the anti-collapse regularizer on the online encoder
+  latents (scale / shape / center).
+* :class:`CommitmentLoss` is the paper's core objective on the predictor's
+  :class:`jepa.models.commitment.Futures`: a relaxed winner-takes-all move
+  loss, a cross-entropy that trains pi, a regression that trains mu, and an
+  optional candidate-diversity penalty.
+
+Both report a :class:`LossOutput`, so the total is always
+``sum(weights[name] * terms[name])``.
+"""
 
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 
-from ..config import VISRegConfig
+from ..config import CommitmentLossConfig, VISRegConfig
 
 
-class VISRegLoss(nn.Module):
+class LossOutput(NamedTuple):
+    """A loss plus the pieces needed to check it and to log it.
+
+    loss:        weighted total.
+    terms:       unweighted scalar loss terms.  ``loss`` is exactly
+                 ``sum(weights[name] * terms[name])``.
+    diagnostics: detached scalars that are not part of the loss.
     """
-    VISReg regularization plus a multi-hypothesis prediction objective.
 
-    The predictor returns :class:`jepa.models.commitment.Futures`: candidates,
-    per-candidate win-probability logits (pi) and a mean-future vector (mu).
-    The single-prediction invariance term is replaced by:
+    loss: Tensor
+    terms: dict[str, Tensor]
+    diagnostics: dict[str, Tensor]
 
-    * a relaxed winner-takes-all move loss that pulls each target toward its
-      nearest candidate (with a small uniform component so no candidate dies),
-    * a cross-entropy that trains pi to predict the same soft assignment from
-      ``z_t`` alone (which candidate will be closest; used for sampling),
-    * a regression of mu onto the normalized target, so mu learns
-      ``E[ŷ | z_t]`` (auxiliary; its input is detached in the predictor),
-    * an optional diversity penalty that stops candidates collapsing onto the
-      same direction.
 
-    The scale/shape/center regularizers are unchanged.  They are evaluated on
-    the online encoder latents (``reg_source``), so they shape the
-    representation the predictor consumes rather than the predictor output.
+class VISReg(nn.Module):
+    """Anti-collapse regularizer on the online encoder latents.
 
-    Weights live in :class:`jepa.config.VISRegConfig`.
+    Three distribution terms push the latent cloud toward a standard normal:
+
+    * scale: per-dimension standard deviation toward 1,
+    * shape: sliced Wasserstein distance to Gaussian quantiles,
+    * center: mean vector toward 0.
     """
 
     def __init__(self, config: VISRegConfig | None = None, **overrides):
@@ -47,61 +62,21 @@ class VISRegLoss(nn.Module):
 
         self.config = config
         self.num_slices = config.num_slices
-        self.scale_w = config.scale_w
-        self.shape_w = config.shape_w
-        self.center_w = config.center_w
-        self.move_w = config.move_w
-        self.score_w = config.score_w
-        self.mean_w = config.mean_w
-        self.diversity_w = config.diversity_w
-        self.diversity_margin = config.diversity_margin
-        self.mh_temperature = config.mh_temperature
-        self.mh_temperature_start = config.mh_temperature_start
-        self.mh_anneal_fraction = config.mh_anneal_fraction
-        self.mh_eps = config.mh_eps
         self.eps = config.eps
+        self.weights = {
+            "scale": config.scale_w,
+            "shape": config.shape_w,
+            "center": config.center_w,
+        }
 
-        # Current temperature multiplier.  A tensor buffer, not a Python
-        # float: torch.compile guards on float attributes and would recompile
-        # every step while it anneals, whereas buffer values are graph inputs.
-        # Non-persistent, so checkpoints are unchanged; it starts at the final
-        # value, which is what evaluation of a trained model should use.
-        self.register_buffer(
-            "mh_temperature_now",
-            torch.tensor(float(config.mh_temperature)),
-            persistent=False,
-        )
-
-    @torch.no_grad()
-    def reset_annealing(self) -> None:
-        """Set the temperature multiplier back to its final value.
-
-        Called after loading (see ``JepaModel._init_weights``): the buffer is
-        not saved, so a loaded model would otherwise hold uninitialized memory.
-        """
-        self.mh_temperature_now.fill_(float(self.mh_temperature))
-
-    @torch.no_grad()
-    def set_anneal_progress(self, progress: float) -> None:
-        """Set the annealed temperature for training progress in ``[0, 1]``.
-
-        Decays geometrically from ``mh_temperature_start`` to
-        ``mh_temperature`` over the first ``mh_anneal_fraction`` of training,
-        then stays at ``mh_temperature``.
-        """
-        t = min(1.0, max(0.0, progress / self.mh_anneal_fraction))
-        value = self.mh_temperature_start * (
-            self.mh_temperature / self.mh_temperature_start
-        ) ** t
-        self.mh_temperature_now.fill_(value)
-
-    def _reg_terms(self, z):
-        """Returns (scale, shape, center) losses for a single tensor."""
+    def _terms(self, z: Tensor) -> dict[str, Tensor]:
+        """Scale/shape/center for a single ``(N, D)`` fp32 tensor."""
         N, D = z.shape
         device = z.device
+        zero = z.new_zeros(())
 
         if N < 2:  # edge case: almost no valid tokens
-            return z.new_zeros(()), z.new_zeros(()), z.new_zeros(())
+            return {"scale": zero, "shape": zero, "center": zero}
 
         # Center
         mu = z.mean(dim=0)
@@ -129,11 +104,100 @@ class VISRegLoss(nn.Module):
 
         l_shape = ((sorted_proj - target_q) ** 2).mean()
 
-        return l_scale, l_shape, l_center
+        return {"scale": l_scale, "shape": l_shape, "center": l_center}
 
-    def _multi_hypothesis_loss(
-        self, futures, target, mask, reg_source, reg_mask
-    ):
+    def forward(self, latents: Tensor, mask: Tensor | None = None) -> LossOutput:
+        """Regularize the online encoder latents.
+
+        Args:
+            latents: ``(..., D)`` encoder latents.
+            mask: optional ``(...)`` boolean/0-1 mask; only masked positions
+                contribute.
+
+        Returns:
+            :class:`LossOutput` with terms ``scale``, ``shape``, ``center``
+            and no diagnostics.
+        """
+        device_type = "cuda" if latents.is_cuda else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            z = latents.float()
+            if mask is not None:
+                z = z[mask.bool().to(z.device)]
+            else:
+                z = z.reshape(-1, z.shape[-1])
+            terms = self._terms(z)
+            loss = sum(self.weights[name] * terms[name] for name in terms)
+        return LossOutput(loss=loss, terms=terms, diagnostics={})
+
+
+class CommitmentLoss(nn.Module):
+    """The commitment objective on the predictor's proposal.
+
+    :class:`~jepa.models.commitment.Futures` holds ``(B, T, P, D)``
+    candidates, ``(B, T, P)`` win-probability logits pi, and a ``(B, T, D)``
+    mean future mu.  The single-prediction invariance term is replaced by:
+
+    * a relaxed winner-takes-all move loss that pulls each target toward its
+      nearest candidate (with a small uniform component so no candidate dies),
+    * a cross-entropy that trains pi to predict the same soft assignment from
+      ``z_t`` alone (which candidate will be closest; used for sampling),
+    * a regression of mu onto the normalized target, so mu learns
+      ``E[ŷ | z_t]`` (auxiliary; its input is detached in the predictor),
+    * an optional diversity penalty that stops candidates collapsing onto the
+      same direction.
+
+    Weights and annealing live in
+    :class:`jepa.config.CommitmentLossConfig`.
+    """
+
+    def __init__(self, config: CommitmentLossConfig | None = None, **overrides):
+        super().__init__()
+
+        if config is None:
+            config = CommitmentLossConfig(**overrides)
+        elif overrides:
+            raise ValueError("Pass either `config` or keyword overrides, not both.")
+
+        config.validate()
+
+        self.config = config
+        self.diversity_margin = config.diversity_margin
+        self.temperature = config.temperature
+        self.temperature_start = config.temperature_start
+        self.anneal_fraction = config.anneal_fraction
+        self.smoothing = config.smoothing
+        self.weights = {
+            "move": config.move_w,
+            "pi": config.pi_w,
+            "mu": config.mu_w,
+            "diversity": config.diversity_w,
+        }
+
+    def temperature_multiplier(self, progress: Tensor | None, like: Tensor) -> Tensor:
+        """Annealed multiplier on the soft-assignment temperature.
+
+        ``progress`` is the fraction of training completed, a 0-dim tensor in
+        ``[0, 1]``.  ``None`` means 1.0, i.e. the final temperature, which is
+        what evaluation should use.  Everything is tensor arithmetic (no
+        Python branch on the value), so ``torch.compile`` does not recompile
+        as training progresses.
+        """
+        if progress is None:
+            progress = like.new_ones(())
+        else:
+            progress = torch.as_tensor(progress, dtype=like.dtype, device=like.device)
+        fraction = (progress / self.anneal_fraction).clamp(0.0, 1.0)
+        return self.temperature_start * (
+            self.temperature / self.temperature_start
+        ) ** fraction
+
+    def _loss(
+        self,
+        futures,
+        target: Tensor,
+        mask: Tensor | None,
+        progress: Tensor | None,
+    ) -> LossOutput:
         """Loss for ``(B, T, P, D)`` candidates, ``(B, T, P)`` pi logits and a
         ``(B, T, D)`` mu from the same :class:`Futures`.
 
@@ -145,11 +209,6 @@ class VISRegLoss(nn.Module):
         distance is ``2 - 2 ĉ_i · mu``, minimized by the candidate nearest the
         mean future, which no multi-candidate head can beat a single mean
         predictor at.
-
-        ``reg_source`` holds the online encoder latents that VISReg acts on.
-        Regularizing those directly prevents the predictor from satisfying
-        the distribution terms by transforming its own output while leaving
-        the encoder collapsed.
         """
         candidates = futures.candidates
         batch, seq, count, _ = candidates.shape
@@ -174,16 +233,15 @@ class VISRegLoss(nn.Module):
 
         # Adaptive temperature: relative differences stay usable even as the
         # overall distance shrinks during training.
+        multiplier = self.temperature_multiplier(progress, cand)
         d_mean = (d.detach() * valid_f.unsqueeze(-1)).sum() / (denom * count)
-        temperature = (
-            self.mh_temperature_now.to(d_mean.dtype) * d_mean
-        ).clamp_min(1e-6)
+        temperature = (multiplier.to(d_mean.dtype) * d_mean).clamp_min(1e-6)
 
         # Relaxed winner-takes-all assignment.  The uniform smoothing keeps
         # every candidate alive instead of only the current winner.
         with torch.no_grad():
             r = F.softmax(-d.detach() / temperature, dim=-1)
-            r = (1.0 - self.mh_eps) * r + self.mh_eps / count
+            r = (1.0 - self.smoothing) * r + self.smoothing / count
             r = r * valid_f.unsqueeze(-1)
 
         l_move = (r * d).sum(-1)  # (B, T)
@@ -192,8 +250,8 @@ class VISRegLoss(nn.Module):
         # pi: the head sees only z_t, so this teaches it how likely each
         # candidate is to be the closest, without access to the target.
         log_probs = F.log_softmax(logits, dim=-1)
-        l_score = -(r * log_probs).sum(-1)  # (B, T)
-        l_score = (l_score * valid_f).sum() / denom
+        l_pi = -(r * log_probs).sum(-1)  # (B, T)
+        l_pi = (l_pi * valid_f).sum() / denom
 
         def masked_mean(values):
             return (values * valid_f).sum() / denom
@@ -201,28 +259,26 @@ class VISRegLoss(nn.Module):
         d_detached = d.detach()
         # Distance of the pi-argmax candidate (greedy generation's choice).
         picked = logits.detach().argmax(dim=-1, keepdim=True)
-        selected_d = masked_mean(d_detached.gather(-1, picked).squeeze(-1))
+        pi_argmax_d = masked_mean(d_detached.gather(-1, picked).squeeze(-1))
 
         # mu: regress onto the normalized target, so mu -> E[ŷ | z_t].  Its
         # input is detached in the predictor, so this only trains mean_head.
         tgt_unit = F.normalize(tgt, dim=-1)
-        l_mean = masked_mean((mu - tgt_unit).pow(2).sum(-1))
+        l_mu = masked_mean((mu - tgt_unit).pow(2).sum(-1))
         with torch.no_grad():
-            mean_stats = {
-                "mean_norm": masked_mean(mu.norm(dim=-1)),
-                # The direction of mu is the optimal single-head
-                # prediction: what multiple candidates must beat.
-                "mean_dir_d": masked_mean(
-                    2.0 - 2.0 * (F.normalize(mu, dim=-1) * tgt_unit).sum(-1)
-                ),
-            }
+            mu_norm = masked_mean(mu.norm(dim=-1))
+            # The direction of mu is the optimal single-head prediction: what
+            # multiple candidates must beat.
+            mu_dir_d = masked_mean(
+                2.0 - 2.0 * (F.normalize(mu, dim=-1) * tgt_unit).sum(-1)
+            )
 
         # Optional repulsion between candidates.  Off-diagonal cosine
         # similarity is penalized only above ``diversity_margin``, i.e. only
         # for near-duplicates.  With margin 0 any positive cosine costs,
         # and pointing orthogonal to everything becomes a free hiding place
         # for unused slots.
-        if self.diversity_w > 0 and count > 1:
+        if self.weights["diversity"] > 0 and count > 1:
             dirs = F.normalize(cand, dim=-1)
             n_valid = valid_f.sum()
             # Pairwise similarities for every position, then sum only over the
@@ -235,72 +291,46 @@ class VISRegLoss(nn.Module):
             mask_div = valid_f.reshape(-1, 1, 1)
             l_div = (
                 F.relu(sim - self.diversity_margin) * off_diag * mask_div
-            ).sum() / (
-                (n_valid * count * (count - 1)).clamp_min(1)
-            )
+            ).sum() / ((n_valid * count * (count - 1)).clamp_min(1))
         else:
             l_div = cand.new_zeros(())
 
-        # VISReg acts on the online encoder latents, not on the predictor
-        # output.  Applying it to the committed future would let the predictor
-        # cancel the encoder's mean in its own output without fixing the
-        # encoder.
-        reg_z = reg_source.float()
-        if reg_mask is not None:
-            reg_valid = reg_mask.bool().to(reg_z.device)
-            reg_z = reg_z[reg_valid]
-        else:
-            reg_z = reg_z.reshape(-1, reg_z.shape[-1])
-        l_scale, l_shape, l_center = self._reg_terms(reg_z)
-
-        loss = (
-            self.move_w * l_move
-            + self.score_w * l_score
-            + self.mean_w * l_mean
-            + self.diversity_w * l_div
-            + self.scale_w * l_scale
-            + self.shape_w * l_shape
-            + self.center_w * l_center
-        )
-
-        stats = {
-            "loss_move": l_move.detach(),
-            "loss_score": l_score.detach(),
-            "loss_mean": l_mean.detach(),
-            "loss_diversity": l_div.detach(),
-            "loss_scale": l_scale.detach(),
-            "loss_shape": l_shape.detach(),
-            "loss_center": l_center.detach(),
-            "best_d": (d.detach().min(-1).values * valid_f).sum() / denom,
-            "selected_d": selected_d,
-            **mean_stats,
-            "temperature": temperature.detach(),
+        terms = {
+            "move": l_move,
+            "pi": l_pi,
+            "mu": l_mu,
+            "diversity": l_div,
         }
-        return loss, stats
+        loss = sum(self.weights[name] * terms[name] for name in terms)
+        diagnostics = {
+            "best_d": (d_detached.min(-1).values * valid_f).sum() / denom,
+            "pi_argmax_d": pi_argmax_d,
+            "mu_norm": mu_norm,
+            "mu_dir_d": mu_dir_d,
+            "temperature": multiplier.detach(),
+        }
+        return LossOutput(loss=loss, terms=terms, diagnostics=diagnostics)
 
     def forward(
         self,
         futures,
-        target,
-        mask=None,
-        reg_source=None,
-        reg_mask=None,
-        return_stats=False,
-    ):
+        target: Tensor,
+        mask: Tensor | None = None,
+        progress: Tensor | None = None,
+    ) -> LossOutput:
         """
         Args:
             futures: :class:`jepa.models.commitment.Futures` with
                 ``(B, T, P, D)`` candidates, ``(B, T, P)`` pi logits and
                 ``(B, T, D)`` mu.
-            target: (B, T, D)
-            mask: (B, T), 1 => valid prediction position
-            reg_source: (B, S, D) online encoder latents for VISReg.
-            reg_mask: (B, S), 1 => valid token in ``reg_source``.
-            return_stats: also return detached (scalar) diagnostics for
-                logging.
+            target: ``(B, T, D)``.
+            mask: ``(B, T)``, 1 => valid prediction position.
+            progress: 0-dim tensor with the fraction of training completed, or
+                ``None`` for the final temperature (evaluation).
 
         Returns:
-            The loss, or ``(loss, stats)`` when ``return_stats`` is True.
+            :class:`LossOutput` with terms ``move``, ``pi``, ``mu``,
+            ``diversity`` and detached diagnostics.
         """
         candidates = futures.candidates
         if candidates.ndim != 4:
@@ -313,12 +343,7 @@ class VISRegLoss(nn.Module):
                 f"target shape {tuple(target.shape)} must match mu shape "
                 f"{tuple(futures.mu.shape)}"
             )
-        if reg_source is None:
-            raise ValueError("reg_source (online encoder latents) is required")
 
         device_type = "cuda" if candidates.is_cuda else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            loss, stats = self._multi_hypothesis_loss(
-                futures, target, mask, reg_source, reg_mask
-            )
-        return (loss, stats) if return_stats else loss
+            return self._loss(futures, target, mask, progress)

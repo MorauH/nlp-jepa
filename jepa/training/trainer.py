@@ -179,12 +179,18 @@ class JepaTrainer:
             **kwargs,
         )
 
-    def _losses(self, labels, attention_mask) -> dict[str, torch.Tensor]:
+    def _losses(
+        self, labels, attention_mask, progress=None
+    ) -> dict[str, torch.Tensor]:
         """Forward one batch; return the weighted total and its components.
 
         A frozen JEPA part reports ``loss=None`` and a skipped decoder returns
         ``decoder_out=None``: the missing term is left out of the total, and
         its key never reaches the history.
+
+        Every JEPA loss term and diagnostic is returned as
+        ``jepa_<name>``, so the history records the full breakdown next to the
+        totals.
         """
         jepa_out, decoder_out = self.model(
             labels=labels,
@@ -192,12 +198,17 @@ class JepaTrainer:
             training=True,
             right_padded=self.right_padded,
             loss_chunk_size=self.decoder_loss_chunk_size,
+            progress=progress,
         )
         values = {}
         terms = []
         if jepa_out["loss"] is not None:
             values["jepa_loss"] = jepa_out["loss"]
             terms.append(self.jepa_loss_weight * jepa_out["loss"])
+            for name, value in jepa_out["terms"].items():
+                values[f"jepa_{name}"] = value
+            for name, value in jepa_out["diagnostics"].items():
+                values[f"jepa_{name}"] = value
         if decoder_out is not None:
             values["decoder_loss"] = decoder_out["loss"]
             terms.append(self.decoder_loss_weight * decoder_out["loss"])
@@ -369,9 +380,6 @@ class JepaTrainer:
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         self.model.train()
         global_step = 0
-        criterion = getattr(self._raw_model, "criterion", None)
-        if not hasattr(criterion, "set_anneal_progress"):
-            criterion = None
 
         for epoch in range(num_epochs):
             batch_sampler = getattr(train_loader, "batch_sampler", None)
@@ -391,14 +399,15 @@ class JepaTrainer:
                 if labels.shape[1] <= horizon:
                     continue
 
-                # Annealed winner-takes-all temperature (no-op unless
-                # VISRegConfig.mh_temperature_start is set).  Updates a buffer
-                # in place, so it does not trigger torch.compile recompiles.
-                if criterion is not None:
-                    criterion.set_anneal_progress(global_step / total_steps)
+                # Annealed winner-takes-all temperature.  A 0-dim tensor, so
+                # torch.compile treats it as a graph input instead of a Python
+                # value to guard on.
+                progress = torch.tensor(
+                    global_step / total_steps, device=device
+                )
 
                 with self._autocast(device):
-                    values = self._losses(labels, attention_mask)
+                    values = self._losses(labels, attention_mask, progress)
                     loss = values["loss"]
 
                 optimizer.zero_grad(set_to_none=True)
@@ -463,9 +472,16 @@ class JepaTrainer:
                 parts = ", ".join(
                     f"{name.replace('_loss', '')} {value:.4f}"
                     for name, value in means.items()
-                    if name not in ("loss", "perplexity")
+                    if name in ("jepa_loss", "decoder_loss")
                 )
                 return f"{means['loss']:.4f} ({parts})"
+
+            def describe_terms(means: dict[str, float]) -> str:
+                return ", ".join(
+                    f"{name.removeprefix('jepa_')} {value:.4f}"
+                    for name, value in means.items()
+                    if name.startswith("jepa_") and name != "jepa_loss"
+                )
 
             summary = (
                 f"epoch {epoch + 1}: train {describe(train_means)} | "
@@ -473,6 +489,12 @@ class JepaTrainer:
             )
             if "perplexity" in val_means:
                 summary += f" | val_ppl {val_means['perplexity']:.2f}"
+            train_terms = describe_terms(train_means)
+            if train_terms:
+                summary += f"\n  train terms: {train_terms}"
+            val_terms = describe_terms(val_means)
+            if val_terms:
+                summary += f"\n  val terms:   {val_terms}"
             print(summary)
 
             if device.type == "cuda":

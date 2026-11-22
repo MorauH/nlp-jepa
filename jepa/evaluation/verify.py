@@ -275,7 +275,7 @@ def main(argv: list[str] | None = None) -> None:
 
         # mu = predicted mean normalized future.  Its norm: ~1 predictable,
         # short = divergent futures.
-        mean_norm = futures.mu.float().norm(dim=-1)[valid].mean()
+        mu_norm = futures.mu.float().norm(dim=-1)[valid].mean()
 
         print("\n--- representation health ---")
         print(
@@ -314,7 +314,7 @@ def main(argv: list[str] | None = None) -> None:
             f"{fmt(majority_accuracy)}"
         )
         print(
-            f"|mu|:               {fmt(mean_norm)}  "
+            f"|mu|:               {fmt(mu_norm)}  "
             "[~1 predictable future; short = divergent futures]"
         )
 
