@@ -169,7 +169,8 @@ def build_model(tokenizer) -> JepaModel:
     return JepaModel(JepaConfig.from_encoder(encoder_config))
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> JepaTrainer:
+    """Run one stage; return the trainer (its model is what was loaded)."""
     args = parse_args(argv)
     stage = args.stage
     output_dir = args.output_dir
@@ -256,6 +257,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     trainer.train()
+    return trainer
 
 
 if __name__ == "__main__":

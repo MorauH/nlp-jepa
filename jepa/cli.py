@@ -12,7 +12,7 @@ from .evaluation.measure import main as measure
 from .inference.generate import main as generate
 from .training.train import main as train
 
-Command = Callable[[list[str] | None], None]
+Command = Callable[[list[str] | None], object]
 
 COMMANDS: dict[str, tuple[Command, str]] = {
     "train": (train, "Train the JEPA stage or the decoder stage."),

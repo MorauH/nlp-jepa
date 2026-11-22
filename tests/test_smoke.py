@@ -1038,9 +1038,25 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
         reloaded.decoder.embedding.weight, base_model.decoder.embedding.weight
     )
 
-    # --resume keeps training *that* decoder (not a fresh one), stays frozen
-    # elsewhere, and appends to the decoder history.  --epochs 2 because the
-    # finished first epoch is not replayed.
+    # With no epochs left, --resume still has to load *that* decoder, not attach
+    # a fresh one from --from: the returned model is the saved checkpoint's.
+    saved_decoder = [p.detach().clone() for p in reloaded.decoder.parameters()]
+    loaded = train.main(
+        [
+            "--stage", "decoder",
+            "--resume",
+            "--from", str(base),
+            "--fineweb-dir", str(data_dir),
+            "--tokenizer", str(tmp_path / "unused-tokenizer"),
+            "--batch-size", "2",
+            "--epochs", "1",
+            "--device", "cpu",
+        ]
+    )
+    for trained, saved in zip(loaded.model.decoder.parameters(), saved_decoder):
+        assert torch.equal(trained, saved)
+
+    # One more epoch continues from that decoder and appends to the history.
     train.main(
         [
             "--stage", "decoder",
@@ -1054,7 +1070,6 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
         ]
     )
     resumed = JepaModel.from_pretrained(str(out))
-    # The resumed decoder kept training from the saved one, not from `--from`.
     assert not torch.equal(
         resumed.decoder.embedding.weight, reloaded.decoder.embedding.weight
     )

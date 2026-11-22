@@ -1,23 +1,12 @@
 """Training loop for :class:`jepa.models.jepa.JepaModel`.
 
-One loop serves both stages (see ``docs/adr/0001-two-stage-training.md``):
+One loop serves both stages (``docs/adr/0001-two-stage-training.md``):
+``stage="jepa"`` trains encoder+predictor and never runs the decoder;
+``stage="decoder"`` trains the decoder against the frozen JEPA.
 
-* ``stage="jepa"`` optimizes the encoder and predictor with
-  :meth:`JepaModel.jepa_loss`; the decoder is frozen and never run.
-* ``stage="decoder"`` optimizes the decoder with
-  :meth:`JepaModel.decoder_loss`; the encoder and predictor are frozen.
-
-The trainer owns the freezing and the eval/train modes; the model itself has
-no stage flags.  A stage's loss function is compiled as a whole, while
-checkpoints are always written from the uncompiled model.
-
-Engineering settings live here as module-level constants, the single source.
-:class:`TrainConfig` carries only the per-run values.  AMP and
-``torch.compile`` are enabled only on CUDA, so a CPU run is always eager fp32.
-
-Every save also writes ``trainer_state_<stage>.pt`` (optimizer, scheduler,
-position, RNG).  ``TrainConfig.resume`` continues from it: the schedule is not
-restarted and the interrupted epoch is replayed only to skip consumed batches.
+Engineering settings are the module constants here; :class:`TrainConfig` holds
+only per-run values.  AMP and ``torch.compile`` are CUDA-only.  The stage loss
+is compiled; checkpoints come from the uncompiled model.
 """
 
 from __future__ import annotations
@@ -45,40 +34,28 @@ from .data import LengthBucketBatchSampler, example_lengths, tokenize_batch
 
 STAGES = ("jepa", "decoder")
 
-# ---------------------------------------------------------------------------
-# Engineering settings: the single source for constants the loop reads.
-# ---------------------------------------------------------------------------
-# bf16 autocast and torch.compile apply only on CUDA; CPU runs stay eager fp32
-# so the test suite never needs a switch.
 USE_AMP = True
 COMPILE_MODEL = True
 COMPILE_MODE = "default"
-# Pad every batch to a multiple of this many tokens: aligned tensor-core tiles
-# and fewer distinct compiled shapes.
+# Pad to a multiple of this many tokens (aligned tiles, fewer compiled shapes).
 PAD_TO_MULTIPLE_OF = 64
-# Steps between tqdm updates.  Each update synchronizes the GPU.
-LOG_EVERY = 10
+LOG_EVERY = 10  # steps between tqdm updates (each one synchronizes the GPU)
 MAX_GRAD_NORM = 1.0
 WEIGHT_DECAY = 0.01
 SEED = 42
-# Linear warmup for the first WARMUP_FRACTION of steps, then cosine decay to
-# LR_FLOOR_FRACTION of the peak.
+# Linear warmup for WARMUP_FRACTION of the steps, then cosine decay to the floor.
 WARMUP_FRACTION = 0.01
 LR_FLOOR_FRACTION = 0.1
-# Checkpoint every N optimizer steps as well as at epoch end.  None or 0
-# disables mid-epoch saves.
-SAVE_EVERY_STEPS = 2000
+SAVE_EVERY_STEPS = 2000  # None or 0 disables mid-epoch saves
 
 
 def _cpu_count() -> int:
     """Number of CPUs this process may use."""
     if hasattr(os, "process_cpu_count"):  # Python >= 3.13
-        count = os.process_cpu_count()
-    elif hasattr(os, "sched_getaffinity"):
-        count = len(os.sched_getaffinity(0))
-    else:
-        count = os.cpu_count()
-    return max(1, count or 1)
+        return max(1, os.process_cpu_count() or 1)
+    if hasattr(os, "sched_getaffinity"):
+        return max(1, len(os.sched_getaffinity(0)))
+    return max(1, os.cpu_count() or 1)
 
 
 DEFAULT_NUM_WORKERS = min(8, _cpu_count())
@@ -100,11 +77,7 @@ class TrainConfig:
 
 
 def _parameter_groups(model, weight_decay: float):
-    """Split trainable parameters into decayed and non-decayed groups.
-
-    Weight decay must not touch biases or normalization scales: decaying an
-    RMSNorm weight collapses the residual stream.
-    """
+    """Decayed and non-decayed parameters (no decay on biases and norms)."""
     decay, no_decay = [], []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
@@ -113,10 +86,18 @@ def _parameter_groups(model, weight_decay: float):
             no_decay.append(parameter)
         else:
             decay.append(parameter)
-    return [
-        {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ]
+    return [{"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0}]
+
+
+def _lr_factor(step: int, *, warmup_steps: int, total_steps: int) -> float:
+    """Linear warmup, then cosine decay to ``LR_FLOOR_FRACTION``."""
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return LR_FLOOR_FRACTION + (1 - LR_FLOOR_FRACTION) * 0.5 * (
+        1 + math.cos(math.pi * progress)
+    )
 
 
 def _jepa_loss(model, labels, attention_mask, progress, policy):
@@ -127,122 +108,63 @@ def _decoder_loss(model, labels, attention_mask, progress, policy):
     return model.decoder_loss(labels, attention_mask=attention_mask, policy=policy)
 
 
-# Stateless; one instance keeps torch.compile from recompiling the validation
-# graph (it guards on the object).
-_EVAL_POLICY = PiArgmax()
+_EVAL_POLICY = PiArgmax()  # one instance; torch.compile guards on the object
 
 
 @dataclass(frozen=True)
 class _Stage:
-    """The per-stage differences the loop reads, looked up once.
-
-    modules:          model attributes this stage trains; the rest freeze.
-    loss:             ``(model, labels, attention_mask, progress, policy)``.
-    prefix:           log-key prefix.
-    logs_total:       log the weighted total under ``<prefix>loss``.
-    token_weighted:   validation perplexity = exp(token-weighted mean loss).
-    validation_policy: commit rule for validation (None = stage default).
-    """
+    """Trained modules, loss callable, log prefix and validation policy."""
 
     modules: tuple[str, ...]
     loss: Callable[..., LossOutput]
     prefix: str
-    logs_total: bool
-    token_weighted: bool
     validation_policy: Policy | None
 
 
 _STAGES = {
-    "jepa": _Stage(
-        modules=("encoder", "predictor"),
-        loss=_jepa_loss,
-        prefix="jepa_",
-        logs_total=True,
-        token_weighted=False,
-        validation_policy=None,
-    ),
-    "decoder": _Stage(
-        modules=("decoder",),
-        loss=_decoder_loss,
-        prefix="decoder_",
-        logs_total=False,
-        token_weighted=True,
-        validation_policy=_EVAL_POLICY,
-    ),
+    "jepa": _Stage(("encoder", "predictor"), _jepa_loss, "jepa_", None),
+    "decoder": _Stage(("decoder",), _decoder_loss, "decoder_", _EVAL_POLICY),
 }
 
 
 class JepaTrainer:
-    """Training loop for one stage of :class:`JepaModel`.
+    """Training loop for one stage of :class:`JepaModel`."""
 
-    Usage::
-
-        trainer = JepaTrainer(model, config, train_dataset, eval_dataset, tokenizer)
-        history = trainer.train()
-    """
-
-    def __init__(
-        self,
-        model: JepaModel,
-        config: TrainConfig,
-        train_dataset,
-        eval_dataset,
-        tokenizer,
-        *,
-        history: dict | None = None,
-    ):
+    def __init__(self, model: JepaModel, config: TrainConfig, train_dataset,
+                 eval_dataset, tokenizer, *, history: dict | None = None):
         if config.stage not in _STAGES:
-            raise ValueError(
-                f"stage must be one of {STAGES}; got {config.stage!r}"
-            )
-
+            raise ValueError(f"stage must be one of {STAGES}; got {config.stage!r}")
         self.model = model
         self.config = config
         self.stage = _STAGES[config.stage]
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
-
-        self.num_workers = (
-            DEFAULT_NUM_WORKERS
-            if config.num_workers is None
-            else max(0, int(config.num_workers))
-        )
-        self.save_every_steps = (
-            int(config.save_every_steps) if config.save_every_steps else None
-        )
-
+        self.num_workers = (DEFAULT_NUM_WORKERS if config.num_workers is None
+                            else max(0, int(config.num_workers)))
+        self.save_every_steps = (int(config.save_every_steps)
+                                 if config.save_every_steps else None)
         self.history_file = f"history_{config.stage}.json"
-        self._amp_dtype: torch.dtype | None = None
-        # Replaced by the compiled stage loss when compilation is enabled.
-        self._loss_fn = partial(self.stage.loss, self.model)
         self.history = history if history is not None else {}
-        # Set by train(); _save writes them so --resume can continue the run.
+        self._amp_dtype: torch.dtype | None = None
+        self._loss_fn = partial(self.stage.loss, self.model)  # compiled in _prepare
+        # Set by train(); _checkpoint writes what --resume needs.
         self._optimizer = None
         self._scheduler = None
         self._device: torch.device | None = None
         self._position: dict = {}
+        self._num_epochs = 0
+        self._total_steps = 0
 
-    # ------------------------------------------------------------------
-    # Stage ownership
-    # ------------------------------------------------------------------
     def _stage_modules(self):
         """Return ``(trainable, frozen)`` module lists for this stage."""
         trainable = [getattr(self.model, name) for name in self.stage.modules]
-        frozen = [
-            getattr(self.model, name)
-            for name in ("encoder", "predictor", "decoder")
-            if name not in self.stage.modules
-        ]
+        frozen = [getattr(self.model, name) for name in ("encoder", "predictor", "decoder")
+                  if name not in self.stage.modules]
         return trainable, frozen
 
     def _apply_stage(self, training: bool) -> None:
-        """Set requires_grad and train/eval modes owned by the stage.
-
-        There is deliberately no top-level ``model.train(...)``: the commit
-        policy is an argument to :meth:`JepaModel.decoder_loss`, not a function
-        of the model's mode.  Only the stage modules' modes matter.
-        """
+        """Set the stage modules' modes; the commit policy is a loss argument."""
         trainable, frozen = self._stage_modules()
         for module in trainable:
             module.requires_grad_(True)
@@ -251,30 +173,23 @@ class JepaTrainer:
             module.requires_grad_(False)
             module.eval()
 
-    # ------------------------------------------------------------------
-    # Loss
-    # ------------------------------------------------------------------
-    def _losses(
-        self, labels, attention_mask, progress=None, policy=None
-    ) -> dict[str, torch.Tensor]:
-        """Forward one batch; return the total and its components.
+    def _losses(self, labels, attention_mask, progress=None, policy=None):
+        """Forward one batch; return the logged values.
 
-        Terms and diagnostics are logged under the stage's prefix.  The JEPA
-        stage also logs its weighted total as ``jepa_loss``; the decoder's
-        total is its token term.
+        ``loss`` is the weighted total.  Every term and diagnostic is logged
+        under the stage prefix; a loss with several terms also logs its total
+        as ``<prefix>loss`` (a single term already is the total).
         """
         out = self._loss_fn(labels, attention_mask, progress, policy)
         prefix = self.stage.prefix
-        values = {
-            f"{prefix}{name}": value
-            for name, value in (*out.terms.items(), *out.diagnostics.items())
-        }
-        if self.stage.logs_total:
+        values = {f"{prefix}{name}": value
+                  for name, value in (*out.terms.items(), *out.diagnostics.items())}
+        if len(out.terms) > 1:
             values[f"{prefix}loss"] = out.loss
         values["loss"] = out.loss
         return values
 
-    def _autocast(self, device: torch.device):
+    def _autocast(self, device):
         if self._amp_dtype is None:
             return nullcontext()
         return torch.autocast(device_type=device.type, dtype=self._amp_dtype)
@@ -289,38 +204,24 @@ class JepaTrainer:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    def _make_loader(self, dataset, shuffle: bool, device, collate_fn) -> DataLoader:
+    def _make_loader(self, dataset, shuffle, device, collate_fn) -> DataLoader:
+        """Build a train (length-bucketed) or validation loader."""
         kwargs = dict(
             num_workers=self.num_workers,
             persistent_workers=self.num_workers > 0,
             pin_memory=device.type == "cuda",
             collate_fn=collate_fn,
-            # A dedicated generator: creating a loader iterator otherwise draws
-            # a base seed from the global RNG, which would desynchronize a
-            # resumed run from the uninterrupted schedule (the shapes of the
-            # VISReg slices depend on the global stream).
+            # A dedicated generator keeps the loader seed off the global RNG.
             generator=torch.Generator().manual_seed(SEED),
         )
         if self.num_workers > 0:
             kwargs["prefetch_factor"] = 4
-
-        if shuffle:
-            # Bucket by length to avoid padding every batch to 1024.
-            return DataLoader(
-                dataset,
-                batch_sampler=LengthBucketBatchSampler(
-                    example_lengths(dataset),
-                    self.config.batch_size,
-                    seed=SEED,
-                ),
-                **kwargs,
-            )
-        return DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            **kwargs,
-        )
+        if shuffle:  # bucket by length to avoid padding every batch to 1024
+            sampler = LengthBucketBatchSampler(
+                example_lengths(dataset), self.config.batch_size, seed=SEED)
+            return DataLoader(dataset, batch_sampler=sampler, **kwargs)
+        return DataLoader(dataset, batch_size=self.config.batch_size,
+                          shuffle=False, **kwargs)
 
     @staticmethod
     def _means(totals: dict[str, torch.Tensor], n: int) -> dict[str, float]:
@@ -328,77 +229,55 @@ class JepaTrainer:
         names = list(totals)
         if not names:  # every batch was shorter than pred_horizon
             return {"loss": float("nan")}
-        values = torch.stack(
-            [totals[name] / max(1, n) for name in names]
-        ).tolist()
+        values = torch.stack([totals[name] / max(1, n) for name in names]).tolist()
         return dict(zip(names, values))
 
-    def _accumulate(
-        self, totals: dict[str, torch.Tensor], values: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
+    def _accumulate(self, totals, values):
+        """Add this batch's values to the running totals, on the GPU."""
         for name, value in values.items():
             if name not in totals:
                 totals[name] = torch.zeros((), device=value.device)
-            # Accumulate on the GPU and synchronize only when logging.
             totals[name] += value.detach()
         return totals
 
     @torch.no_grad()
     def evaluate(self, val_loader: DataLoader, device: torch.device) -> dict[str, float]:
-        """Return the average validation losses."""
+        """Return the average validation losses (and perplexity if weighted)."""
         self._apply_stage(training=False)
-        horizon = self.model.pred_horizon
+        tokens_key = f"{self.stage.prefix}tokens"
         totals: dict[str, torch.Tensor] = {}
         n_batches = 0
-        # 0-dim tensor, not None: the same graph inputs as training under
-        # torch.compile.  1.0 means the final commitment temperature.
+        # 0-dim tensor: the same graph input as training; 1.0 = final temperature.
         progress = torch.ones((), device=device)
         policy = self.stage.validation_policy
         token_sum = token_count = None
-
         for labels, attention_mask in val_loader:
             labels = labels.to(device, non_blocking=True)
             attention_mask = attention_mask.to(device, non_blocking=True)
-            if labels.shape[1] <= horizon:
+            if labels.shape[1] <= self.model.pred_horizon:
                 continue
             with self._autocast(device):
                 values = self._losses(labels, attention_mask, progress, policy)
                 self._accumulate(totals, values)
-            if self.stage.token_weighted:
-                prefix = self.stage.prefix
-                count = values[f"{prefix}tokens"]
-                contribution = values[f"{prefix}token"] * count
-                token_sum = (
-                    contribution if token_sum is None else token_sum + contribution
-                )
+            # A ``tokens`` diagnostic means the loss is a per-token mean:
+            # weight it by its token count for an exact perplexity.
+            if tokens_key in values:
+                count = values[tokens_key]
+                contribution = values["loss"] * count
+                token_sum = contribution if token_sum is None else token_sum + contribution
                 token_count = count if token_count is None else token_count + count
             n_batches += 1
-
         self._apply_stage(training=True)
         if n_batches == 0:
             return {"loss": float("nan")}
-
         averages = self._means(totals, n_batches)
-        if self.stage.token_weighted:
-            # One path: perplexity of the token-weighted mean token loss.
+        if token_sum is not None:
             mean_token_loss = (token_sum / token_count.clamp_min(1)).item()
             averages["perplexity"] = math.exp(min(mean_token_loss, 20.0))
         return averages
 
-    def _state_file(self, output_dir: str | Path) -> str:
+    def _state_file(self, output_dir) -> str:
         return os.path.join(output_dir, f"trainer_state_{self.config.stage}.pt")
-
-    def _set_position(self, *, epoch, epoch_step, global_step, total_steps, totals):
-        """Record where the next resume should continue from."""
-        self._position = {
-            "epoch": int(epoch),
-            "epoch_step": int(epoch_step),
-            "global_step": int(global_step),
-            "total_steps": int(total_steps),
-            "epoch_totals": {
-                name: value.detach().cpu() for name, value in totals.items()
-            },
-        }
 
     @staticmethod
     def _restore_rng(rng: dict, device: torch.device) -> None:
@@ -410,17 +289,14 @@ class JepaTrainer:
 
     def _trainer_state(self) -> dict:
         """Everything a resumed run needs besides the model weights."""
-        state = {
-            **self._position,
-            "optimizer": self._optimizer.state_dict(),
-            "scheduler": self._scheduler.state_dict(),
-            "rng": {"cpu": torch.get_rng_state()},
-        }
+        state = {**self._position, "optimizer": self._optimizer.state_dict(),
+                 "scheduler": self._scheduler.state_dict(),
+                 "rng": {"cpu": torch.get_rng_state()}}
         if self._device is not None and self._device.type == "cuda":
             state["rng"]["cuda"] = torch.cuda.get_rng_state_all()
         return state
 
-    def _load_trainer_state(self, output_dir: str | Path) -> dict:
+    def _load_trainer_state(self, output_dir) -> dict:
         path = self._state_file(output_dir)
         if not os.path.exists(path):
             raise FileNotFoundError(
@@ -430,7 +306,7 @@ class JepaTrainer:
             )
         return torch.load(path, map_location="cpu", weights_only=True)
 
-    def _save(self, output_dir: str | Path) -> None:
+    def _save(self, output_dir) -> None:
         """Save the model, this stage's history and the resume state."""
         os.makedirs(output_dir, exist_ok=True)
         # Save the original module, not a compiled wrapper (whose state dict
@@ -441,287 +317,226 @@ class JepaTrainer:
         if self._optimizer is not None:
             torch.save(self._trainer_state(), self._state_file(output_dir))
 
-    def train(self) -> dict:
-        """Train the model and return the loss history."""
-        config = self.config
-        stage = config.stage
-        device = select_device(config.device)
-        print(f"Device: {device} | dataloader workers: {self.num_workers}")
+    def _checkpoint(self, *, epoch, epoch_step, global_step, totals,
+                    end_of_epoch=False) -> None:
+        """Record where a resume continues, then save.
 
+        ``epoch`` is 0-based.  The resume position points at the next batch to
+        train: the start of the next epoch after an end-of-epoch save.  The
+        history's ``last_checkpoint`` reports the epoch 1-based, for people.
+        """
+        self._position = {
+            "epoch": epoch + 1 if end_of_epoch else epoch,
+            "epoch_step": 0 if end_of_epoch else epoch_step,
+            "global_step": global_step,
+            "total_steps": self._total_steps,
+            "epoch_totals": {} if end_of_epoch else
+                {name: value.detach().cpu() for name, value in totals.items()},
+        }
+        checkpoint = {"epoch": epoch + 1, "epoch_step": epoch_step,
+                      "global_step": global_step, "total_steps": self._total_steps}
+        if end_of_epoch:
+            checkpoint["end_of_epoch"] = True
+        else:
+            # Epoch history stays untouched; record the running train means.
+            checkpoint.update({f"train_{name}": value
+                               for name, value in self._means(totals, epoch_step).items()})
+        self.history["last_checkpoint"] = checkpoint
+        self._save(self.config.output_dir)
+
+    def _prepare(self, device: torch.device) -> None:
+        """Seed, backends, stage modes, AMP dtype and the compiled stage loss."""
         set_seed(SEED)
+        self._device = device
         self._configure_backends(device)
         self.model.to(device)
-        # Freeze the other stage before building the optimizer so its
-        # parameters never enter a group.
+        # Freeze the other stage before the optimizer groups are built.
         self._apply_stage(training=True)
+        self._amp_dtype = torch.bfloat16 if USE_AMP and device.type == "cuda" else None
+        compile_on = COMPILE_MODEL and device.type == "cuda"
+        print(f"stage: {self.config.stage} | AMP: {'bf16' if self._amp_dtype else 'off'}"
+              f" | compile: {compile_on} (mode={COMPILE_MODE})"
+              f" | pad multiple: {PAD_TO_MULTIPLE_OF}")
+        if compile_on:
+            self._compile_loss()
 
-        # bf16 autocast on CUDA; the CPU path runs in fp32.
-        self._amp_dtype = (
-            torch.bfloat16 if USE_AMP and device.type == "cuda" else None
-        )
-        amp_label = "bf16" if self._amp_dtype else "off"
-        compile_enabled = COMPILE_MODEL and device.type == "cuda"
-        print(
-            f"stage: {stage} | AMP: {amp_label} | compile: {compile_enabled} "
-            f"(mode={COMPILE_MODE}) | pad multiple: {PAD_TO_MULTIPLE_OF}"
-        )
+    def _compile_loss(self) -> None:
+        """Compile the stage loss, falling back to eager on failure."""
+        # dynamic=True avoids a recompile per sequence length or token count.
+        torch._dynamo.config.recompile_limit = 64
+        torch._dynamo.config.cache_size_limit = 64
+        torch._dynamo.config.suppress_errors = True
+        try:
+            # Only the stage's loss: the frozen stage stays out of the graph.
+            self._loss_fn = torch.compile(self._loss_fn, mode=COMPILE_MODE, dynamic=True)
+            print(f"torch.compile: enabled for {self.config.stage} loss")
+        except Exception as exc:  # pragma: no cover - depends on the backend
+            warnings.warn(f"torch.compile failed ({exc!r}); continuing eagerly.",
+                          RuntimeWarning)
+            self._loss_fn = partial(self.stage.loss, self.model)
 
-        if compile_enabled:
-            # ``dynamic=True`` keeps the varying sequence lengths and the
-            # variable number of valid tokens from triggering a recompile for
-            # every batch shape; ``suppress_errors`` falls back to eager
-            # instead of killing a long run.  64 covers every 64-token bucket.
-            torch._dynamo.config.recompile_limit = 64
-            torch._dynamo.config.cache_size_limit = 64
-            torch._dynamo.config.suppress_errors = True
-            try:
-                # Compile only the stage's loss: the other stage's modules are
-                # frozen and must stay out of the graph.
-                self._loss_fn = torch.compile(
-                    self._loss_fn, mode=COMPILE_MODE, dynamic=True
-                )
-                print(f"torch.compile: enabled for {stage} loss")
-            except Exception as exc:  # pragma: no cover - depends on the backend
-                warnings.warn(
-                    f"torch.compile failed ({exc!r}); continuing eagerly.",
-                    RuntimeWarning,
-                )
-                self._loss_fn = partial(self.stage.loss, self.model)
-
-        optimizer_kwargs = {}
-        if device.type == "cuda":
-            # Fused AdamW keeps the whole update in one CUDA kernel.
-            optimizer_kwargs["fused"] = True
+    def _build_optimizer(self):
+        """AdamW on the trainable parameters, fused on CUDA."""
+        kwargs = {"fused": True} if self._device.type == "cuda" else {}
         groups = _parameter_groups(self.model, WEIGHT_DECAY)
         try:
-            optimizer = torch.optim.AdamW(
-                groups, lr=config.learning_rate, **optimizer_kwargs
-            )
+            optimizer = torch.optim.AdamW(groups, lr=self.config.learning_rate, **kwargs)
         except (TypeError, RuntimeError):
-            optimizer_kwargs.pop("fused", None)
-            optimizer = torch.optim.AdamW(
-                groups, lr=config.learning_rate, **optimizer_kwargs
-            )
-        if optimizer_kwargs:
+            kwargs = {}
+            optimizer = torch.optim.AdamW(groups, lr=self.config.learning_rate)
+        if kwargs:
             print("Optimizer: AdamW (fused)")
+        return optimizer
 
-        collate = partial(
-            tokenize_batch,
-            tokenizer=self.tokenizer,
-            pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
-        )
-        train_loader = self._make_loader(
-            self.train_dataset, shuffle=True, device=device, collate_fn=collate
-        )
-        val_loader = self._make_loader(
-            self.eval_dataset, shuffle=False, device=device, collate_fn=collate
-        )
-
-        horizon = self.model.pred_horizon
-        num_epochs = max(1, int(config.epochs))
-
-        total_steps = max(1, len(train_loader) * num_epochs)
-        warmup_steps = max(1, int(total_steps * WARMUP_FRACTION))
-
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return (step + 1) / warmup_steps
-            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return LR_FLOOR_FRACTION + (1 - LR_FLOOR_FRACTION) * 0.5 * (
-                1 + math.cos(math.pi * progress)
-            )
-
+    def _build_scheduler(self, optimizer):
+        """Linear warmup, then cosine decay, planned over the run's steps."""
+        warmup_steps = max(1, int(self._total_steps * WARMUP_FRACTION))
+        lr_lambda = partial(_lr_factor, warmup_steps=warmup_steps,
+                            total_steps=self._total_steps)
         with warnings.catch_warnings():
             # LambdaLR steps once during construction; the warning is harmless.
-            warnings.filterwarnings(
-                "ignore", message="Detected call of `lr_scheduler.step"
-            )
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        self._optimizer = optimizer
-        self._scheduler = scheduler
-        global_step = 0
-        start_epoch = 0
-        skip_batches = 0
-        resumed_totals: dict[str, torch.Tensor] = {}
-        if config.resume:
-            state = self._load_trainer_state(config.output_dir)
-            if int(state.get("total_steps", total_steps)) != total_steps:
-                warnings.warn(
-                    f"resuming with total_steps={total_steps}, but the run "
-                    f"started with total_steps={state.get('total_steps')}; the "
-                    "LR schedule will not be the one the run started with.",
-                    RuntimeWarning,
-                )
-            # Optimizer before scheduler: its param groups carry the LR the
-            # scheduler last set, and the scheduler restores its position.
-            optimizer.load_state_dict(state["optimizer"])
-            scheduler.load_state_dict(state["scheduler"])
-            global_step = int(state["global_step"])
-            start_epoch = int(state["epoch"])
-            skip_batches = int(state["epoch_step"])
-            resumed_totals = {
-                name: value.to(device)
-                for name, value in state.get("epoch_totals", {}).items()
-            }
-            self._restore_rng(state.get("rng", {}), device)
-            print(
-                f"Resuming: epoch {start_epoch + 1}, step "
-                f"{global_step}/{total_steps}, {skip_batches} batches into the "
-                "epoch"
-            )
+            warnings.filterwarnings("ignore", message="Detected call of `lr_scheduler.step")
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-        self._device = device
+    def _restore(self, optimizer, scheduler):
+        """Load the resume state; return ``(global_step, epoch, skipped, totals)``."""
+        state = self._load_trainer_state(self.config.output_dir)
+        if int(state.get("total_steps", self._total_steps)) != self._total_steps:
+            warnings.warn(
+                f"resuming with total_steps={self._total_steps}, but the run "
+                f"started with total_steps={state.get('total_steps')}; the "
+                "LR schedule will not be the one the run started with.",
+                RuntimeWarning,
+            )
+        # Optimizer before scheduler: its groups hold the LR the scheduler set.
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        global_step = int(state["global_step"])
+        start_epoch = int(state["epoch"])
+        skip_batches = int(state["epoch_step"])
+        resumed_totals = {name: value.to(self._device)
+                          for name, value in state.get("epoch_totals", {}).items()}
+        self._restore_rng(state.get("rng", {}), self._device)
+        print(f"Resuming: epoch {start_epoch + 1}, step {global_step}/"
+              f"{self._total_steps}, {skip_batches} batches into the epoch")
+        return global_step, start_epoch, skip_batches, resumed_totals
+
+    def _train_epoch(self, loader, optimizer, scheduler, *, epoch, global_step,
+                     skip_batches=0, totals=None):
+        """Run one epoch; return ``(totals, batches, global_step)``.
+
+        A resumed epoch skips the ``skip_batches`` batches it already trained
+        (the sampler order is deterministic per epoch) and continues the
+        running ``totals`` saved with them.
+        """
+        device = self._device
+        self._apply_stage(training=True)
+        batch_sampler = getattr(loader, "batch_sampler", None)
+        if isinstance(batch_sampler, LengthBucketBatchSampler):
+            batch_sampler.set_epoch(epoch)
+        totals = dict(totals or {})
+        n_batches = to_skip = skip_batches
+        skipped = 0
+        pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{self._num_epochs}")
+        for labels, attention_mask in pbar:
+            labels = labels.to(device, non_blocking=True)
+            attention_mask = attention_mask.to(device, non_blocking=True)
+            if labels.shape[1] <= self.model.pred_horizon:
+                continue
+            if skipped < to_skip:
+                skipped += 1
+                continue
+            # 0-dim tensor, so torch.compile treats the annealing progress as
+            # a graph input instead of a Python value to guard on.
+            progress = torch.tensor(global_step / self._total_steps, device=device)
+            with self._autocast(device):
+                values = self._losses(labels, attention_mask, progress)
+                loss = values["loss"]
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if MAX_GRAD_NORM is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), MAX_GRAD_NORM)
+            optimizer.step()
+            scheduler.step()
+            self._accumulate(totals, values)
+            n_batches += 1
+            global_step += 1
+            if n_batches % LOG_EVERY == 0:
+                self._update_postfix(pbar, totals, n_batches, scheduler)
+            if self.save_every_steps and global_step % self.save_every_steps == 0:
+                pbar.write(f"step {global_step}/{self._total_steps}: saving "
+                           f"checkpoint to {self.config.output_dir}")
+                self._checkpoint(epoch=epoch, epoch_step=n_batches,
+                                 global_step=global_step, totals=totals)
+        return totals, n_batches, global_step
+
+    @staticmethod
+    def _update_postfix(pbar, totals, n_batches, scheduler) -> None:
+        """Show the running mean loss and the LR in the progress bar."""
+        loss = totals["loss"] / max(1, n_batches)
+        pbar.set_postfix(loss=f"{loss.item():.4f}",
+                         lr=f"{scheduler.get_last_lr()[0]:.2e}")
+
+    def _describe_terms(self, means: dict[str, float]) -> str:
+        """Per-term/diagnostic breakdown, for a loss with several terms."""
         prefix = self.stage.prefix
-        score_key = prefix + ("loss" if self.stage.logs_total else "token")
+        total_key = f"{prefix}loss"
+        if total_key not in means:
+            return ""
+        return ", ".join(f"{name.removeprefix(prefix)} {value:.4f}"
+                         for name, value in means.items()
+                         if name.startswith(prefix) and name != total_key)
 
-        for epoch in range(start_epoch, num_epochs):
-            self._apply_stage(training=True)
-            batch_sampler = getattr(train_loader, "batch_sampler", None)
-            if isinstance(batch_sampler, LengthBucketBatchSampler):
-                batch_sampler.set_epoch(epoch)
+    def _record_epoch(self, epoch, totals, n_batches, val_loader, device) -> None:
+        """Append the epoch's means to the history and print the summary."""
+        train_means = self._means(totals, n_batches)
+        val_means = self.evaluate(val_loader, device)
+        for split, means in (("train", train_means), ("val", val_means)):
+            for name, value in means.items():
+                self.history.setdefault(f"{split}_{name}", []).append(value)
+        summary = (f"epoch {epoch + 1} [{self.config.stage}]: "
+                   f"train {train_means['loss']:.4f} | val {val_means['loss']:.4f}")
+        if "perplexity" in val_means:
+            summary += f" | val_ppl {val_means['perplexity']:.2f}"
+        if terms := self._describe_terms(train_means):
+            summary += f"\n  train terms: {terms}"
+        if terms := self._describe_terms(val_means):
+            summary += f"\n  val terms:   {terms}"
+        print(summary)
+        if device.type == "cuda":
+            print(f"epoch {epoch + 1} peak VRAM: "
+                  f"{torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB allocated, "
+                  f"{torch.cuda.max_memory_reserved(device) / 1e9:.2f} GB reserved")
 
-            # The sampler is deterministic per epoch, so replaying the epoch
-            # and skipping the already-consumed batches lands exactly after the
-            # step where the interrupted checkpoint was written.
-            resuming_epoch = epoch == start_epoch
-            totals: dict[str, torch.Tensor] = (
-                dict(resumed_totals) if resuming_epoch else {}
-            )
-            n_batches = skip_batches if resuming_epoch else 0
-            to_skip = skip_batches if resuming_epoch else 0
-            skipped = 0
-            pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{num_epochs}")
-
-            for labels, attention_mask in pbar:
-                labels = labels.to(device, non_blocking=True)
-                attention_mask = attention_mask.to(device, non_blocking=True)
-                if labels.shape[1] <= horizon:
-                    continue
-                if skipped < to_skip:
-                    skipped += 1
-                    continue
-
-                # 0-dim tensor, so torch.compile treats the annealing progress
-                # as a graph input instead of a Python value to guard on.
-                progress = torch.tensor(
-                    global_step / total_steps, device=device
-                )
-
-                with self._autocast(device):
-                    values = self._losses(labels, attention_mask, progress)
-                    loss = values["loss"]
-
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                if MAX_GRAD_NORM is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), MAX_GRAD_NORM
-                    )
-                optimizer.step()
-                scheduler.step()
-
-                self._accumulate(totals, values)
-                n_batches += 1
-                global_step += 1
-
-                if n_batches % LOG_EVERY == 0:
-                    means = self._means(totals, n_batches)
-                    postfix = {"loss": f"{means['loss']:.4f}"}
-                    if score_key in means:
-                        postfix[score_key.removeprefix(prefix)] = (
-                            f"{means[score_key]:.4f}"
-                        )
-                    postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
-                    pbar.set_postfix(postfix)
-
-                if (
-                    self.save_every_steps
-                    and global_step % self.save_every_steps == 0
-                ):
-                    # Epoch-level history stays untouched; this records where
-                    # the mid-epoch checkpoint was taken and the running train
-                    # losses at that point.
-                    self.history["last_checkpoint"] = {
-                        "epoch": epoch + 1,
-                        "epoch_step": n_batches,
-                        "global_step": global_step,
-                        "total_steps": total_steps,
-                        **{
-                            f"train_{name}": value
-                            for name, value in self._means(totals, n_batches).items()
-                        },
-                    }
-                    self._set_position(
-                        epoch=epoch,
-                        epoch_step=n_batches,
-                        global_step=global_step,
-                        total_steps=total_steps,
-                        totals=totals,
-                    )
-                    pbar.write(
-                        f"step {global_step}/{total_steps}: saving checkpoint "
-                        f"to {config.output_dir}"
-                    )
-                    self._save(config.output_dir)
-
-            train_means = self._means(totals, n_batches)
-            val_means = self.evaluate(val_loader, device)
-            for name, value in train_means.items():
-                self.history.setdefault(f"train_{name}", []).append(value)
-            for name, value in val_means.items():
-                self.history.setdefault(f"val_{name}", []).append(value)
-
-            def describe(means: dict[str, float]) -> str:
-                parts = (
-                    f"{score_key.removeprefix(prefix)} {means[score_key]:.4f}"
-                    if score_key in means
-                    else ""
-                )
-                return f"{means['loss']:.4f} ({parts})"
-
-            def describe_terms(means: dict[str, float]) -> str:
-                if not self.stage.logs_total:
-                    return ""
-                return ", ".join(
-                    f"{name.removeprefix(prefix)} {value:.4f}"
-                    for name, value in means.items()
-                    if name.startswith(prefix) and name != score_key
-                )
-
-            summary = (
-                f"epoch {epoch + 1} [{stage}]: train {describe(train_means)} | "
-                f"val {describe(val_means)}"
-            )
-            if "perplexity" in val_means:
-                summary += f" | val_ppl {val_means['perplexity']:.2f}"
-            if terms := describe_terms(train_means):
-                summary += f"\n  train terms: {terms}"
-            if terms := describe_terms(val_means):
-                summary += f"\n  val terms:   {terms}"
-            print(summary)
-
-            if device.type == "cuda":
-                print(
-                    f"epoch {epoch + 1} peak VRAM: "
-                    f"{torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB allocated, "
-                    f"{torch.cuda.max_memory_reserved(device) / 1e9:.2f} GB reserved"
-                )
-
-            print(f"Saving to {config.output_dir}.")
-            self.history["last_checkpoint"] = {
-                "epoch": epoch + 1,
-                "epoch_step": n_batches,
-                "global_step": global_step,
-                "total_steps": total_steps,
-                "end_of_epoch": True,
-            }
-            # The next epoch starts at step 0 with fresh running totals.
-            self._set_position(
-                epoch=epoch + 1,
-                epoch_step=0,
+    def train(self) -> dict:
+        """Train the model and return the loss history."""
+        device = select_device(self.config.device)
+        print(f"Device: {device} | dataloader workers: {self.num_workers}")
+        self._prepare(device)
+        optimizer = self._build_optimizer()
+        collate = partial(tokenize_batch, tokenizer=self.tokenizer,
+                          pad_to_multiple_of=PAD_TO_MULTIPLE_OF)
+        train_loader = self._make_loader(self.train_dataset, True, device, collate)
+        val_loader = self._make_loader(self.eval_dataset, False, device, collate)
+        self._num_epochs = max(1, int(self.config.epochs))
+        self._total_steps = max(1, len(train_loader) * self._num_epochs)
+        scheduler = self._build_scheduler(optimizer)
+        self._optimizer, self._scheduler = optimizer, scheduler
+        global_step = start_epoch = skip_batches = 0
+        resumed_totals = {}
+        if self.config.resume:
+            global_step, start_epoch, skip_batches, resumed_totals = self._restore(
+                optimizer, scheduler)
+        for epoch in range(start_epoch, self._num_epochs):
+            resuming = epoch == start_epoch
+            totals, n_batches, global_step = self._train_epoch(
+                train_loader, optimizer, scheduler, epoch=epoch,
                 global_step=global_step,
-                total_steps=total_steps,
-                totals={},
-            )
-            self._save(config.output_dir)
+                skip_batches=skip_batches if resuming else 0,
+                totals=resumed_totals if resuming else None)
+            self._record_epoch(epoch, totals, n_batches, val_loader, device)
+            print(f"Saving to {self.config.output_dir}.")
+            self._checkpoint(epoch=epoch, epoch_step=n_batches,
+                             global_step=global_step, totals=totals,
+                             end_of_epoch=True)
         return self.history
