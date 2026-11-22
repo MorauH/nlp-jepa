@@ -6,8 +6,9 @@ last ``sliding_window`` tokens, so grammar comes from the token context and
 semantics from the JEPA waypoint.
 
 Usage:
-    python -m jepa generate
-    python -m jepa generate --model runs/jepa --steps 3 --temperature 0.7
+    python -m jepa generate --prompt "Once upon a time"
+    python -m jepa generate --model runs/jepa --prompt "Once upon a time" \\
+        --steps 3 --temperature 0.7
 """
 
 from __future__ import annotations
@@ -23,21 +24,7 @@ from ..runtime import select_device
 
 DEFAULT_MODEL = str(DEFAULT_RUN_DIR)
 DEFAULT_TOKENIZER = str(TOKENIZER_DIR)
-
-
-def ask_int(prompt: str, *, minimum: int = 1) -> int:
-    """Ask until the user enters an integer >= ``minimum``."""
-    while True:
-        raw = input(prompt).strip()
-        try:
-            value = int(raw)
-        except ValueError:
-            print("Please enter an integer.")
-            continue
-        if value < minimum:
-            print(f"Please enter an integer >= {minimum}.")
-            continue
-        return value
+DEFAULT_STEPS = 1
 
 
 @torch.no_grad()
@@ -156,7 +143,7 @@ def main(argv: list[str] | None = None) -> None:
         default=DEFAULT_TOKENIZER,
         help="Tokenizer directory trained by `python -m jepa train-tokenizer`",
     )
-    parser.add_argument("--device", default=None, help="cpu, cuda, cuda:0, mps, ...")
+    parser.add_argument("--device", default=None, help="cpu, cuda, cuda:0, ...")
     parser.add_argument(
         "--temperature",
         type=float,
@@ -182,12 +169,12 @@ def main(argv: list[str] | None = None) -> None:
         default=0,
         help="Top-k cutoff for direction sampling; 0 disables it.",
     )
-    parser.add_argument("--steps", type=int, default=None, help="Prediction steps")
-    parser.add_argument("--prompt", default=None, help="Prompt text")
+    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Prediction steps")
+    parser.add_argument("--prompt", required=True, help="Prompt text")
     parser.add_argument("--seed", type=int, default=None, help="Sampling seed")
     args = parser.parse_args(argv)
 
-    if args.steps is not None and args.steps < 1:
+    if args.steps < 1:
         parser.error("--steps must be at least 1")
 
     if args.seed is not None:
@@ -211,16 +198,10 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Loaded {args.model} on {device} (k={k} tokens per prediction step)")
 
     prompt = args.prompt
-    while prompt is None or not prompt.strip():
-        prompt = input("Prompt: ")
-        if not prompt.strip():
-            print("Prompt cannot be empty.")
+    if not prompt.strip():
+        raise ValueError("--prompt cannot be empty.")
 
     steps = args.steps
-    if steps is None:
-        steps = ask_int(
-            f"Number of prediction steps (1 step = {k} tokens): ", minimum=1
-        )
 
     generated_text, generated_ids = generate(
         model,

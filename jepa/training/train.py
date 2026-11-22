@@ -23,13 +23,7 @@ from pathlib import Path
 from datasets import load_from_disk
 from transformers import set_seed
 
-from ..config import (
-    DecoderConfig,
-    EncoderConfig,
-    JepaConfig,
-    PredictorConfig,
-    VISRegConfig,
-)
+from ..config import EncoderConfig, JepaConfig
 from ..data.tokenizer import load_tokenizer
 from ..models.stack import JepaDecodeModel
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
@@ -43,82 +37,6 @@ OUTPUT_DIR = DEFAULT_RUN_DIR
 # --subset trains on this many examples (smoke test).
 SUBSET_TRAIN = 4
 SUBSET_VAL = 2
-
-# ---------------------------------------------------------------------------
-# Model shape
-# ---------------------------------------------------------------------------
-MODEL_MAX_LENGTH = 1024
-HIDDEN_SIZE = 448
-INTERMEDIATE_SIZE = 896
-NUM_ATTENTION_HEADS = 8
-NUM_HIDDEN_LAYERS = 8
-
-# The predictor reads only z_t: the causal encoder already summarizes the
-# prefix there, and a trunk over past latents let the predictor do the
-# encoder's job.  Layers of the candidate head (expansion slots, not time).
-PREDICTOR_HIDDEN_LAYERS = 2
-# Candidate futures per position.  Analysis of the old 24-candidate head found
-# only ~5 distinct candidate groups, so 8 keeps the useful diversity at a third
-# of the head's slot/score cost.
-PREDICTOR_PREDICTION_COUNT = 8
-# Tokens between z_t and the predicted latent, and the decoder's block length
-# (one waypoint per block).  At k=5 the latents became too smooth
-# (cos(z_t, z_t+5) ~0.90): the future was nearly copyable, only 2 of 8
-# candidates were used, and the waypoint added little beyond z_t.  A longer
-# horizon makes the future genuinely uncertain, which is what the candidates
-# and the waypoint hint are for.  Stored in the checkpoint config, so it only
-# applies to fresh models (`--resume` and `train-decoder` keep the saved k).
-PRED_HORIZON = 20
-
-# Deeper token decoder.  Its tables are tied (below) and the hint is injected
-# at every layer, so the extra depth buys grammar, not capacity in the tables.
-DECODER_HIDDEN_LAYERS = 4
-# Past tokens visible to each decoder position.  Short on purpose: with 96
-# tokens of context the decoder learned to ignore the latent hint (verify:
-# predicted ~ shuffled hint), so a narrower window makes it lean on the hint
-# for anything beyond local grammar.
-DECODER_SLIDING_WINDOW = 32
-# Probability that a decoder block is trained on the hindsight-best predictor
-# candidate (closest to the real future) instead of the score-selected one.
-# The hindsight choice carries real information about the continuation, which
-# teaches the decoder to use the hint.  Validation always uses the
-# score-selected waypoint (the inference condition), so a train/val decoder
-# loss gap shows how much the decoder relies on the hint.  0.0 = old behaviour.
-DECODER_HINDSIGHT_PROB = 1.0
-# Share the decoder input embedding with the lm_head: one table instead of two
-# (the encoder keeps its own, so the decoder loss cannot touch the encoder).
-DECODER_TIE_EMBEDDINGS = True
-# Re-inject the latent hint before every decoder layer instead of only at the
-# input.  The per-layer projections start at zero, so this is a strict
-# extension of input-only injection.
-DECODER_HINT_EVERY_LAYER = True
-VISREG_NUM_SLICES = 256
-# Push the predictor candidates apart.  VISREG_SCORE_W weights the
-# win-probability (pi) cross-entropy; VISREG_MEAN_W the mean-future (mu)
-# regression (mu's input is detached, so it only trains the mean head).
-# These are applied on resume too, so old checkpoints pick up the new weights.
-VISREG_DIVERSITY_W = 0.5
-VISREG_SCORE_W = 1.0
-VISREG_MEAN_W = 1.0
-
-# Candidate-collapse fixes.  In the previous run only 2 of 8 slots were ever
-# used: the other 6 drifted to norms ~50x z_t (the loss compares directions,
-# so norm was free), where the gradient through the loss's normalization
-# vanishes; the diversity penalty let them hide orthogonal to everything; and
-# the sharp assignment gave them ~zero weight.
-# 1. Fix every candidate to the encoder-latent scale (architecture; saved in
-#    the predictor config).
-PREDICTOR_NORMALIZE_CANDIDATES = True
-# 2. Annealed winner-takes-all: the assignment-temperature multiplier starts
-#    at VISREG_MH_TEMPERATURE_START (every slot shares every target, so each
-#    finds a region) and decays geometrically to the final value (0.1, the
-#    VISRegConfig default) over the first VISREG_MH_ANNEAL_FRACTION of steps.
-VISREG_MH_TEMPERATURE_START = 1.0
-VISREG_MH_ANNEAL_FRACTION = 0.3
-# 3. Only penalize near-duplicate candidates (cosine above the margin), so an
-#    unused slot gains nothing by pointing orthogonal to everything.
-VISREG_DIVERSITY_MARGIN = 0.5
-# Items 2-3 are applied on resume too (like the weights above).
 
 # Relative weights of the two objectives in the backward pass.
 JEPA_LOSS_WEIGHT = 2.0
@@ -217,10 +135,11 @@ def add_dataset_args(
 
 
 def load_training_tokenizer(tokenizer_dir: Path):
-    """Load the tokenizer and cap its sequence length at MODEL_MAX_LENGTH."""
+    """Load the tokenizer and cap its sequence length at the model's max."""
     tokenizer = load_tokenizer(tokenizer_dir)
+    max_length = EncoderConfig().max_position_embeddings
     tokenizer.model_max_length = min(
-        tokenizer.model_max_length or MODEL_MAX_LENGTH, MODEL_MAX_LENGTH
+        tokenizer.model_max_length or max_length, max_length
     )
     tokenizer("test")  # warm any encoding cache
     return tokenizer
@@ -265,55 +184,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_model(tokenizer) -> JepaDecodeModel:
-    """Build a fresh JEPA + decoder model from the component configs."""
-    max_length = min(tokenizer.model_max_length or MODEL_MAX_LENGTH, MODEL_MAX_LENGTH)
-    tokenizer.model_max_length = max_length
-
+    """Build a fresh JEPA + decoder model from the config defaults."""
     encoder_config = EncoderConfig(
         vocab_size=len(tokenizer),
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        num_attention_heads=NUM_ATTENTION_HEADS,
-        num_hidden_layers=NUM_HIDDEN_LAYERS,
-        rope_theta=500_000.0,
-        hidden_act="silu",
-        max_position_embeddings=max_length,
-        rms_norm_eps=1e-6,
         pad_token_id=tokenizer.pad_token_id,
-        is_causal=True,
     )
-
-    predictor_config = PredictorConfig.from_encoder(
-        encoder_config,
-        num_hidden_layers=PREDICTOR_HIDDEN_LAYERS,
-        prediction_count=PREDICTOR_PREDICTION_COUNT,
-        normalize_candidates=PREDICTOR_NORMALIZE_CANDIDATES,
+    tokenizer.model_max_length = min(
+        tokenizer.model_max_length or encoder_config.max_position_embeddings,
+        encoder_config.max_position_embeddings,
     )
-    decoder_config = DecoderConfig.from_encoder(
-        encoder_config,
-        num_hidden_layers=DECODER_HIDDEN_LAYERS,
-        sliding_window=DECODER_SLIDING_WINDOW,
-        tie_embeddings=DECODER_TIE_EMBEDDINGS,
-        hint_every_layer=DECODER_HINT_EVERY_LAYER,
-    )
-    visreg_config = VISRegConfig(
-        num_slices=VISREG_NUM_SLICES,
-        diversity_w=VISREG_DIVERSITY_W,
-        score_w=VISREG_SCORE_W,
-        mean_w=VISREG_MEAN_W,
-        diversity_margin=VISREG_DIVERSITY_MARGIN,
-        mh_temperature_start=VISREG_MH_TEMPERATURE_START,
-        mh_anneal_fraction=VISREG_MH_ANNEAL_FRACTION,
-    )
-
-    config = JepaConfig.from_encoder(
-        encoder_config,
-        predictor=predictor_config,
-        decoder=decoder_config,
-        visreg=visreg_config,
-        pred_horizon=PRED_HORIZON,
-    )
-    return JepaDecodeModel(config)
+    return JepaDecodeModel(JepaConfig.from_encoder(encoder_config))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -337,20 +217,6 @@ def main(argv: list[str] | None = None) -> None:
                 f"{len(tokenizer)} tokens. Pass the matching --tokenizer, or "
                 "train from scratch without --resume."
             )
-        # Apply the current objective weights even when the checkpoint was
-        # trained with older values.
-        model.criterion.diversity_w = VISREG_DIVERSITY_W
-        model.criterion.score_w = VISREG_SCORE_W
-        model.config.visreg.diversity_w = VISREG_DIVERSITY_W
-        model.config.visreg.score_w = VISREG_SCORE_W
-        for name, value in (
-            ("mean_w", VISREG_MEAN_W),
-            ("diversity_margin", VISREG_DIVERSITY_MARGIN),
-            ("mh_temperature_start", VISREG_MH_TEMPERATURE_START),
-            ("mh_anneal_fraction", VISREG_MH_ANNEAL_FRACTION),
-        ):
-            setattr(model.criterion, name, value)
-            setattr(model.config.visreg, name, value)
         history_path = OUTPUT_DIR / "history.json"
         history = None
         if history_path.exists():
@@ -360,9 +226,6 @@ def main(argv: list[str] | None = None) -> None:
         model = build_model(tokenizer)
         history = None
 
-    # Runtime training knob (not saved in the config), so set it for both a
-    # fresh model and a resumed one.
-    model.decoder_hindsight_prob = DECODER_HINDSIGHT_PROB
     if args.jepa_only:
         model.skip_decoder()
 
@@ -372,7 +235,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         print(
             f"Decoder window: {model.decoder.sliding_window} | "
-            f"hindsight waypoint prob: {model.decoder_hindsight_prob}"
+            f"train policy: {model.config.decoder.train_policy}"
         )
     print("Parameters:", f"{sum(p.numel() for p in model.parameters()):,}")
     print("  encoder:  ", f"{sum(p.numel() for p in model.encoder.parameters()):,}")

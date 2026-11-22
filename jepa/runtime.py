@@ -24,8 +24,6 @@ def select_device(name: str | None = None) -> torch.device:
         return torch.device(name)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
     return torch.device("cpu")
 
 

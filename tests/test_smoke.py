@@ -18,8 +18,6 @@ from jepa import (
 def tiny_config(
     *,
     with_decoder: bool = True,
-    tie_embeddings: bool = False,
-    hint_every_layer: bool = False,
 ) -> JepaConfig:
     encoder = EncoderConfig(
         vocab_size=64,
@@ -39,8 +37,6 @@ def tiny_config(
             encoder,
             sliding_window=8,
             num_hidden_layers=1,
-            tie_embeddings=tie_embeddings,
-            hint_every_layer=hint_every_layer,
         )
         if with_decoder
         else None
@@ -144,17 +140,6 @@ def test_expected_distances_identity():
     torch.testing.assert_close(expected_distances(cand, target), actual)
 
 
-def test_removed_predictor_options():
-    """Old configs with the options off still load; enabled ones fail loudly."""
-    encoder = tiny_config().encoder
-    config = PredictorConfig.from_encoder(encoder, trunk_layers=0, context_window=0)
-    assert not hasattr(config, "trunk_layers")
-    assert "context_window" not in config.to_dict()
-    for name in ("trunk_layers", "context_window"):
-        with pytest.raises(ValueError, match=name):
-            PredictorConfig.from_encoder(encoder, **{name: 2})
-
-
 def test_jepa_inference_without_decoder():
     model = JepaModel(tiny_config(with_decoder=False))
     labels = torch.randint(1, 64, (2, 12))
@@ -194,7 +179,7 @@ def test_visreg_dot_product_distance_matches_reference():
     dirs = F.normalize(cand[valid], dim=-1)
     sim = torch.bmm(dirs, dirs.transpose(1, 2))
     off_diag = 1.0 - torch.eye(4)
-    div_ref = (F.relu(sim) * off_diag).sum() / (dirs.shape[0] * 4 * 3)
+    div_ref = (F.relu(sim - 0.5) * off_diag).sum() / (dirs.shape[0] * 4 * 3)
     torch.testing.assert_close(stats["loss_diversity"], div_ref.detach())
 
     def masked(values):
@@ -222,55 +207,6 @@ def test_visreg_dot_product_distance_matches_reference():
 
 
 # ---------------------------------------------------------------------------
-# Predictor parameters
-# ---------------------------------------------------------------------------
-
-# Parameters of the z_t-only predictor for the tiny config.
-PREDICTOR_KEYS = [
-    "hidden_expansion.weights",
-    "hidden_expansion.bias",
-    "transformer.decoders.0.attn.w_q_norm.0.weight",
-    "transformer.decoders.0.attn.w_q_norm.1.rms_norm.weight",
-    "transformer.decoders.0.attn.w_k_norm.0.weight",
-    "transformer.decoders.0.attn.w_k_norm.1.rms_norm.weight",
-    "transformer.decoders.0.attn.w_v.weight",
-    "transformer.decoders.0.attn.w_o.weight",
-    "transformer.decoders.0.attn_norm.rms_norm.weight",
-    "transformer.decoders.0.mlp.branch_silu.0.weight",
-    "transformer.decoders.0.mlp.branch_lin.weight",
-    "transformer.decoders.0.mlp.linear.weight",
-    "transformer.decoders.0.mlp_norm.rms_norm.weight",
-    "delta_head.weights",
-    "delta_head.bias",
-    "score_head.weights",
-    "score_head.bias",
-    "mean_head.0.weight",
-    "mean_head.0.bias",
-    "mean_head.2.weight",
-    "mean_head.2.bias",
-]
-
-
-def test_new_config_fields_default_to_legacy_behaviour():
-    encoder = tiny_config().encoder
-    decoder = DecoderConfig.from_encoder(encoder)
-    assert decoder.tie_embeddings is False
-    assert decoder.hint_every_layer is False
-    assert decoder.tie_word_embeddings is False
-
-
-def test_predictor_parameters():
-    from jepa import PredictorModel
-
-    predictor = PredictorModel(
-        PredictorConfig.from_encoder(
-            tiny_config().encoder, prediction_count=4, num_hidden_layers=1
-        )
-    )
-    assert list(predictor.state_dict()) == PREDICTOR_KEYS
-
-
-# ---------------------------------------------------------------------------
 # Decoder: tied embeddings and per-layer hints
 # ---------------------------------------------------------------------------
 
@@ -280,7 +216,7 @@ def test_decoder_tied_embeddings_round_trip(tmp_path):
 
     from jepa import DecoderModel
 
-    model = JepaDecodeModel(tiny_config(tie_embeddings=True))
+    model = JepaDecodeModel(tiny_config())
     decoder = model.decoder
     assert decoder.lm_head.weight is decoder.embedding.weight
     # The decoder table stays separate from the encoder's.
@@ -329,47 +265,8 @@ def test_decoder_tied_embeddings_round_trip(tmp_path):
     assert torch.equal(standalone.embedding.weight, decoder.embedding.weight)
 
 
-def test_untied_decoder_keeps_two_tables():
-    model = JepaDecodeModel(tiny_config(tie_embeddings=False))
-    decoder = model.decoder
-    assert decoder.lm_head.weight is not decoder.embedding.weight
-    assert decoder.lm_head.weight.shape == decoder.embedding.weight.shape
-
-
-def test_hint_every_layer_starts_as_input_only_injection():
-    """Zero-initialized per-layer projections leave the forward pass unchanged."""
-    from jepa import DecoderModel
-
-    torch.manual_seed(0)
-    encoder = tiny_config().encoder
-    base = DecoderModel(
-        DecoderConfig.from_encoder(encoder, sliding_window=8, num_hidden_layers=2)
-    ).eval()
-    layered = DecoderModel(
-        DecoderConfig.from_encoder(
-            encoder,
-            sliding_window=8,
-            num_hidden_layers=2,
-            hint_every_layer=True,
-        )
-    ).eval()
-    missing, unexpected = layered.load_state_dict(base.state_dict(), strict=False)
-    assert unexpected == []
-    assert all(key.startswith("hint_proj.") for key in missing)
-    assert all(
-        torch.count_nonzero(projection.weight) == 0
-        for projection in layered.hint_proj
-    )
-
-    input_ids = torch.randint(1, 64, (2, 6))
-    hint = torch.randn(2, 6, 32)
-    with torch.no_grad():
-        torch.testing.assert_close(
-            layered._run(input_ids, hint), base._run(input_ids, hint)
-        )
-
-
-def test_hint_every_layer_matches_generate_path():
+def test_hint_reinjected_before_every_layer():
+    """Every layer has a zero-initialized hint projection."""
     from jepa import DecoderModel
 
     torch.manual_seed(0)
@@ -378,7 +275,35 @@ def test_hint_every_layer_matches_generate_path():
             tiny_config().encoder,
             sliding_window=8,
             num_hidden_layers=2,
-            hint_every_layer=True,
+        )
+    ).eval()
+    assert len(decoder.hint_proj) == 2
+    assert all(
+        torch.count_nonzero(projection.weight) == 0
+        for projection in decoder.hint_proj
+    )
+
+    # With zeroed projections the forward pass is input-only injection.
+    input_ids = torch.randint(1, 64, (2, 6))
+    hint = torch.randn(2, 6, 32)
+    with torch.no_grad():
+        plain = decoder._run(input_ids, hint)
+    for projection in decoder.hint_proj:
+        torch.nn.init.normal_(projection.weight)
+    with torch.no_grad():
+        layered = decoder._run(input_ids, hint)
+    assert not torch.allclose(plain, layered)
+
+
+def test_hint_and_generate_path_agree():
+    from jepa import DecoderModel
+
+    torch.manual_seed(0)
+    decoder = DecoderModel(
+        DecoderConfig.from_encoder(
+            tiny_config().encoder,
+            sliding_window=8,
+            num_hidden_layers=2,
         )
     ).eval()
     z_t = torch.randn(1, 32)
@@ -405,14 +330,12 @@ def test_hint_every_layer_matches_generate_path():
 
 
 # ---------------------------------------------------------------------------
-# Full stack with every new option
+# Full stack
 # ---------------------------------------------------------------------------
 
 
-def test_full_stack_forward_with_all_new_options():
-    model = JepaDecodeModel(
-        tiny_config(tie_embeddings=True, hint_every_layer=True)
-    )
+def test_full_stack_forward_with_chunked_decoder_loss():
+    model = JepaDecodeModel(tiny_config())
     labels = torch.randint(1, 64, (2, 12))
     jepa_out, decoder_out = model(
         labels=labels,
@@ -442,9 +365,7 @@ def test_full_stack_forward_with_all_new_options():
 
 
 def test_decoder_loss_does_not_update_encoder_or_predictor():
-    model = JepaDecodeModel(
-        tiny_config(tie_embeddings=True, hint_every_layer=True)
-    )
+    model = JepaDecodeModel(tiny_config())
     labels = torch.randint(1, 64, (2, 12))
     _, decoder_out = model(
         labels=labels, attention_mask=torch.ones_like(labels), training=True
@@ -516,7 +437,6 @@ def test_decoder_hindsight_waypoints_in_train_selected_in_eval():
 
     torch.manual_seed(0)
     model = JepaDecodeModel(tiny_config())
-    model.decoder_hindsight_prob = 1.0
     labels = torch.randint(1, 64, (2, 12))
     mask = torch.ones_like(labels)
     k = model.pred_horizon
@@ -547,33 +467,24 @@ def test_decoder_hindsight_waypoints_in_train_selected_in_eval():
             decoder_out["loss"], decoder_loss_with(selected, jepa_out)
         )
 
-
-def test_mix_waypoints_probabilities():
-    from jepa.models.stack import mix_waypoints
-
-    selected = torch.zeros(4, 50, 3)
-    hindsight = torch.ones(4, 50, 3)
-    assert torch.equal(mix_waypoints(selected, hindsight, 1.0), hindsight)
-    assert torch.equal(mix_waypoints(selected, hindsight, 0.0), selected)
-    torch.manual_seed(0)
-    mixed = mix_waypoints(selected, hindsight, 0.3)
-    # Whole positions are switched, never individual dimensions.
-    assert torch.all(mixed.amin(-1) == mixed.amax(-1))
-    assert 0.2 < mixed[..., 0].mean().item() < 0.4
+        # train_policy="pi_argmax" uses the inference choice while training.
+        model.config.decoder.train_policy = "pi_argmax"
+        model.train()
+        jepa_out, decoder_out = model(labels=labels, attention_mask=mask, training=True)
+        selected = select_waypoints(jepa_out["preds"], jepa_out["scores"])
+        torch.testing.assert_close(
+            decoder_out["loss"], decoder_loss_with(selected, jepa_out)
+        )
 
 
-def test_normalize_candidates_fixes_scale():
+def test_candidates_are_rms_normalized():
     from jepa import PredictorModel
 
     torch.manual_seed(0)
-    encoder = tiny_config().encoder
-    legacy = PredictorModel(PredictorConfig.from_encoder(encoder, prediction_count=4))
-    normed = PredictorModel(
-        PredictorConfig.from_encoder(encoder, prediction_count=4, normalize_candidates=True)
+    predictor = PredictorModel(
+        PredictorConfig.from_encoder(tiny_config().encoder, prediction_count=4)
     )
-    # No new parameters: old checkpoints keep loading.
-    assert legacy.state_dict().keys() == normed.state_dict().keys()
-    preds, _, _ = normed(torch.randn(2, 5, 32) * 7.0)
+    preds, _, _ = predictor(torch.randn(2, 5, 32) * 7.0)
     rms = preds.pow(2).mean(-1).sqrt()
     torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-3, rtol=1e-3)
 
@@ -590,10 +501,6 @@ def test_annealed_temperature_schedule_and_loading(tmp_path):
         loss.set_anneal_progress(progress)
         assert loss.mh_temperature_now.item() == pytest.approx(expected, rel=1e-5)
     assert "mh_temperature_now" not in loss.state_dict()
-
-    constant = VISRegLoss(VISRegConfig(mh_temperature=0.1))
-    constant.set_anneal_progress(0.0)
-    assert constant.mh_temperature_now.item() == pytest.approx(0.1)
 
     # The non-persistent buffer must survive from_pretrained (meta-device init).
     config = tiny_config()
@@ -687,9 +594,8 @@ def test_frozen_jepa_trains_only_the_decoder(tmp_path):
     from jepa.training.trainer import JepaTrainer, TrainConfig
 
     torch.manual_seed(0)
-    model = JepaDecodeModel(tiny_config(hint_every_layer=True))
+    model = JepaDecodeModel(tiny_config())
     model.freeze_jepa()
-    model.decoder_hindsight_prob = 1.0
 
     backbone = list(model.encoder.parameters()) + list(model.predictor.parameters())
     before_backbone = [p.detach().clone() for p in backbone]
@@ -746,11 +652,9 @@ def test_frozen_decoder_loss_matches_joint_mode(amp_dtype):
     from contextlib import nullcontext
 
     torch.manual_seed(0)
-    joint = JepaDecodeModel(tiny_config(hint_every_layer=True))
-    joint.decoder_hindsight_prob = 1.0
+    joint = JepaDecodeModel(tiny_config())
     frozen = copy.deepcopy(joint)
     frozen.freeze_jepa()
-    frozen.decoder_hindsight_prob = 1.0
 
     labels = torch.randint(1, 64, (2, 12))
     mask = torch.ones_like(labels)
@@ -759,8 +663,9 @@ def test_frozen_decoder_loss_matches_joint_mode(amp_dtype):
     )
 
     with torch.no_grad(), autocast:
-        # Training: hindsight waypoint (prob 1.0).  The frozen path computes it
-        # from hindsight_waypoints(); joint mode uses the loss's winner.
+        # Training: hindsight waypoint (the default train policy).  The frozen
+        # path computes it from hindsight_waypoints(); joint mode uses the
+        # loss's winner.
         joint.train()
         frozen.train()
         joint_jepa, joint_decoder = joint(
@@ -798,7 +703,7 @@ def test_train_decoder_entry_point_writes_loadable_checkpoint(tmp_path, monkeypa
 
     torch.manual_seed(0)
     base = tmp_path / "base"
-    base_model = JepaDecodeModel(tiny_config(hint_every_layer=True))
+    base_model = JepaDecodeModel(tiny_config())
     base_model.save_pretrained(base)
     for name in ("encoder", "predictor", "decoder"):
         getattr(base_model, name).save_pretrained(base / name)
@@ -914,7 +819,7 @@ def test_jepa_only_never_runs_the_decoder(tmp_path):
     from jepa.training.trainer import JepaTrainer, TrainConfig
 
     torch.manual_seed(0)
-    model = JepaDecodeModel(tiny_config(hint_every_layer=True))
+    model = JepaDecodeModel(tiny_config())
     model.skip_decoder()
 
     before_encoder = [p.detach().clone() for p in model.encoder.parameters()]

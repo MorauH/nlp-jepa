@@ -49,41 +49,22 @@ def select_waypoints(preds, scores):
     ).squeeze(2)
 
 
-def hindsight_waypoints(preds, target, normalize: bool = True):
+def hindsight_waypoints(preds, target):
     """Select the candidate closest to the real future latent ("hindsight").
 
     ``preds`` is ``(batch, positions, prediction_count, hidden)`` and
     ``target`` the real ``(batch, positions, hidden)`` latents ``k`` steps
-    ahead.  Uses the same distance as the multi-hypothesis loss (cosine-style
-    when ``normalize``).  The result is still a predictor output, so feeding it
-    to the decoder carries information about the actual future without leaking
-    the raw block-end latent (which contains the last target token).
+    ahead.  Uses the same normalized (cosine-style) distance as the
+    multi-hypothesis loss.  The result is still a predictor output, so feeding
+    it to the decoder carries information about the actual future without
+    leaking the raw block-end latent (which contains the last target token).
     """
-    if normalize:
-        preds_cmp = F.normalize(preds.float(), dim=-1)
-        target_cmp = F.normalize(target.float(), dim=-1)
-        best = torch.einsum("btpd,btd->btp", preds_cmp, target_cmp).argmax(-1)
-    else:
-        best = (preds.float() - target.float().unsqueeze(2)).pow(2).sum(-1).argmin(-1)
+    preds_cmp = F.normalize(preds.float(), dim=-1)
+    target_cmp = F.normalize(target.float(), dim=-1)
+    best = torch.einsum("btpd,btd->btp", preds_cmp, target_cmp).argmax(-1)
     return preds.gather(
         2, best[..., None, None].expand(-1, -1, 1, preds.shape[-1])
     ).squeeze(2)
-
-
-def mix_waypoints(selected, hindsight, hindsight_prob: float):
-    """Per position, use ``hindsight`` with probability ``hindsight_prob``.
-
-    ``1.0`` always uses the hindsight-best candidate, ``0.0`` always the
-    score-selected one (the inference condition).  Mixing per base position
-    means each decoder block gets one or the other, since a block's hint is
-    read from its block-start position.
-    """
-    if hindsight_prob >= 1.0:
-        return hindsight
-    if hindsight_prob <= 0.0:
-        return selected
-    use = torch.rand(selected.shape[:2], device=selected.device) < hindsight_prob
-    return torch.where(use.unsqueeze(-1), hindsight, selected)
 
 
 class JepaDecodeModel(JepaModel):
@@ -93,7 +74,7 @@ class JepaDecodeModel(JepaModel):
     field is set (use :meth:`JepaConfig.from_encoder` with
     ``with_decoder=True``)::
 
-        config = JepaConfig.from_encoder(enc_config, pred_horizon=5)
+        config = JepaConfig.from_encoder(enc_config)
         model = JepaDecodeModel(config)
 
     Existing components can be injected, which lets a decoder be trained
@@ -116,14 +97,6 @@ class JepaDecodeModel(JepaModel):
             )
 
         self.decoder = decoder if decoder is not None else DecoderModel(config.decoder)
-
-        # Probability that a decoder block is trained on the hindsight-best
-        # candidate (closest to the real future) instead of the score-selected
-        # one.  A runtime training knob set by the training script, not saved
-        # in the config; 0.0 = the original behaviour.  Only used in train
-        # mode: in eval mode the decoder always gets the score-selected
-        # waypoint, so validation measures the inference condition.
-        self.decoder_hindsight_prob = 0.0
 
         # Decoder-only training (``freeze_jepa``): forward then runs the
         # encoder/predictor under ``no_grad`` and computes no JEPA loss.
@@ -198,7 +171,6 @@ class JepaDecodeModel(JepaModel):
             z_future = hindsight_waypoints(
                 preds,
                 latents[:, horizon:, :],
-                normalize=self.config.visreg.normalize_distance,
             )
         return {
             "loss": None,
@@ -270,17 +242,19 @@ class JepaDecodeModel(JepaModel):
         # predictor candidate at the block end.  Using a predictor output (not
         # the raw block-end latent) avoids leaking the final target token.
         #
-        # In training, the candidate is the hindsight-best one (closest to the
-        # real future; ``jepa_out["z_future"]``) with probability
-        # ``decoder_hindsight_prob``, else the score-selected one.  The
+        # In training, ``DecoderConfig.train_policy`` picks the candidate:
+        # "hindsight" is the one closest to the real future
+        # (``jepa_out["z_future"]``), "pi_argmax" the score-selected one.  The
         # hindsight choice correlates with the actual continuation, so the
         # decoder learns that the hint is informative instead of ignoring it.
+        # Evaluation always uses the score-selected candidate, so validation
+        # measures the inference condition.
         latents = jepa_out["latents"]
-        selected = select_waypoints(jepa_out["preds"], jepa_out["scores"])
-        hindsight_prob = self.decoder_hindsight_prob if self.training else 0.0
-        predicted_future = mix_waypoints(
-            selected, jepa_out["z_future"], hindsight_prob
-        ).detach()
+        if self.training and self.config.decoder.train_policy == "hindsight":
+            predicted_future = jepa_out["z_future"]
+        else:
+            predicted_future = select_waypoints(jepa_out["preds"], jepa_out["scores"])
+        predicted_future = predicted_future.detach()
         z_t, z_future = build_block_hints(
             latents,
             self.pred_horizon,

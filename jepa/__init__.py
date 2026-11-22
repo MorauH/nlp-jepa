@@ -14,7 +14,7 @@ Component models can be used on their own::
 The full stack takes a single composed config::
 
     from jepa import JepaConfig, JepaDecodeModel
-    config = JepaConfig.from_encoder(encoder.config, pred_horizon=5)
+    config = JepaConfig.from_encoder(encoder.config)
     model = JepaDecodeModel(config)
 """
 
@@ -32,7 +32,6 @@ from .models.jepa import JepaModel
 from .models.losses import VISRegLoss
 from .models.predictor import PredictorModel
 from .models.stack import JepaDecodeModel
-from .training.trainer import JepaTrainer, TrainConfig
 
 __all__ = [
     # Configs
@@ -50,7 +49,4 @@ __all__ = [
     "JepaDecodeModel",
     # Loss
     "VISRegLoss",
-    # Training
-    "JepaTrainer",
-    "TrainConfig",
 ]

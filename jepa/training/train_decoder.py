@@ -40,13 +40,8 @@ from .train import (
     AMP_DTYPE,
     COMPILE_MODE,
     COMPILE_MODEL,
-    DECODER_HIDDEN_LAYERS,
-    DECODER_HINDSIGHT_PROB,
-    DECODER_HINT_EVERY_LAYER,
     DECODER_LOSS_CHUNK_SIZE,
     DECODER_LOSS_WEIGHT,
-    DECODER_SLIDING_WINDOW,
-    DECODER_TIE_EMBEDDINGS,
     LOG_EVERY,
     MAX_GRAD_NORM,
     PAD_TO_MULTIPLE_OF,
@@ -111,11 +106,10 @@ def load_model_for_resume(model_dir: Path) -> JepaDecodeModel:
     """Load the full checkpoint, keeping its decoder, with the JEPA part frozen.
 
     Unlike :func:`build_model` the decoder is not replaced, and its config
-    (layers, window, ...) comes from the checkpoint, not from the constants.
+    (layers, window, ...) comes from the checkpoint.
     """
     model = JepaDecodeModel.from_pretrained(str(model_dir))
     model.freeze_jepa()
-    model.decoder_hindsight_prob = DECODER_HINDSIGHT_PROB
     return model
 
 
@@ -125,13 +119,7 @@ def build_model(model_dir: Path) -> JepaDecodeModel:
     predictor = PredictorModel.from_pretrained(str(model_dir / "predictor"))
     base_config = JepaConfig.from_json_file(str(model_dir / "config.json"))
 
-    decoder_config = DecoderConfig.from_encoder(
-        encoder.config,
-        num_hidden_layers=DECODER_HIDDEN_LAYERS,
-        sliding_window=DECODER_SLIDING_WINDOW,
-        tie_embeddings=DECODER_TIE_EMBEDDINGS,
-        hint_every_layer=DECODER_HINT_EVERY_LAYER,
-    )
+    decoder_config = DecoderConfig.from_encoder(encoder.config)
     config = JepaConfig.from_encoder(
         encoder.config,
         predictor=predictor.config,
@@ -141,8 +129,6 @@ def build_model(model_dir: Path) -> JepaDecodeModel:
     )
     model = JepaDecodeModel(config, encoder=encoder, predictor=predictor)
     model.freeze_jepa()
-    # Runtime training knob, not saved in the config (see train.py).
-    model.decoder_hindsight_prob = DECODER_HINDSIGHT_PROB
     return model
 
 

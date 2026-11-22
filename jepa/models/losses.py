@@ -59,7 +59,6 @@ class VISRegLoss(nn.Module):
         self.mh_temperature_start = config.mh_temperature_start
         self.mh_anneal_fraction = config.mh_anneal_fraction
         self.mh_eps = config.mh_eps
-        self.normalize_distance = config.normalize_distance
         self.eps = config.eps
 
         # Current temperature multiplier.  A tensor buffer, not a Python
@@ -88,10 +87,8 @@ class VISRegLoss(nn.Module):
 
         Decays geometrically from ``mh_temperature_start`` to
         ``mh_temperature`` over the first ``mh_anneal_fraction`` of training,
-        then stays at ``mh_temperature``.  No-op without annealing.
+        then stays at ``mh_temperature``.
         """
-        if self.mh_temperature_start is None:
-            return
         t = min(1.0, max(0.0, progress / self.mh_anneal_fraction))
         value = self.mh_temperature_start * (
             self.mh_temperature / self.mh_temperature_start
@@ -168,19 +165,15 @@ class VISRegLoss(nn.Module):
         valid_f = valid.to(cand.dtype)
         denom = valid_f.sum().clamp_min(1.0)
 
-        if self.normalize_distance:
-            cand_cmp = F.normalize(cand, dim=-1)
-            tgt_cmp = F.normalize(tgt, dim=-1)
-            # Both sides are unit vectors, so the squared distance is
-            # 2 - 2 * (a . b).  Computing it from the dot product avoids
-            # materializing the (B, T, P, D) fp32 difference and its square
-            # (about 1.4 GB each at batch 32 x 1024).  Clamping at zero hides
-            # the fp32 rounding when a == b.
-            dot = torch.einsum("btpd,btd->btp", cand_cmp, tgt_cmp)
-            d = (2.0 - 2.0 * dot).clamp_min(0.0)
-        else:
-            cand_cmp = cand
-            d = (cand - tgt.unsqueeze(2)).pow(2).sum(-1)
+        cand_cmp = F.normalize(cand, dim=-1)
+        tgt_cmp = F.normalize(tgt, dim=-1)
+        # Both sides are unit vectors, so the squared distance is
+        # 2 - 2 * (a . b).  Computing it from the dot product avoids
+        # materializing the (B, T, P, D) fp32 difference and its square
+        # (about 1.4 GB each at batch 32 x 1024).  Clamping at zero hides
+        # the fp32 rounding when a == b.
+        dot = torch.einsum("btpd,btd->btp", cand_cmp, tgt_cmp)
+        d = (2.0 - 2.0 * dot).clamp_min(0.0)
 
         # Adaptive temperature: relative differences stay usable even as the
         # overall distance shrinks during training.
@@ -218,7 +211,7 @@ class VISRegLoss(nn.Module):
         mean_stats = {}
         if mean is not None:
             mu = mean.float()
-            tgt_unit = tgt_cmp if self.normalize_distance else F.normalize(tgt, dim=-1)
+            tgt_unit = tgt_cmp
             l_mean = masked_mean((mu - tgt_unit).pow(2).sum(-1))
             with torch.no_grad():
                 mean_stats = {
@@ -238,10 +231,7 @@ class VISRegLoss(nn.Module):
         # and pointing orthogonal to everything becomes a free hiding place
         # for unused slots.
         if self.diversity_w > 0 and count > 1:
-            dirs = (
-                cand_cmp if self.normalize_distance
-                else F.normalize(cand, dim=-1)
-            )
+            dirs = cand_cmp
             n_valid = valid_f.sum()
             # Pairwise similarities for every position, then sum only over the
             # valid ones.  Gathering the valid rows first (the old path) copied

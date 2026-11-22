@@ -40,7 +40,6 @@ def expected_distances(candidates, mean):
 
     For unit vectors ``d = 2 - 2 c·y``, and the candidate is fixed given
     ``z_t``, so ``E[d_i | z_t] = 2 - 2 ĉ_i · E[ŷ | z_t] = 2 - 2 ĉ_i · mu``.
-    Valid for ``VISRegConfig.normalize_distance=True`` (the default).
 
     candidates: (..., P, D), mean: (..., D) -> (..., P)
     """
@@ -252,19 +251,18 @@ class PredictorModel(PreTrainedModel):
 
         predictions = z_t.unsqueeze(1) + pred_deltas  # (N, prediction_count, target_dim)
 
-        if self.config.normalize_candidates:
-            # Fix every candidate to the encoder-latent scale (per-dim RMS 1,
-            # i.e. norm ~sqrt(target_dim)).  The loss compares directions only,
-            # so without this a candidate's norm is free; unused slots drifted
-            # to norms ~50x z_t, where the gradient through the loss's
-            # normalization (~1/norm) vanishes and they could never recover.
-            # No learnable gain: it would reintroduce the free scale.  Runs in
-            # fp32 for precise statistics, like the other norms.
-            predictions = F.rms_norm(
-                predictions.float(),
-                (target_dim,),
-                eps=self.config.rms_norm_eps,
-            ).to(predictions.dtype)
+        # Fix every candidate to the encoder-latent scale (per-dim RMS 1, i.e.
+        # norm ~sqrt(target_dim)).  The loss compares directions only, so
+        # without this a candidate's norm is free; unused slots drifted to norms
+        # ~50x z_t, where the gradient through the loss's normalization
+        # (~1/norm) vanishes and they could never recover.  No learnable gain:
+        # it would reintroduce the free scale.  Runs in fp32 for precise
+        # statistics, like the other norms.
+        predictions = F.rms_norm(
+            predictions.float(),
+            (target_dim,),
+            eps=self.config.rms_norm_eps,
+        ).to(predictions.dtype)
 
         if return_all_timesteps:
             return PredictorOutput(

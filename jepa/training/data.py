@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Sampler
 
 # Number of batches' worth of examples to sort together when bucketing by
@@ -14,27 +13,19 @@ LENGTH_BUCKET_WINDOW = 100
 
 
 def example_lengths(dataset) -> list[int]:
-    """Per-example lengths for length bucketing.
-
-    Prepared FineWeb chunks carry ``input_ids``; raw text corpora only have
-    ``text``, where the character count is a good enough proxy for the token
-    length.
-    """
-    column = "input_ids" if "input_ids" in dataset.column_names else "text"
+    """Per-example token lengths for length bucketing."""
     try:
         import pyarrow.compute as pc
 
-        values = dataset.data.column(column)
+        values = dataset.data.column("input_ids")
         # ``select``/``filter`` keep the selection in ``_indices``; ``data`` is
         # the unfiltered table, so apply it before measuring.
         indices = getattr(dataset, "_indices", None)
         if indices is not None:
             values = values.take(indices.column(0))
-        if column == "input_ids":
-            return pc.list_value_length(values).to_pylist()
-        return pc.utf8_length(values).to_pylist()
+        return pc.list_value_length(values).to_pylist()
     except Exception:
-        return [len(dataset[i][column]) for i in range(len(dataset))]
+        return [len(dataset[i]["input_ids"]) for i in range(len(dataset))]
 
 
 class LengthBucketBatchSampler(Sampler[list[int]]):
@@ -103,47 +94,25 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
 
 
 def tokenize_batch(batch, tokenizer, pad_to_multiple_of: int = 1):
-    """Collate examples into ``(labels, attention_mask)`` tensors.
+    """Collate pre-tokenized ``input_ids`` examples into padded tensors.
 
-    Accepts either raw ``text`` examples or pre-tokenized ``input_ids``
-    examples (used by the FineWeb-Edu preparation script).  Padding is
-    right-aligned and ignored by the loss.
+    Padding is right-aligned and ignored by the loss.
     """
-    if "input_ids" in batch[0]:
-        sequences = [list(example["input_ids"]) for example in batch]
-        max_len = max(len(ids) for ids in sequences)
-        if pad_to_multiple_of > 1:
-            max_len = (
-                (max_len + pad_to_multiple_of - 1) // pad_to_multiple_of
-            ) * pad_to_multiple_of
-
-        pad_id = tokenizer.pad_token_id
-        input_ids = [
-            ids + [pad_id] * (max_len - len(ids)) for ids in sequences
-        ]
-        attention_mask = [
-            [1] * len(ids) + [0] * (max_len - len(ids)) for ids in sequences
-        ]
-        return (
-            torch.tensor(input_ids, dtype=torch.long),
-            torch.tensor(attention_mask, dtype=torch.long),
-        )
-
-    encoded = tokenizer(
-        [example["text"] for example in batch],
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    )
-    input_ids = encoded["input_ids"]
-    attention_mask = encoded["attention_mask"]
-
+    sequences = [list(example["input_ids"]) for example in batch]
+    max_len = max(len(ids) for ids in sequences)
     if pad_to_multiple_of > 1:
-        extra = (-input_ids.shape[1]) % pad_to_multiple_of
-        if extra:
-            input_ids = F.pad(
-                input_ids, (0, extra), value=tokenizer.pad_token_id
-            )
-            attention_mask = F.pad(attention_mask, (0, extra), value=0)
+        max_len = (
+            (max_len + pad_to_multiple_of - 1) // pad_to_multiple_of
+        ) * pad_to_multiple_of
 
-    return input_ids, attention_mask
+    pad_id = tokenizer.pad_token_id
+    input_ids = [
+        ids + [pad_id] * (max_len - len(ids)) for ids in sequences
+    ]
+    attention_mask = [
+        [1] * len(ids) + [0] * (max_len - len(ids)) for ids in sequences
+    ]
+    return (
+        torch.tensor(input_ids, dtype=torch.long),
+        torch.tensor(attention_mask, dtype=torch.long),
+    )
