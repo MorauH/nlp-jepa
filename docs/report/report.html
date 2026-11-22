@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Commit, Don't Average — draft report</title>
+<script>
+  window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+<style>
+  :root { --ink: #1c1c1c; --muted: #5b5b5b; --rule: #d8d4cc; --todo: #fff4d6; --todo-ink: #7a5400; }
+  body { font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+         color: var(--ink); background: #fdfcf9; line-height: 1.55; margin: 0; }
+  main { max-width: 46rem; margin: 3rem auto 6rem; padding: 0 1.5rem; }
+  h1 { font-size: 1.9rem; line-height: 1.25; margin-bottom: .3rem; text-align: center; }
+  .subtitle, .authors, .status { text-align: center; color: var(--muted); margin: .2rem 0; }
+  .status { font-family: ui-monospace, monospace; font-size: .8rem; margin-top: 1rem; }
+  h2 { font-size: 1.3rem; margin-top: 2.6rem; border-bottom: 1px solid var(--rule); padding-bottom: .2rem; }
+  h3 { font-size: 1.08rem; margin-top: 1.8rem; }
+  .abstract { margin: 2rem 2rem; font-size: .96rem; }
+  .abstract h2 { border: none; text-align: center; font-size: 1rem; text-transform: uppercase; letter-spacing: .08em; margin: 0 0 .4rem; }
+  table { border-collapse: collapse; margin: 1.2rem auto; font-size: .88rem; }
+  th, td { padding: .28rem .7rem; text-align: right; border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { border-bottom: 2px solid var(--ink); }
+  caption { caption-side: bottom; font-size: .85rem; color: var(--muted); padding-top: .5rem; text-align: left; }
+  figure { margin: 1.6rem 0; }
+  figcaption { font-size: .85rem; color: var(--muted); margin-top: .5rem; }
+  .placeholder-figure { border: 1px dashed #b9a77a; background: var(--todo); color: var(--todo-ink);
+                        height: 14rem; display: flex; align-items: center; justify-content: center;
+                        text-align: center; padding: 1rem; font-family: ui-monospace, monospace; font-size: .8rem; }
+  .todo { background: var(--todo); color: var(--todo-ink); font-family: ui-monospace, monospace;
+          font-size: .78em; padding: .05rem .35rem; border-radius: 3px; white-space: nowrap; }
+  .note { background: var(--todo); border-left: 3px solid #c99a2e; padding: .6rem .9rem; font-size: .9rem; margin: 1rem 0; }
+  .hyp { border-left: 3px solid #4b6b8a; padding: .1rem .9rem; margin: .8rem 0; background: #f2f5f8; }
+  code { font-family: ui-monospace, monospace; font-size: .86em; }
+  ol.refs { font-size: .88rem; padding-left: 1.6rem; }
+  ol.refs li { margin-bottom: .35rem; }
+  .muted { color: var(--muted); }
+  td.todo-cell { color: var(--todo-ink); background: var(--todo); font-family: ui-monospace, monospace; font-size: .78rem; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Commit, Don't Average: Multi-Hypothesis Latent Prediction for Sharp Multi-Step Futures in Text</h1>
+<p class="subtitle">Draft technical report</p>
+<p class="authors"><span class="todo">TODO: author, affiliation, date</span></p>
+<p class="status">Status: draft. Method and setup sections describe the implemented code. All results are placeholders (marked TODO).</p>
+
+<!-- ===================================================================== -->
+<section class="abstract">
+<h2>Abstract</h2>
+<p>
+A predictor trained to minimize a distance to the future learns the conditional
+mean of the possible futures. When the future is uncertain, that mean is a blur:
+a point between the plausible outcomes that need not correspond to any of them.
+In a joint-embedding predictive architecture (JEPA) this blur lives in latent
+space, and it compounds when predictions are chained: a multi-step rollout that
+feeds a blurred latent back into the predictor drifts away from the latents
+real text produces. We study a simple alternative. The predictor proposes
+\(P\) candidate future latents together with a distribution \(\pi\) over which
+candidate will be closest to the real future, and every prediction step
+<em>commits</em> to exactly one candidate instead of averaging. Training uses a
+relaxed winner-takes-all objective, and a separate head estimates the mean
+future \(\mu\), which serves as an in-model single-prediction baseline.
+We train the model on FineWeb-Edu with a horizon of \(k = 20\) tokens and
+compare committed rollouts with the \(\mu\) path and with an otherwise
+identical single-candidate model (\(P = 1\)), at depths of up to four steps
+(80 tokens).
+<span class="todo">TODO: one or two sentences with the main result, e.g. manifold distance and best-of-K rollout error at depth 4, with seeds.</span>
+</p>
+</section>
+
+<!-- ===================================================================== -->
+<h2>1&nbsp; Introduction</h2>
+
+<p>
+Regression onto an uncertain target produces an average. In video prediction
+this is visible as blurry frames, which motivated adversarial and multi-scale
+objectives that go beyond mean squared error [Mathieu et al. 2016]. The same
+effect applies to any predictor trained with a distance loss. Under a squared
+or cosine-type distance, the optimal single prediction given the context is
+the mean of the future, or its direction. If the future is multimodal, the mean
+lies between the modes.
+</p>
+
+<p>
+Joint-embedding predictive architectures [LeCun 2022; Assran et al. 2023;
+Bardes et al. 2024] predict representations rather than raw signals. This
+removes the need to model unpredictable low-level detail, but it does not
+remove the averaging. A JEPA predictor that outputs a single latent still
+learns the conditional mean <em>in latent space</em>. For a single prediction
+step that may be harmless. For planning, or for generating text from a latent
+plan, the predictor's output is fed back in as the next input. A mean latent
+is then an input the encoder never produces, and each further step predicts
+from a point that is off the distribution of real latents.
+</p>
+
+<p>
+We test whether <strong>committing</strong> avoids this. The predictor proposes
+\(P\) candidates for the latent \(k\) tokens ahead, and a learned distribution
+\(\pi\) says how likely each candidate is to be the closest to the real future.
+A <em>commit</em> chooses exactly one candidate according to a <em>policy</em>
+(sampling from \(\pi\), its argmax, or, during training, the candidate closest
+to the real future), and the rollout continues from that candidate. Because
+each committed latent stands for one future rather than a mixture of all of
+them, we expect it to stay close to the latents real text produces, even after
+several steps.
+</p>
+
+<p>Contributions:</p>
+<ol>
+  <li>A multi-hypothesis JEPA for text with an explicit commitment step, a
+      win-probability head \(\pi\), and a detached mean-future head \(\mu\) that
+      provides an in-model single-prediction baseline and a per-context
+      uncertainty estimate (\(\lvert\mu\rvert\)).</li>
+  <li>An evaluation protocol for multi-step latent rollouts: rollout error,
+      manifold distance calibrated against real latents, and best-of-\(K\)
+      rollout error. We argue that error against the single realized future is
+      the wrong yardstick for committed rollouts (Section&nbsp;4.4).</li>
+  <li>Experiments on a synthetic two-successor Markov chain, where valid
+      futures are known, and on FineWeb-Edu, against a single-candidate
+      baseline and ablations. <span class="todo">TODO: adjust to what was actually run.</span></li>
+  <li>A qualitative comparison of text decoded from committed plans and from
+      the mean plan. <span class="todo">TODO: ticket 003</span></li>
+</ol>
+
+<!-- ===================================================================== -->
+<h2>2&nbsp; Related work</h2>
+
+<p class="note">Draft. Verify every citation (authors, year, venue) before release,
+and add the source of the VISReg regularizer.</p>
+
+<p>
+<strong>Multiple-hypothesis prediction.</strong>
+Producing several outputs and training only the best one is the idea behind
+multiple choice learning [Guzman-Rivera et al. 2012] and its stochastic
+variant for deep ensembles [Lee et al. 2016]. Rupprecht et al. [2017] show
+that a relaxed winner-takes-all loss, which gives a small weight to the
+non-winning hypotheses, avoids dead hypotheses, and characterize what the
+hypotheses converge to. Our move loss is such a relaxation, with an annealed,
+distance-relative temperature and uniform smoothing. Mixture density networks
+[Bishop 1994] model multimodality with an explicit mixture likelihood instead.
+Trajectory forecasting routinely evaluates multimodal predictors with
+best-of-\(K\) errors [e.g. Gupta et al. 2018]; we adopt this for rollouts.
+</p>
+
+<p>
+<strong>JEPA and non-contrastive regularization.</strong>
+JEPAs predict a target representation from a context representation [LeCun
+2022], with instances for images [Assran et al. 2023] and video [Bardes et
+al. 2024]. Training against a target produced by the same encoder needs a
+mechanism against collapse; variance-invariance-covariance regularization
+[Bardes et al. 2022] is a common choice. We regularize the encoder latents
+toward a centered, unit-scale, Gaussian-shaped distribution, with the shape
+matched by sliced projections.
+<span class="todo">TODO: cite the source of this "VISReg" regularizer (scale/shape/center with sliced Gaussian matching)</span>
+</p>
+
+<p>
+<strong>Latent world models and latent language modeling.</strong>
+World models learn latent dynamics and plan or imagine in latent space [Ha and
+Schmidhuber 2018; Hafner et al. 2020]. Stochastic latent variables are the
+usual answer to multimodal futures there, and in stochastic video prediction
+[Babaeizadeh et al. 2018]. For language, Large Concept Models predict the next
+sentence embedding [LCM team, Barrault et al. 2024] and discuss the limitation
+of mean-squared-error prediction in embedding space. Our setting is a small
+JEPA over token-level latents, with a horizon of \(k\) tokens and a token
+decoder conditioned on latent hints.
+<span class="todo">TODO: position more precisely against latent-planning language models</span>
+</p>
+
+<!-- ===================================================================== -->
+<h2>3&nbsp; Method</h2>
+
+<h3>3.1&nbsp; Encoder and targets</h3>
+<p>
+A causal transformer encoder maps tokens \(x_{1..T}\) to latents
+\(z_{1..T} \in \mathbb{R}^D\). The latent \(z_t\) summarizes the prefix up to
+\(t\). The prediction target is the encoder's own latent \(k\) tokens ahead,
+with gradients stopped: \(y_t = \mathrm{sg}(z_{t+k})\). There is no separate
+target encoder. Collapse is prevented by a regularizer on the encoder latents
+(Section&nbsp;3.4).
+</p>
+
+<h3>3.2&nbsp; Predictor: candidates, \(\pi\) and \(\mu\)</h3>
+<p>
+The predictor sees only \(z_t\). It expands \(z_t\) into \(P\) slots with a
+per-slot linear map, mixes the slots with a small non-causal transformer, and
+produces for each slot \(i\) a residual \(\delta_i\) and a logit. The
+<em>candidates</em> are
+</p>
+\[ c_i = \operatorname{RMSNorm}\big(z_t + \delta_i(z_t)\big), \qquad i = 1,\dots,P, \]
+<p>
+normalized without a learnable gain, so every candidate lives at the scale of
+real latents and can be fed back into the predictor. The logits define
+\(\pi(\cdot \mid z_t)\), the probability that each candidate is the one
+closest to the real future. A separate MLP on \(\mathrm{sg}(z_t)\) outputs
+\(\mu\), trained to estimate \(\mathbb{E}[\hat y \mid z_t]\) with
+\(\hat y = y / \lVert y \rVert\). Its input is detached, so \(\mu\) only
+<em>measures</em>: \(\lvert\mu\rvert \approx 1\) when the future is
+predictable and shrinks when the futures diverge.
+</p>
+
+<h3>3.3&nbsp; Commitment</h3>
+<p>All comparisons use the cosine distance</p>
+\[ d(a, b) = 2 - 2\cos(a, b). \]
+<p>
+A <em>commit</em> applies a policy that scores the candidates and returns the
+highest-scoring candidate and its index. The committed future is always exactly
+one of the candidates, never a combination. The policies are:
+</p>
+<ul>
+  <li><strong>Hindsight</strong>: \(\arg\min_i d(c_i, y)\). Needs the real
+      future, so it is only available during training and measurement.</li>
+  <li><strong>\(\pi\)-argmax</strong>: the most likely candidate.</li>
+  <li><strong>\(\pi\)-sample</strong>: a sample from \(\pi\) (Gumbel-max, with
+      optional temperature and top-\(k\)).</li>
+  <li><strong>\(\mu\)-safe</strong>: the candidate with the lowest expected
+      distance under \(\mu\). For unit vectors,
+      \(\mathbb{E}[d(c_i, \hat y) \mid z_t] = 2 - 2\,\hat c_i \cdot \mu\).</li>
+</ul>
+<p>
+The identity in the last item matters for interpretation. Under this distance,
+the best single prediction in expectation is the direction of \(\mu\), and no
+committed candidate can beat it on expected distance unless the future is
+unimodal. Commitment therefore trades expected distance for the property of
+being an actual future. Our evaluation is built around this trade-off
+(Section&nbsp;4.4).
+</p>
+
+<h3>3.4&nbsp; Objective</h3>
+<p>
+For a position with distances \(d_i = d(c_i, y)\), the soft assignment is
+</p>
+\[ r_i = (1 - \varepsilon)\,\operatorname{softmax}_i\!\left(-\frac{d_i}{\tau}\right) + \frac{\varepsilon}{P},
+   \qquad \tau = s \cdot \bar d, \]
+<p>
+with gradients stopped through \(r\), \(\bar d\) the mean candidate distance
+over the batch (so the temperature is relative to the current distance scale),
+and \(s\) annealed geometrically from 1.0 to 0.1 over the first 30% of
+training. Early on every candidate shares every target; later the assignment
+approaches winner-takes-all. The smoothing \(\varepsilon = 0.05\) keeps every
+candidate receiving some gradient. The commitment loss is
+</p>
+\[ \mathcal{L}_{\text{commit}} =
+   \underbrace{\sum_i r_i d_i}_{\text{move}}
+   \; \underbrace{- \sum_i r_i \log \pi_i}_{\pi}
+   \; + \underbrace{\lVert \mu - \hat y \rVert^2}_{\mu}
+   \; + 0.5 \cdot \underbrace{\operatorname{mean}_{i \ne j} \big[\cos(c_i, c_j) - m\big]_+}_{\text{diversity}} \]
+<p>
+with margin \(m = 0.5\), so only near-duplicate candidates are pushed apart.
+The \(\pi\) term is a cross-entropy against \(r\). It is bounded below by
+\(H(r)\), so we report \(\mathrm{KL}(r \,\Vert\, \pi)\) separately. The
+encoder is regularized by VISReg, applied to all valid encoder latents: a
+centering term (squared mean), a scale term (\((1 - \mathrm{std})^2\) per
+dimension), and a shape term (squared distance between sorted projections on
+256 random directions and standard-normal quantiles). The JEPA loss is the
+unweighted sum of VISReg and \(\mathcal{L}_{\text{commit}}\), with all weights
+1 except diversity.
+</p>
+
+<h3>3.5&nbsp; Rollout</h3>
+<p>
+A rollout of depth \(n\) chains commits without going back to tokens:
+\(z^{(0)} = z_t\) and \(z^{(i)} = \operatorname{commit}(\text{predictor}(z^{(i-1)}), \text{policy})\).
+Each step advances the plan by \(k\) tokens, so depth 4 with \(k = 20\) plans
+80 tokens ahead. The predictor is trained only on real latents. Rollout is
+used for evaluation only, so the experiments test whether committed latents
+remain usable inputs <em>without</em> being trained for it. The \(\mu\) path,
+\(z^{(i)} = \sqrt{D}\,\mu(z^{(i-1)}) / \lVert\mu(z^{(i-1)})\rVert\), is the
+in-model averaging baseline.
+</p>
+
+<h3>3.6&nbsp; Decoder and hints</h3>
+<p>
+A small causal token transformer with a sliding window of 32 tokens generates
+text. Each token position belongs to a block of \(k\) tokens. Its
+<em>hint</em> is a projection of the latent at the block start plus a
+projection of the committed future for that block. The hint is added to the
+token embeddings and re-injected before every layer through zero-initialized
+projections. The short window forces the decoder to take longer-range content
+from the hint.
+</p>
+<p>
+During decoder training the committed future is chosen by hindsight. This is
+deliberate teacher forcing, and it leaks information. The hint is still a
+predictor output, but the choice among \(P\) candidates was made with the real
+future, so it carries up to \(\log_2 P = 3\) bits about it. Hints chosen by
+\(\pi\)-argmax carry none. Validation and all reported decoder results use
+\(\pi\)-argmax unless stated otherwise. The last block of a sequence has no
+latent \(k\) tokens ahead and is excluded from the decoder loss.
+</p>
+
+<h3>3.7&nbsp; Two-stage training</h3>
+<p>
+The encoder and predictor are trained first (the JEPA stage). The decoder is
+then trained against the frozen JEPA (the decoder stage), so its hints are
+stable from the first step and the decoder loss cannot change the latents.
+</p>
+
+<!-- ===================================================================== -->
+<h2>4&nbsp; Experimental setup</h2>
+
+<h3>4.1&nbsp; Data</h3>
+<p>
+FineWeb-Edu [Penedo et al. 2024], <code>sample-10BT</code>, with a 32k-token
+byte-level BPE tokenizer trained on a 500&nbsp;MB sample. We use about 500M
+tokens, split into non-overlapping chunks of 1024 tokens. Chunks shorter than
+64 tokens are dropped. Whole documents are held out for validation, so no
+validation chunk continues a training document.
+<span class="todo">TODO: exact token counts of the train/validation splits</span>
+</p>
+
+<h3>4.2&nbsp; Model and training</h3>
+<table>
+  <thead><tr><th>Component</th><th>Setting</th></tr></thead>
+  <tbody>
+    <tr><td>Encoder</td><td>causal, 8 layers, width 448, 8 heads, SwiGLU 896, RoPE, context 1024</td></tr>
+    <tr><td>Predictor</td><td>reads \(z_t\) only; \(P = 8\) slots, 2 non-causal layers, width 448</td></tr>
+    <tr><td>Decoder</td><td>4 layers, width 448, sliding window 32, tied embeddings, per-layer hint</td></tr>
+    <tr><td>Horizon</td><td>\(k = 20\) tokens</td></tr>
+    <tr><td>Commitment loss</td><td>\(s\): 1.0 → 0.1 over 30%, \(\varepsilon = 0.05\), diversity 0.5 (margin 0.5)</td></tr>
+    <tr><td>VISReg</td><td>scale, shape, center weights 1; 256 slices</td></tr>
+    <tr><td>JEPA stage</td><td>AdamW, lr \(4\cdot10^{-4}\), batch 24, 3 epochs, wd 0.01</td></tr>
+    <tr><td>Decoder stage</td><td>AdamW, lr \(6\cdot10^{-4}\), batch 24, 1 epoch, hindsight hints</td></tr>
+    <tr><td>Schedule</td><td>1% linear warmup, cosine to 10% of peak; bf16; grad-norm clip 1.0</td></tr>
+  </tbody>
+  <caption>Table 1. Main configuration (the defaults in <code>jepa/config.py</code>).
+  <span class="todo">TODO: parameter counts, GPU type and hours per stage</span></caption>
+</table>
+
+<h3>4.3&nbsp; Baselines, ablations and seeds</h3>
+<table>
+  <thead><tr><th>Run</th><th>Change from main</th><th>Question</th></tr></thead>
+  <tbody>
+    <tr><td>Main</td><td>—</td><td>—</td></tr>
+    <tr><td>\(P = 1\)</td><td>one candidate</td><td>Does committing among several candidates beat a single prediction?</td></tr>
+    <tr><td>\(P = 4\)</td><td>four candidates</td><td>Sensitivity to \(P\)</td></tr>
+    <tr><td>No annealing</td><td>\(s\) fixed at 0.1</td><td>Does annealing prevent dead candidates?</td></tr>
+    <tr><td>No diversity</td><td>diversity weight 0</td><td>Is the diversity term needed?</td></tr>
+    <tr><td>Decoder: \(\pi\)-argmax hints</td><td>decoder trained on \(\pi\)-argmax hints</td><td>Cost and benefit of hindsight teacher forcing</td></tr>
+  </tbody>
+  <caption>Table 2. Runs. Each runs with <span class="todo">TODO: n</span> seeds.
+  Running variants requires ticket 002.</caption>
+</table>
+
+<h3>4.4&nbsp; Metrics</h3>
+<ul>
+  <li><strong>Rollout error</strong> at depth \(i\): \(d(z^{(i)}, z_{t+ik})\),
+      the distance to the latent of the real continuation.</li>
+  <li><strong>Best-of-\(K\) rollout error</strong>: the lowest error over
+      \(K\) independent \(\pi\)-sample rollouts, with whole trajectories
+      compared (ticket 005).</li>
+  <li><strong>Manifold distance</strong>: the distance from a rollout latent to
+      its nearest neighbor in a bank of 50k encoder latents from training
+      documents (disjoint from the query documents). A <code>real</code> row
+      measures the same quantity for the real future latents and calibrates
+      what "on the manifold" means.</li>
+  <li><strong>Path validity</strong> and <strong>branch entropy</strong>
+      (synthetic only, where the valid transitions are known).</li>
+  <li><strong>Decoder cross-entropy</strong> under different hints:
+      \(\pi\)-argmax, \(\pi\)-sample, \(\mu\)-safe, hindsight, real block
+      latent (leaky upper bound), shuffled, and null.</li>
+</ul>
+<p>
+<strong>Why rollout error alone is the wrong yardstick.</strong> By the
+identity in Section&nbsp;3.3, the mean direction minimizes the expected
+distance to the realized future. Plain rollout error therefore favours
+averaging by construction: a committed rollout that follows a plausible but
+unrealized branch is penalized as if it were wrong. We report rollout error,
+but the claim is evaluated on (a) manifold distance, which asks whether the
+rollout is a future at all, (b) best-of-\(K\) error, which asks whether the
+committed futures include the real one, and (c) hindsight rollout error, which
+asks whether following the real branch stays accurate over several steps.
+</p>
+
+<h3>4.5&nbsp; Hypotheses (fixed before the experiments)</h3>
+<div class="hyp"><strong>H1 (sharpness).</strong> At depths 2–4, committed (\(\pi\)-sample) rollouts have a lower manifold distance than both the \(\mu\) path and the \(P = 1\) model's rollouts, by more than the seed standard deviation, and remain within <span class="todo">TODO: tolerance</span> of the <code>real</code> row.</div>
+<div class="hyp"><strong>H2 (coverage).</strong> At depth 4, best-of-16 \(\pi\)-sample rollout error is lower than the rollout error of the \(\mu\) path and of the \(P = 1\) model.</div>
+<div class="hyp"><strong>H3 (stability).</strong> Hindsight rollout error grows more slowly with depth than \(\mu\)-path error.</div>
+<div class="hyp"><strong>H4 (use).</strong> The decoder uses the committed future: shuffled-hint cross-entropy exceeds \(\pi\)-argmax cross-entropy by more than 0.05 nats.</div>
+<p class="muted">If a hypothesis fails, we report it as failed. We do not change the metric after seeing the results.</p>
+
+<!-- ===================================================================== -->
+<h2>5&nbsp; Results</h2>
+
+<h3>5.1&nbsp; Synthetic: a two-successor Markov chain</h3>
+<p>
+Eight states at the latent scale (\(D = 32\)), each with two equally likely
+successors. A predictor with \(P = 4\), and one with \(P = 1\), are trained
+with the commitment loss on (state, successor) pairs. Here the valid futures
+are known exactly, so this experiment isolates the mechanism from the
+difficulty of text.
+<span class="todo">TODO: fill from ticket 004</span>
+</p>
+<table>
+  <thead>
+    <tr><th>Model / path</th><th>Metric</th><th>depth 1</th><th>2</th><th>3</th><th>4</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>\(P = 4\), \(\pi\)-sample</td><td>manifold dist.</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(P = 4\), \(\pi\)-sample</td><td>path validity</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(P = 4\), hindsight</td><td>rollout error</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(P = 4\), \(\pi\)-sample</td><td>rollout error</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(P = 4\), \(\mu\) path</td><td>manifold dist.</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(P = 4\), \(\mu\) path</td><td>rollout error</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(P = 1\)</td><td>manifold dist.</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(P = 1\)</td><td>rollout error</td><td class="todo-cell" colspan="4">TODO</td></tr>
+  </tbody>
+  <caption>Table 3. Synthetic results, mean ± std over seeds. Also report
+  \(\pi\)-sample branch entropy (ideal: 1 bit), mode coverage and \(\lvert\mu\rvert\).</caption>
+</table>
+<figure>
+  <div class="placeholder-figure">TODO — Figure 1: manifold distance (left) and rollout error (right) vs depth,
+    for P=4 π-sample, P=4 hindsight, μ path and P=1. Error bars over seeds.</div>
+  <figcaption>Figure 1. Synthetic chain.</figcaption>
+</figure>
+
+<h3>5.2&nbsp; Representation and predictor health</h3>
+<p>
+Before interpreting rollouts, we check that the encoder has not collapsed and
+that the candidates are used:
+effective rank of the latents, VISReg terms, candidate usage (live and
+effective slots), \(\pi\)'s gain in nats over a constant distribution, and
+\(\mu\) calibration (measured \(\mu\)-direction distance against
+\(2 - 2\lvert\mu\rvert\)).
+<span class="todo">TODO: table from <code>python -m jepa measure --json</code> (sections representation, loss, heads)</span>
+</p>
+
+<h3>5.3&nbsp; Rollouts on FineWeb-Edu</h3>
+<table>
+  <thead>
+    <tr><th>Path</th><th>depth 1</th><th>2</th><th>3</th><th>4</th></tr>
+  </thead>
+  <tbody>
+    <tr><th colspan="5" style="text-align:left">Manifold distance (lower is closer to real latents)</th></tr>
+    <tr><td><code>real</code> (calibration)</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(\pi\)-sample</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(\pi\)-argmax</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(\mu\) path</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(P = 1\) model</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><th colspan="5" style="text-align:left">Rollout error (distance to the real continuation's latent)</th></tr>
+    <tr><td>hindsight</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>best-of-16 \(\pi\)-sample</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(\pi\)-sample</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(\mu\) path</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><td>\(P = 1\) model</td><td class="todo-cell" colspan="4">TODO</td></tr>
+  </tbody>
+  <caption>Table 4. Main result. Depth \(i\) plans \(20i\) tokens ahead. Mean ± std over seeds. H1–H3.</caption>
+</table>
+<figure>
+  <div class="placeholder-figure">TODO — Figure 2: manifold distance and best-of-K rollout error vs depth on FineWeb-Edu,
+    with the real row as a band.</div>
+  <figcaption>Figure 2. Rollouts on FineWeb-Edu.</figcaption>
+</figure>
+
+<h3>5.4&nbsp; Does the decoder use the committed future?</h3>
+<table>
+  <thead><tr><th>Hint</th><th>Token CE (nats)</th></tr></thead>
+  <tbody>
+    <tr><td>\(\pi\)-argmax</td><td class="todo-cell">TODO</td></tr>
+    <tr><td>\(\pi\)-sample</td><td class="todo-cell">TODO</td></tr>
+    <tr><td>\(\mu\)-safe</td><td class="todo-cell">TODO</td></tr>
+    <tr><td>hindsight (teacher forcing)</td><td class="todo-cell">TODO</td></tr>
+    <tr><td>real block latent (leaky upper bound)</td><td class="todo-cell">TODO</td></tr>
+    <tr><td>shuffled</td><td class="todo-cell">TODO</td></tr>
+    <tr><td>null</td><td class="todo-cell">TODO</td></tr>
+  </tbody>
+  <caption>Table 5. Decoder cross-entropy by hint (H4). Hint use = shuffled − \(\pi\)-argmax.
+  Commit headroom = \(\pi\)-argmax − hindsight.</caption>
+</table>
+
+<h3>5.5&nbsp; Decoded plans: committed vs mean</h3>
+<p>
+For fixed, seeded validation prompts, we plan four blocks ahead in latent
+space and decode each plan greedily, without re-encoding. We compare
+\(\pi\)-sample plans (three samples), the \(\pi\)-argmax plan, the \(\mu\) plan,
+the \(P = 1\) model's plan, and the real continuation. The decoder was trained
+on committed candidates, so decoding the \(\mu\) plan is out of distribution
+for it. The \(P = 1\) model, whose decoder was trained on its own single
+prediction, is the fair comparison.
+<span class="todo">TODO: ticket 003</span>
+</p>
+<figure>
+  <div class="placeholder-figure">TODO — Figure 3: side-by-side decoded continuations (prompt · real · π-sample ×3 · π-argmax · μ · P=1),
+    80 tokens each, prompts chosen by seed, not by hand.</div>
+  <figcaption>Figure 3. Decoded latent plans.</figcaption>
+</figure>
+
+<h3>5.6&nbsp; Ablations</h3>
+<p><span class="todo">TODO: one table, main metric (depth-4 manifold distance and best-of-16 error) per ablation in Table 2, plus live slots</span></p>
+
+<!-- ===================================================================== -->
+<h2>6&nbsp; Discussion</h2>
+<p>
+<strong>Sharp is not the same as right.</strong> A committed rollout can be a
+perfectly valid future and still not be the one that happened. Section 3.3
+shows that on expected distance the mean wins by construction. The useful
+property of commitment is that the rollout remains a future the model can
+continue from, and that many such rollouts together cover the real
+continuation. <span class="todo">TODO: discuss in light of Tables 3–4</span>
+</p>
+<p>
+<strong>What \(\mu\) adds.</strong> \(\mu\) is free: its input is detached, so
+it does not change the encoder or the candidates. It gives a per-context
+measure of how divergent the futures are (\(\lvert\mu\rvert\)), and an in-model
+answer to "what would a single prediction have done", without training a
+second model. <span class="todo">TODO: relation between |μ| and the gap between committed and μ rollouts, per context</span>
+</p>
+<p>
+<strong>Candidate usage.</strong> In earlier runs only a few of the eight
+candidates won regularly. Annealing and the margin-based diversity term target
+this. <span class="todo">TODO: report live/effective slots; link to the head-growth direction in <code>docs/vision.md</code></span>
+</p>
+
+<!-- ===================================================================== -->
+<h2>7&nbsp; Limitations</h2>
+<ul>
+  <li>One small model scale and one horizon (\(k = 20\)). <span class="todo">TODO: compute budget</span></li>
+  <li>Rollouts are evaluated, not trained: the predictor never sees its own
+      outputs as inputs. A multi-step training loss is a natural extension.</li>
+  <li>Decoder training uses hindsight hints, which carry up to 3 bits about
+      the real future per block. Reported decoder numbers use \(\pi\)-argmax
+      hints.</li>
+  <li>Manifold distance uses a finite bank of real latents (50k). Distances
+      shrink as the bank grows, so only comparisons at a fixed bank size are
+      meaningful.</li>
+  <li>The target is the encoder's own latent with gradients stopped and no
+      EMA target encoder; we do not compare target choices.</li>
+  <li>The quality of decoded text is judged qualitatively.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2>8&nbsp; Conclusion</h2>
+<p>
+<span class="todo">TODO: write after the results. Three sentences: what was tested, what was found (including failures), what it suggests next.</span>
+</p>
+
+<!-- ===================================================================== -->
+<h2>Reproducibility</h2>
+<p>Code: <span class="todo">TODO: repository URL and commit</span>. Commands:</p>
+<pre><code>python -m jepa train-tokenizer
+python -m jepa prepare-data
+python -m jepa train                                   # JEPA stage
+python -m jepa train --stage decoder --from runs/jepa  # decoder stage
+python -m jepa measure --model runs/jepa-decoder --json runs/jepa-decoder/metrics.json</code></pre>
+<p class="muted">Variant runs (P = 1, ablations, seeds) need ticket 002, and the synthetic numbers ticket 004.</p>
+
+<!-- ===================================================================== -->
+<h2>References</h2>
+<p class="note">Draft list. Check every entry against the original before release.</p>
+<ol class="refs">
+  <li>Assran, M., et al. (2023). Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture. <em>CVPR</em>.</li>
+  <li>Babaeizadeh, M., et al. (2018). Stochastic Variational Video Prediction. <em>ICLR</em>.</li>
+  <li>Bardes, A., Ponce, J., LeCun, Y. (2022). VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning. <em>ICLR</em>.</li>
+  <li>Bardes, A., et al. (2024). Revisiting Feature Prediction for Learning Visual Representations from Video (V-JEPA). <em>arXiv</em>.</li>
+  <li>Bishop, C. M. (1994). Mixture Density Networks. Technical report, Aston University.</li>
+  <li>Gupta, A., et al. (2018). Social GAN: Socially Acceptable Trajectories with Generative Adversarial Networks. <em>CVPR</em>.</li>
+  <li>Guzman-Rivera, A., Batra, D., Kohli, P. (2012). Multiple Choice Learning: Learning to Produce Multiple Structured Outputs. <em>NeurIPS</em>.</li>
+  <li>Ha, D., Schmidhuber, J. (2018). World Models. <em>arXiv / NeurIPS</em>.</li>
+  <li>Hafner, D., et al. (2020). Dream to Control: Learning Behaviors by Latent Imagination. <em>ICLR</em>.</li>
+  <li>LCM team, Barrault, L., et al. (2024). Large Concept Models: Language Modeling in a Sentence Representation Space. <em>arXiv</em>.</li>
+  <li>LeCun, Y. (2022). A Path Towards Autonomous Machine Intelligence. <em>OpenReview</em> position paper.</li>
+  <li>Lee, S., et al. (2016). Stochastic Multiple Choice Learning for Training Diverse Deep Ensembles. <em>NeurIPS</em>.</li>
+  <li>Maddison, C. J., Tarlow, D., Minka, T. (2014). A* Sampling. <em>NeurIPS</em>. (Gumbel-max sampling.)</li>
+  <li>Mathieu, M., Couprie, C., LeCun, Y. (2016). Deep Multi-Scale Video Prediction Beyond Mean Square Error. <em>ICLR</em>.</li>
+  <li>Penedo, G., et al. (2024). The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale. <em>arXiv</em>.</li>
+  <li>Rupprecht, C., et al. (2017). Learning in an Uncertain World: Representing Ambiguity Through Multiple Hypotheses. <em>ICCV</em>.</li>
+  <li><span class="todo">TODO: the source of the VISReg regularizer</span></li>
+</ol>
+
+</main>
+</body>
+</html>

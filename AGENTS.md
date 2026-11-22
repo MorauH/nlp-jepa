@@ -21,7 +21,8 @@ Vocabulary: `GLOSSARY.md`. Design: `docs/architecture.md`.
 - `jepa/evaluation/measure.py`: the paper's numbers. `jepa/inference/generate.py`: sampling.
 - `jepa/paths.py`: `data/` and `runs/` are resolved from the package location, not the CWD.
 - `data/` (tokenizer + prepared chunks) and `runs/` (checkpoints) are gitignored generated artifacts. Don't hand-edit them. Regenerating them streams FineWeb-Edu from the network and takes a long time.
-- `docs/architecture.md` describes the implemented model; `docs/vision.md` is planning, not implemented behavior; `docs/adr/` records decisions.
+- `docs/architecture.md` describes the implemented model; `docs/vision.md` is planning, not implemented behavior; `docs/adr/` records decisions; `docs/tickets/` holds open work items (not implemented).
+- `docs/report/report.html`: the draft research report. Results are placeholders (marked `TODO`) until the experiments in `docs/tickets/` are run.
 
 ## Gotchas
 - Config defaults are the experiment. Don't override model size, window, candidate count, loss weights or annealing in the scripts. Checkpoint `config.json` nests `encoder`/`predictor`/`decoder`/`visreg`/`commitment` with no top-level duplicates.
