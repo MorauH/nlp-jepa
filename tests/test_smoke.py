@@ -51,9 +51,7 @@ def expected_decoder_loss(model, labels, attention_mask, policy_name):
     k = model.pred_horizon
     with torch.no_grad():
         latents = model._encode(labels, attention_mask)
-        futures = model.predictor(
-            latents[:, :-k, :], return_all_timesteps=True
-        )
+        futures = model.predictor(latents[:, :-k, :])
         if policy_name == "hindsight":
             committed = futures.commit(Hindsight(), latents[:, k:, :]).future
         else:
@@ -88,8 +86,8 @@ def test_full_stack_forward():
     )
 
 
-def test_predictor_reads_only_z_t():
-    """Each position's output depends on its own latent and nothing else."""
+def test_predictor_is_a_pure_function_of_a_latent():
+    """Each latent's output depends on that latent and nothing else."""
     from jepa import PredictorModel
 
     torch.manual_seed(0)
@@ -105,24 +103,33 @@ def test_predictor_reads_only_z_t():
     torch.nn.init.normal_(predictor.mean_head[-1].weight)
 
     with torch.no_grad():
-        futures = predictor(latents, return_all_timesteps=True)
+        futures = predictor(latents)
         candidates, pi, mu = futures
         assert candidates.shape == (2, 6, 4, 32)
         assert pi.shape == (2, 6, 4)
         assert mu.shape == (2, 6, 32)
-        # The single-step path on z_t alone matches every position.
+        # The single-latent path (leading dims (B,)) matches every position.
         for t in range(6):
-            step = predictor(latents[:, t : t + 1], return_all_timesteps=False)
+            step = predictor(latents[:, t])
             torch.testing.assert_close(
                 step.candidates, candidates[:, t], atol=1e-5, rtol=1e-4
             )
             torch.testing.assert_close(step.pi, pi[:, t], atol=1e-5, rtol=1e-4)
             torch.testing.assert_close(step.mu, mu[:, t], atol=1e-5, rtol=1e-4)
 
+        # No leading dimensions at all: (D,) -> (P, D), (P,), (D,).
+        single = predictor(latents[0, 0])
+        assert single.candidates.shape == (4, 32)
+        assert single.pi.shape == (4,)
+        assert single.mu.shape == (32,)
+        torch.testing.assert_close(
+            single.candidates, candidates[0, 0], atol=1e-5, rtol=1e-4
+        )
+
         # Changing one latent changes only that position.
         shifted = latents.clone()
         shifted[:, 3] += 1.0
-        shifted_futures = predictor(shifted, return_all_timesteps=True)
+        shifted_futures = predictor(shifted)
         keep = [0, 1, 2, 4, 5]
         torch.testing.assert_close(
             shifted_futures.candidates[:, keep], candidates[:, keep]

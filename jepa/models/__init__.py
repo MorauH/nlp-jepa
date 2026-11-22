@@ -8,6 +8,7 @@ from .commitment import (
     PiArgmax,
     PiSample,
     policy,
+    rollout,
 )
 from .decoder import DecoderModel
 from .encoder import EncodeTransformer
@@ -31,4 +32,5 @@ __all__ = [
     "PiArgmax",
     "PiSample",
     "policy",
+    "rollout",
 ]

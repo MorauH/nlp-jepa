@@ -239,7 +239,7 @@ def main(argv: list[str] | None = None) -> None:
             dim=-1,
         )
 
-        futures = model.predictor(latents[:, :-k, :], return_all_timesteps=True)
+        futures = model.predictor(latents[:, :-k, :])
         candidates = futures.candidates
         distances = futures.distances(real_future)
         delta = (candidates - latents[:, :-k, :].unsqueeze(2)).norm(dim=-1)

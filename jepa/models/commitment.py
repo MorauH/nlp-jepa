@@ -118,6 +118,65 @@ class Commit(NamedTuple):
     index: Tensor
 
 
+def rollout(
+    predictor,
+    z: Tensor,
+    policy: "Policy",
+    steps: int,
+    targets: Tensor | None = None,
+) -> Commit:
+    """Chain ``steps`` commits from ``z`` without re-encoding any tokens.
+
+    ``z_1 = commit(predictor(z))``, ``z_2 = commit(predictor(z_1))``, ... Each
+    committed future is exactly one of the predictor's candidates, so it lives
+    at the encoder-latent scale and can be fed straight back into the
+    predictor.  No tokens (and no encoder) are involved.
+
+    Args:
+        predictor: any callable ``z -> Futures``, e.g. a
+            :class:`~jepa.models.predictor.PredictorModel`.
+        z: ``(..., D)`` starting latent.
+        policy: the commit rule used at every depth.  A hindsight policy needs
+            ``targets``.
+        steps: number of commits, at least 1.
+        targets: ``(..., steps, D)`` real latents at depths 1..steps; required
+            iff ``policy.needs_target``.  Depth ``i`` (1-based) commits against
+            ``targets[..., i - 1, :]``.
+
+    Returns:
+        :class:`Commit` with ``future`` ``(..., steps, D)`` and ``index``
+        ``(..., steps)``.
+
+    Gradients are not detached; the caller decides.  This is evaluation-only
+    for now: the predictor is trained on real latents only.  A multi-step
+    training loss could later be built on top of this function.
+    """
+    if steps < 1:
+        raise ValueError(f"steps must be at least 1; got {steps!r}")
+    if policy.needs_target and targets is None:
+        raise ValueError(
+            f"{type(policy).__name__} commits by hindsight and needs the real "
+            "path; pass targets=..."
+        )
+    if targets is not None:
+        expected = (*z.shape[:-1], steps, z.shape[-1])
+        if tuple(targets.shape) != expected:
+            raise ValueError(
+                f"targets shape {tuple(targets.shape)} must be {expected}"
+            )
+
+    futures: list[Tensor] = []
+    indices: list[Tensor] = []
+    for depth in range(steps):
+        target = None if targets is None else targets[..., depth, :]
+        commit = predictor(z).commit(policy, target)
+        z = commit.future
+        futures.append(commit.future)
+        indices.append(commit.index)
+
+    return Commit(torch.stack(futures, dim=-2), torch.stack(indices, dim=-1))
+
+
 class Policy(Protocol):
     """A rule that scores candidates so the highest score can be committed."""
 

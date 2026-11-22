@@ -116,9 +116,10 @@ class PredictorModel(PreTrainedModel):
     """Predict ``z_{t+k}`` from the single latest latent ``z_t``.
 
     The causal encoder already summarizes the whole prefix in ``z_t``, so the
-    predictor deliberately sees nothing else: ``z_t`` is the state.  Each
-    position is predicted independently, which is what makes
-    ``return_all_timesteps=True`` (training) and ``False`` (inference) agree.
+    predictor deliberately sees nothing else: ``z_t`` is the state.  It is a
+    pure function of a latent: callers pass any leading dimensions (including
+    none) and slice their own inputs, and every latent is predicted
+    independently.
 
     ``z_t`` is expanded into ``prediction_count`` slots, mixed by a small
     non-causal transformer across the slots, and turned into
@@ -135,7 +136,7 @@ class PredictorModel(PreTrainedModel):
     Configured by :class:`jepa.config.PredictorConfig` and usable on its own::
 
         predictor = PredictorModel(PredictorConfig.from_encoder(enc_config))
-        futures = predictor(latents, return_all_timesteps=False)
+        futures = predictor(z_t)          # z_t: (..., D)
         committed = futures.commit(PiArgmax()).future
     """
 
@@ -181,32 +182,28 @@ class PredictorModel(PreTrainedModel):
         nn.init.zeros_(self.mean_head[-1].weight)
         nn.init.zeros_(self.mean_head[-1].bias)
 
-    def forward(self, input, return_all_timesteps: bool = True):
-        """Predict k steps into the future from each latent in ``input``.
+    def forward(self, input: torch.Tensor) -> Futures:
+        """Predict the future latent(s) from one latent per input position.
 
         Args:
-            input: (batch, seq, target_dim) encoder latents.
-            return_all_timesteps: If True, predict from every position
-                                  independently.  If False, predict only from
-                                  the final latent (the others are ignored).
+            input: ``(..., target_dim)`` latents.  Any number of leading
+                dimensions is accepted, including none.
         Returns:
-            :class:`Futures` with ``candidates``, ``pi`` and ``mu`` of shapes
-            (batch, seq, P, D), (batch, seq, P), (batch, seq, D) when
-            ``return_all_timesteps`` is True, or (batch, P, D), (batch, P),
-            (batch, D) otherwise.
+            :class:`Futures` with ``candidates`` ``(..., P, D)``, ``pi``
+            ``(..., P)`` and ``mu`` ``(..., D)``, preserving the input's
+            leading dimensions.
         """
-        assert input.ndim == 3, (
-            f"Expected 3D tensor (batch, seq, target_dim), got shape {input.shape}"
-        )
+        target_dim = input.shape[-1]
+        if target_dim != self.config.target_dim:
+            raise ValueError(
+                f"Expected latents with last dimension {self.config.target_dim}; "
+                f"got shape {tuple(input.shape)}"
+            )
 
-        batch_size, seq_len, target_dim = input.shape
+        leading = input.shape[:-1]
         prediction_count = self.config.prediction_count
 
-        if return_all_timesteps:
-            z_t = input.reshape(batch_size * seq_len, target_dim)
-        else:
-            z_t = input[:, -1, :]
-            seq_len = 1
+        z_t = input.reshape(-1, target_dim)
 
         hidden_states = self.hidden_expansion(z_t)  # (N, prediction_count, hidden_size)
         hidden_states = self.transformer(hidden_states)
@@ -231,11 +228,8 @@ class PredictorModel(PreTrainedModel):
             eps=self.config.rms_norm_eps,
         ).to(candidates.dtype)
 
-        if return_all_timesteps:
-            return Futures(
-                candidates.view(batch_size, seq_len, prediction_count, target_dim),
-                pi.view(batch_size, seq_len, prediction_count),
-                mu.view(batch_size, seq_len, target_dim),
-            )
-
-        return Futures(candidates, pi, mu)
+        return Futures(
+            candidates.view(*leading, prediction_count, target_dim),
+            pi.view(*leading, prediction_count),
+            mu.view(*leading, target_dim),
+        )

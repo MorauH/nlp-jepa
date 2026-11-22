@@ -148,7 +148,7 @@ class JepaModel(PreTrainedModel):
             valid = None
 
         # From each hidden[i, t, :] predict hidden[i, t+k, :]
-        futures = self.predictor(X, return_all_timesteps=True)
+        futures = self.predictor(X)
 
         # VISReg acts on the online encoder latents, not on the predictor
         # output.  Applying it to the committed future would let the predictor
@@ -194,9 +194,7 @@ class JepaModel(PreTrainedModel):
 
         with torch.no_grad():
             latents = self._encode(labels, attention_mask)
-            futures = self.predictor(
-                latents[:, :-k, :], return_all_timesteps=True
-            )
+            futures = self.predictor(latents[:, :-k, :])
             if self.training:
                 committed = futures.commit(
                     policy(self.config.decoder.train_policy),

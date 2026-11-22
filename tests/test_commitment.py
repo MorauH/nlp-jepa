@@ -14,7 +14,10 @@ from jepa.models import (
     PiArgmax,
     PiSample,
     policy,
+    rollout,
 )
+from jepa.models.predictor import PredictorModel
+from jepa import PredictorConfig
 
 
 def pick(candidates, index):
@@ -147,6 +150,87 @@ def test_pi_sample_frequencies_follow_pi():
     torch.testing.assert_close(
         frequencies, torch.softmax(logits, dim=-1), atol=0.03, rtol=0
     )
+
+
+# ---------------------------------------------------------------------------
+# Rollout: chaining commits without re-encoding
+# ---------------------------------------------------------------------------
+
+
+def tiny_predictor(dim=8, count=4):
+    torch.manual_seed(0)
+    return PredictorModel(
+        PredictorConfig(
+            target_dim=dim,
+            hidden_size=dim,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            prediction_count=count,
+        )
+    ).eval()
+
+
+@pytest.mark.parametrize("leading", [(), (3,)])
+@pytest.mark.parametrize("steps", [1, 3])
+def test_rollout_has_one_committed_future_per_depth(leading, steps):
+    predictor = tiny_predictor()
+    z = torch.randn(*leading, 8)
+
+    with torch.no_grad():
+        result = rollout(predictor, z, PiArgmax(), steps)
+
+    assert result.future.shape == (*leading, steps, 8)
+    assert result.index.shape == (*leading, steps)
+
+    # Depth i commits from the previous depth's committed future.
+    previous = z
+    for depth in range(steps):
+        commit = predictor(previous).commit(PiArgmax())
+        assert torch.equal(result.index[..., depth], commit.index)
+        assert torch.equal(result.future[..., depth, :], commit.future)
+        previous = result.future[..., depth, :]
+
+
+def test_rollout_hindsight_matches_committing_by_hand():
+    predictor = tiny_predictor()
+    z = torch.randn(2, 8)
+    targets = torch.randn(2, 3, 8)
+
+    with torch.no_grad():
+        result = rollout(predictor, z, Hindsight(), 3, targets=targets)
+
+        previous = z
+        for depth in range(3):
+            commit = predictor(previous).commit(
+                Hindsight(), targets[..., depth, :]
+            )
+            assert torch.equal(result.index[..., depth], commit.index)
+            assert torch.equal(
+                result.future[..., depth, :], commit.future
+            )
+            previous = result.future[..., depth, :]
+
+
+def test_rollout_rejects_bad_steps_and_missing_hindsight_targets():
+    predictor = tiny_predictor()
+    z = torch.randn(2, 8)
+
+    with pytest.raises(ValueError):
+        rollout(predictor, z, PiArgmax(), 0)
+    with pytest.raises(ValueError):
+        rollout(predictor, z, Hindsight(), 3)
+    with pytest.raises(ValueError):
+        rollout(predictor, z, Hindsight(), 3, targets=torch.randn(2, 2, 8))
+
+
+def test_rollout_leaves_gradients_attached():
+    predictor = tiny_predictor()
+    z = torch.randn(2, 8, requires_grad=True)
+
+    result = rollout(predictor, z, PiArgmax(), 2)
+    result.future.sum().backward()
+
+    assert z.grad is not None
 
 
 # ---------------------------------------------------------------------------

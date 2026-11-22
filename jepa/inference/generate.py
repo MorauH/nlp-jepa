@@ -73,7 +73,7 @@ def generate(
         z_t = latents[:, -1, :]
 
         # The predictor reads only the last latent (z_t).
-        futures = model.predictor(latents, return_all_timesteps=False)
+        futures = model.predictor(z_t)
         committed = futures.commit(
             PiSample(temperature=direction_temperature, top_k=direction_top_k)
         ).future
