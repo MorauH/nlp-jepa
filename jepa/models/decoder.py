@@ -119,6 +119,59 @@ class DecoderModel(PreTrainedModel):
             )
         return self.norm(hidden_states)
 
+    def token_loss(
+        self,
+        z_t,
+        committed,
+        labels,
+        attention_mask=None,
+        chunk_size: int | None = None,
+    ):
+        """Summed next-token cross-entropy and token count for one hint.
+
+        This is the single implementation of the decoder's token-level loss.
+        :meth:`forward` and :meth:`JepaModel.decoder_loss` both go through it,
+        and measurement calls it once per hint condition.
+
+        Args:
+            z_t: (B, S, H) latent at the start of each token's block.
+            committed: (B, S, H) hint at the end of each token's block.
+            labels: (B, S) token ids.
+            attention_mask: optional (B, S) padding mask.
+            chunk_size: optional number of positions per ``lm_head`` chunk, so
+                the full (B, S, vocab) logits tensor is never held.
+
+        Returns:
+            ``(total, count)``: the summed loss over non-pad target tokens and
+            the number of those tokens.  Their ratio is the token-weighted mean
+            loss.
+        """
+        input_ids = labels[:, :-1]
+        targets = labels[:, 1:]
+        steps = input_ids.shape[1]
+
+        hint = self._hint(z_t[:, :steps], committed[:, :steps])
+        mask = attention_mask[:, :-1] if attention_mask is not None else None
+        hidden_states = self._run(input_ids, hint, mask)
+
+        # Cross-entropy is fp32 even under autocast; accumulate there so a
+        # chunked loss has the same precision as the single-pass one.
+        total = torch.zeros((), device=hidden_states.device, dtype=torch.float32)
+        count = torch.zeros((), device=hidden_states.device, dtype=torch.long)
+        chunk = steps if chunk_size is None else max(1, int(chunk_size))
+        for start in range(0, steps, chunk):
+            end = min(start + chunk, steps)
+            logits = self.lm_head(hidden_states[:, start:end, :])
+            chunk_targets = targets[:, start:end]
+            total = total + F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                chunk_targets.reshape(-1),
+                ignore_index=self.pad_token_id,
+                reduction="sum",
+            )
+            count = count + (chunk_targets != self.pad_token_id).sum()
+        return total, count
+
     def forward(
         self,
         z_t,
@@ -142,39 +195,13 @@ class DecoderModel(PreTrainedModel):
         if not training:
             raise ValueError("DecoderModel.forward is training-only; use generate()")
 
-        input_ids = labels[:, :-1]
-        targets = labels[:, 1:]
-        steps = input_ids.shape[1]
-
-        hint = self._hint(z_t[:, :steps], committed[:, :steps])
-        mask = attention_mask[:, :-1] if attention_mask is not None else None
-        hidden_states = self._run(input_ids, hint, mask)
-
-        if loss_chunk_size is None:
-            logits = self.lm_head(hidden_states)
-            total = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                targets.reshape(-1),
-                ignore_index=self.pad_token_id,
-                reduction="sum",
-            )
-            count = (targets != self.pad_token_id).sum()
-            return {"loss": total / count.clamp_min(1)}
-
-        total = hidden_states.new_zeros(())
-        count = torch.zeros((), device=hidden_states.device, dtype=torch.long)
-        chunk = max(1, int(loss_chunk_size))
-        for start in range(0, steps, chunk):
-            end = min(start + chunk, steps)
-            logits = self.lm_head(hidden_states[:, start:end, :])
-            chunk_targets = targets[:, start:end]
-            total = total + F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                chunk_targets.reshape(-1),
-                ignore_index=self.pad_token_id,
-                reduction="sum",
-            )
-            count = count + (chunk_targets != self.pad_token_id).sum()
+        total, count = self.token_loss(
+            z_t,
+            committed,
+            labels,
+            attention_mask=attention_mask,
+            chunk_size=loss_chunk_size,
+        )
         return {"loss": total / count.clamp_min(1)}
 
     @torch.no_grad()

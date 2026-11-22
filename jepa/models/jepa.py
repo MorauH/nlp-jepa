@@ -207,15 +207,14 @@ class JepaModel(PreTrainedModel):
                 latents, k, committed=committed.detach()
             )
 
-        token_out = self.decoder(
-            z_t=z_t.detach(),
-            committed=committed,
-            labels=labels,
-            training=True,
-            loss_chunk_size=self.decoder_loss_chunk_size,
+        token_sum, token_count = self.decoder.token_loss(
+            z_t.detach(),
+            committed.detach(),
+            labels,
             attention_mask=attention_mask,
+            chunk_size=self.decoder_loss_chunk_size,
         )
-        token_loss = token_out["loss"]
+        token_loss = token_sum / token_count.clamp_min(1)
         return LossOutput(
             loss=token_loss,
             terms={"token": token_loss},

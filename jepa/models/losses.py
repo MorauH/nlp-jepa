@@ -226,6 +226,9 @@ class CommitmentLoss(nn.Module):
         valid_f = valid.to(cand.dtype)
         denom = valid_f.sum().clamp_min(1.0)
 
+        def masked_mean(values):
+            return (values * valid_f).sum() / denom
+
         # The one candidate-target distance in the codebase: fp32, normalized,
         # computed from the dot product (no (B, T, P, D) difference).  The
         # clamp hides fp32 rounding when a candidate equals the target.
@@ -243,6 +246,12 @@ class CommitmentLoss(nn.Module):
             r = F.softmax(-d.detach() / temperature, dim=-1)
             r = (1.0 - self.smoothing) * r + self.smoothing / count
             r = r * valid_f.unsqueeze(-1)
+            # H(r): the entropy of the soft assignment.  pi's loss is
+            # ``H(r) + KL(r || pi)``, so only the KL part is learnable and
+            # ``H(r)`` is the floor of the pi term.
+            assignment_entropy = masked_mean(
+                -(r * r.clamp_min(1e-12).log()).sum(-1)
+            )
 
         l_move = (r * d).sum(-1)  # (B, T)
         l_move = (l_move * valid_f).sum() / denom
@@ -252,9 +261,6 @@ class CommitmentLoss(nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
         l_pi = -(r * log_probs).sum(-1)  # (B, T)
         l_pi = (l_pi * valid_f).sum() / denom
-
-        def masked_mean(values):
-            return (values * valid_f).sum() / denom
 
         d_detached = d.detach()
         # Distance of the pi-argmax candidate (greedy generation's choice).
@@ -308,6 +314,7 @@ class CommitmentLoss(nn.Module):
             "mu_norm": mu_norm,
             "mu_dir_d": mu_dir_d,
             "temperature": multiplier.detach(),
+            "assignment_entropy": assignment_entropy,
         }
         return LossOutput(loss=loss, terms=terms, diagnostics=diagnostics)
 

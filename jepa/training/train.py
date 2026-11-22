@@ -52,7 +52,7 @@ STAGE_DEFAULTS = {
 
 # Save a checkpoint (full model + history_<stage>.json, overwriting the output
 # dir) every N optimizer steps, in addition to the end of each epoch.  A crash
-# or SLURM timeout then loses at most N steps, and `verify` can be run on the
+# or SLURM timeout then loses at most N steps, and `measure` can be run on the
 # partially trained model.  None disables mid-epoch saves.
 SAVE_EVERY_STEPS = 2000
 

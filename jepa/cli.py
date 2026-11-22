@@ -8,7 +8,7 @@ from collections.abc import Callable
 
 from .data.prepare import main as prepare_data
 from .data.train_tokenizer import main as train_tokenizer
-from .evaluation.verify import main as verify
+from .evaluation.measure import main as measure
 from .inference.generate import main as generate
 from .training.train import main as train
 
@@ -19,7 +19,7 @@ COMMANDS: dict[str, tuple[Command, str]] = {
     "generate": (generate, "Generate text from a trained checkpoint."),
     "prepare-data": (prepare_data, "Tokenize FineWeb-Edu into training chunks."),
     "train-tokenizer": (train_tokenizer, "Train the 32k byte-level BPE tokenizer."),
-    "verify": (verify, "Run collapse and latent-usage checks."),
+    "measure": (measure, "Measure the paper's numbers for a checkpoint."),
 }
 
 

@@ -40,7 +40,8 @@ jepa/
   inference/
     generate.py               sample text from a checkpoint
   evaluation/
-    verify.py                 collapse / latent-usage checks
+    measure.py                the paper's numbers: representation, commit,
+                              rollout and decoder measurements
 runs/                         checkpoints (ignored)
 scripts/
   slurm_train.sh              SLURM launcher
@@ -126,7 +127,8 @@ python -m jepa generate --prompt "When in Rome, " --steps 3 --temperature 0.8
 ## Evaluation
 
 ```bash
-python -m jepa verify --model runs/jepa
+python -m jepa measure --model runs/jepa
+python -m jepa measure --model runs/jepa --json runs/jepa/metrics.json
 ```
 
 Run `python -m jepa --help` for the command list. Detailed configuration,

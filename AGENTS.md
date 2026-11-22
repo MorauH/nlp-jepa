@@ -7,7 +7,7 @@ JEPA text model (causal encoder → latent predictor → autoregressive decoder)
 - Tests: `uv run python -m pytest -q`. Single test: `uv run python -m pytest -q tests/test_smoke.py::test_full_stack_forward`.
   - Use `python -m pytest`, not bare `pytest`/`uv run pytest`: `[tool.uv] package = false`, so `jepa` is only importable when the CWD is on `sys.path`. Bare pytest fails with `No module named 'jepa'`.
 - No lint, formatter, typecheck, or CI config exists. Don't invent one.
-- CLI entrypoint: `python -m jepa <train|train-decoder|generate|prepare-data|train-tokenizer|verify>` (`jepa/cli.py`). Each subcommand owns its argparse (`python -m jepa train --help`).
+- CLI entrypoint: `python -m jepa <train|generate|prepare-data|train-tokenizer|measure>` (`jepa/cli.py`). Each subcommand owns its argparse (`python -m jepa train --help`).
 - Quick end-to-end training check: `python -m jepa train --subset` (needs the prepared data and tokenizer in `data/`).
 
 ## Layout / boundaries

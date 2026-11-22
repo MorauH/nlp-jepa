@@ -948,7 +948,14 @@ def test_jepa_stage_logs_every_term_and_diagnostic(tmp_path):
 
     history = json.loads((tmp_path / "history_jepa.json").read_text())
     terms = set(model.visreg.weights) | set(model.commitment_loss.weights)
-    diagnostics = {"best_d", "pi_argmax_d", "mu_norm", "mu_dir_d", "temperature"}
+    diagnostics = {
+        "best_d",
+        "pi_argmax_d",
+        "mu_norm",
+        "mu_dir_d",
+        "temperature",
+        "assignment_entropy",
+    }
     assert terms == {"scale", "shape", "center", "move", "pi", "mu", "diversity"}
 
     for prefix in ("train", "val"):

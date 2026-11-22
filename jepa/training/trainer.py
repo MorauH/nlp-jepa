@@ -112,7 +112,7 @@ class JepaTrainer:
             else max(0, int(config.num_workers))
         )
         # Also checkpoint every N optimizer steps (not only at epoch end), so
-        # a crash/timeout loses at most N steps and `verify` can be run on a
+        # a crash/timeout loses at most N steps and `measure` can be run on a
         # partially trained model.  None or 0 disables mid-epoch saves.
         self.save_every_steps = (
             int(save_every_steps) if save_every_steps else None

@@ -1,1 +1,1 @@
-"""Evaluation helpers for the JEPA decoder."""
+"""Measurement: the numbers the paper reports for a trained checkpoint."""
