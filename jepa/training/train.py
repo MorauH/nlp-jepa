@@ -2,8 +2,8 @@
 
 ``--stage jepa`` (the default) trains the encoder and predictor with the JEPA
 objective.  ``--stage decoder`` trains a decoder against a frozen JEPA loaded
-from ``--from``.  The two stages are described in
-``docs/adr/0001-two-stage-training.md``.
+from ``--from``, writing to ``<from>-decoder`` by default.  The two stages are
+described in ``docs/adr/0001-two-stage-training.md``.
 
 Run from the repository root::
 
@@ -50,10 +50,11 @@ STAGE_DEFAULTS = {
     "decoder": {"batch_size": 24, "epochs": 1, "learning_rate": 6e-4},
 }
 
-# Save a checkpoint (full model + history_<stage>.json, overwriting the output
-# dir) every N optimizer steps, in addition to the end of each epoch.  A crash
-# or SLURM timeout then loses at most N steps, and `measure` can be run on the
-# partially trained model.  None disables mid-epoch saves.
+# Save a checkpoint (full model + history_<stage>.json + trainer_state_<stage>.pt,
+# overwriting the output dir) every N optimizer steps, in addition to the end of
+# each epoch.  A crash or SLURM timeout then loses at most N steps, `measure` can
+# be run on the partially trained model, and `--resume` continues from the last
+# save.  None disables mid-epoch saves.
 SAVE_EVERY_STEPS = 2000
 
 # ---------------------------------------------------------------------------
@@ -164,14 +165,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Where to write the checkpoint and history_<stage>.json "
-        "(default: runs/jepa for both stages; decoder defaults to --from).",
+        help="Where to write the checkpoint, history_<stage>.json and "
+        "trainer_state_<stage>.pt (default: runs/jepa for the JEPA stage; "
+        "the decoder stage writes to a sibling of --from, e.g. "
+        "runs/jepa-decoder).",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Continue from the checkpoint in the output dir (JEPA stage) or "
-        "keep the decoder already in --from (decoder stage).",
+        help="Continue from the model, history and trainer state in the output "
+        "dir, resuming the LR schedule and the epoch at the saved step. "
+        "Missing trainer_state_<stage>.pt is an error.",
     )
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", default=None, help="cpu, cuda, cuda:0, ...")
@@ -186,7 +190,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.lr is None:
         args.lr = defaults["learning_rate"]
     if args.output_dir is None:
-        args.output_dir = DEFAULT_RUN_DIR if args.stage == "jepa" else args.from_dir
+        if args.stage == "jepa":
+            args.output_dir = DEFAULT_RUN_DIR
+        else:
+            # A sibling, never the JEPA checkpoint itself: the decoder stage
+            # overwrites its output dir, so the source must stay intact.
+            args.output_dir = args.from_dir.parent / f"{args.from_dir.name}-decoder"
+    if (
+        args.stage == "decoder"
+        and not args.resume
+        and args.output_dir.resolve() == args.from_dir.resolve()
+    ):
+        parser.error(
+            "--output-dir must differ from --from when starting a fresh "
+            "decoder stage: it writes the full model, history and trainer "
+            "state over the JEPA checkpoint. Omit --output-dir to use "
+            f"{args.from_dir.name}-decoder next to --from."
+        )
     return args
 
 
@@ -208,6 +228,12 @@ def main(argv: list[str] | None = None) -> None:
     set_seed(SEED)
     stage = args.stage
     output_dir = args.output_dir
+    if args.resume and not (output_dir / "config.json").exists():
+        raise FileNotFoundError(
+            f"--resume needs a checkpoint in {output_dir}, but it has no "
+            "config.json. Pass the run's --output-dir or start without "
+            "--resume."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = load_training_tokenizer(args.tokenizer)
@@ -228,21 +254,22 @@ def main(argv: list[str] | None = None) -> None:
             model = JepaModel.from_pretrained(str(output_dir))
         else:
             model = build_model(tokenizer)
+    elif args.resume:
+        # The decoder stage resumes the model in its own output dir, which
+        # holds the frozen JEPA plus the partially trained decoder.
+        model = JepaModel.from_pretrained(str(output_dir))
     else:
         base = JepaModel.from_pretrained(str(args.from_dir))
-        if args.resume:
-            model = base
-        else:
-            # Fresh decoder weights, same architecture and frozen JEPA.
-            model = JepaModel(
-                base.config,
-                encoder=base.encoder,
-                predictor=base.predictor,
-            )
+        # Fresh decoder weights, same architecture and frozen JEPA.
+        model = JepaModel(
+            base.config,
+            encoder=base.encoder,
+            predictor=base.predictor,
+        )
 
     expected_vocab = model.config.encoder.vocab_size
     if expected_vocab != len(tokenizer):
-        source = output_dir if stage == "jepa" else args.from_dir
+        source = output_dir if (stage == "jepa" or args.resume) else args.from_dir
         raise ValueError(
             f"{source} was trained with vocab_size={expected_vocab}, but "
             f"{args.tokenizer} has {len(tokenizer)} tokens. Pass the matching "
@@ -251,6 +278,7 @@ def main(argv: list[str] | None = None) -> None:
 
     print("Model loaded")
     print(f"Stage: {stage}")
+    print(f"Output: {output_dir}")
     print("Parameters:", f"{sum(p.numel() for p in model.parameters()):,}")
     print("  encoder:  ", f"{sum(p.numel() for p in model.encoder.parameters()):,}")
     print("  predictor:", f"{sum(p.numel() for p in model.predictor.parameters()):,}")
@@ -273,6 +301,7 @@ def main(argv: list[str] | None = None) -> None:
             weight_decay=WEIGHT_DECAY,
             seed=SEED,
             device=args.device,
+            resume=args.resume,
         ),
         train_dataset=train_dataset,
         eval_dataset=val_dataset,

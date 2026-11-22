@@ -126,6 +126,7 @@ class DecoderModel(PreTrainedModel):
         labels,
         attention_mask=None,
         chunk_size: int | None = None,
+        loss_mask=None,
     ):
         """Summed next-token cross-entropy and token count for one hint.
 
@@ -140,11 +141,15 @@ class DecoderModel(PreTrainedModel):
             attention_mask: optional (B, S) padding mask.
             chunk_size: optional number of positions per ``lm_head`` chunk, so
                 the full (B, S, vocab) logits tensor is never held.
+            loss_mask: optional (B, S - 1) bool aligned with the hint
+                positions.  False positions do not contribute to the loss or
+                the count, which is how a block with no committed future is
+                excluded.
 
         Returns:
-            ``(total, count)``: the summed loss over non-pad target tokens and
-            the number of those tokens.  Their ratio is the token-weighted mean
-            loss.
+            ``(total, count)``: the summed loss over counted target tokens and
+            the number of those tokens.  Their ratio is the token-weighted
+            mean loss.
         """
         input_ids = labels[:, :-1]
         targets = labels[:, 1:]
@@ -163,13 +168,17 @@ class DecoderModel(PreTrainedModel):
             end = min(start + chunk, steps)
             logits = self.lm_head(hidden_states[:, start:end, :])
             chunk_targets = targets[:, start:end]
-            total = total + F.cross_entropy(
+            keep = chunk_targets != self.pad_token_id
+            if loss_mask is not None:
+                keep = keep & loss_mask[:, start:end]
+            values = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]),
                 chunk_targets.reshape(-1),
                 ignore_index=self.pad_token_id,
-                reduction="sum",
-            )
-            count = count + (chunk_targets != self.pad_token_id).sum()
+                reduction="none",
+            ).reshape(chunk_targets.shape)
+            total = total + values.masked_fill(~keep, 0.0).sum()
+            count = count + keep.sum()
         return total, count
 
     def forward(

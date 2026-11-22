@@ -10,6 +10,10 @@ One loop serves both stages (see ``docs/adr/0001-two-stage-training.md``):
 The trainer owns the freezing and the eval/train modes; the model itself has
 no stage flags.  A stage's loss function is compiled as a whole, while
 checkpoints are always written from the uncompiled model.
+
+Every save also writes ``trainer_state_<stage>.pt`` (optimizer, scheduler,
+position, RNG).  ``TrainConfig.resume`` continues from it: the schedule is not
+restarted and the interrupted epoch is replayed only to skip consumed batches.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import set_seed
 
+from ..models.commitment import PiArgmax
 from ..models.jepa import JepaModel
 from ..runtime import select_device
 from .data import LengthBucketBatchSampler, example_lengths, tokenize_batch
@@ -52,6 +57,7 @@ class TrainConfig:
     seed: int = 42
     device: str | None = None
     num_workers: int | None = None
+    resume: bool = False
 
 
 def _cpu_count() -> int:
@@ -143,7 +149,15 @@ class JepaTrainer:
         self._amp_dtype: torch.dtype | None = None
         # Replaced by the compiled stage loss when compilation succeeds.
         self._loss_fn = self._raw_loss
+        # One instance, reused: torch.compile guards on the object, so a fresh
+        # PiArgmax() per epoch would recompile the validation graph.
+        self._eval_policy = PiArgmax()
         self.history = history if history is not None else {}
+        # Set by train(); _save writes them so --resume can continue the run.
+        self._optimizer = None
+        self._scheduler = None
+        self._device: torch.device | None = None
+        self._position: dict = {}
 
     # ------------------------------------------------------------------
     # Stage ownership
@@ -161,10 +175,12 @@ class JepaTrainer:
         )
 
     def _apply_stage(self, training: bool) -> None:
-        """Set requires_grad and train/eval modes owned by the stage."""
-        # The top-level flag matters: decoder_loss reads ``self.training`` to
-        # pick the commit policy.
-        self.model.train(training)
+        """Set requires_grad and train/eval modes owned by the stage.
+
+        There is deliberately no top-level ``model.train(...)``: the commit
+        policy is an argument to :meth:`JepaModel.decoder_loss`, not a function
+        of the model's mode.  Only the stage modules' modes matter.
+        """
         trainable, frozen = self._stage_modules()
         for module in trainable:
             module.requires_grad_(True)
@@ -176,20 +192,24 @@ class JepaTrainer:
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
-    def _raw_loss(self, labels, attention_mask=None, progress=None):
+    def _raw_loss(self, labels, attention_mask=None, progress=None, policy=None):
         if self.config.stage == "jepa":
             return self.model.jepa_loss(
                 labels, attention_mask=attention_mask, progress=progress
             )
-        return self.model.decoder_loss(labels, attention_mask=attention_mask)
+        return self.model.decoder_loss(
+            labels, attention_mask=attention_mask, policy=policy
+        )
 
-    def _losses(self, labels, attention_mask, progress=None) -> dict[str, torch.Tensor]:
+    def _losses(
+        self, labels, attention_mask, progress=None, policy=None
+    ) -> dict[str, torch.Tensor]:
         """Forward one batch; return the total and its components.
 
         The JEPA stage prefixes every term and diagnostic with ``jepa_``.  The
         decoder stage logs only the unweighted token loss.
         """
-        out = self._loss_fn(labels, attention_mask, progress)
+        out = self._loss_fn(labels, attention_mask, progress, policy)
         if self.config.stage == "jepa":
             values = {"jepa_loss": out.loss}
             for name, value in (*out.terms.items(), *out.diagnostics.items()):
@@ -220,6 +240,11 @@ class JepaTrainer:
             persistent_workers=self.num_workers > 0,
             pin_memory=device.type == "cuda",
             collate_fn=collate_fn,
+            # A dedicated generator: creating a loader iterator otherwise draws
+            # a base seed from the global RNG, which would desynchronize a
+            # resumed run from the uninterrupted schedule (the shapes of the
+            # VISReg slices depend on the global stream).
+            generator=torch.Generator().manual_seed(self.config.seed),
         )
         if self.num_workers > 0:
             kwargs["prefetch_factor"] = 4
@@ -266,10 +291,15 @@ class JepaTrainer:
     @torch.no_grad()
     def evaluate(self, val_loader: DataLoader, device: torch.device) -> dict[str, float]:
         """Return the average validation losses."""
-        self.model.eval()
+        self._apply_stage(training=False)
         horizon = self.model.pred_horizon
         totals: dict[str, torch.Tensor] = {}
         n_batches = 0
+        # 0-dim tensor, not None: the same graph inputs as training under
+        # torch.compile.  1.0 means the final commitment temperature.
+        progress = torch.ones((), device=device)
+        # Validation is the inference condition: π-argmax, no real future.
+        policy = self._eval_policy if self.config.stage == "decoder" else None
 
         for labels, attention_mask in val_loader:
             labels = labels.to(device, non_blocking=True)
@@ -277,7 +307,9 @@ class JepaTrainer:
             if labels.shape[1] <= horizon:
                 continue
             with self._autocast(device):
-                self._accumulate(totals, self._losses(labels, attention_mask))
+                self._accumulate(
+                    totals, self._losses(labels, attention_mask, progress, policy)
+                )
             n_batches += 1
 
         self._apply_stage(training=True)
@@ -291,14 +323,61 @@ class JepaTrainer:
             )
         return averages
 
+    def _state_file(self, output_dir: str | Path) -> str:
+        return os.path.join(output_dir, f"trainer_state_{self.config.stage}.pt")
+
+    def _set_position(self, *, epoch, epoch_step, global_step, total_steps, totals):
+        """Record where the next resume should continue from."""
+        self._position = {
+            "epoch": int(epoch),
+            "epoch_step": int(epoch_step),
+            "global_step": int(global_step),
+            "total_steps": int(total_steps),
+            "epoch_totals": {
+                name: value.detach().cpu() for name, value in totals.items()
+            },
+        }
+
+    @staticmethod
+    def _restore_rng(rng: dict, device: torch.device) -> None:
+        """Restore the RNG streams saved next to the last step."""
+        if "cpu" in rng:
+            torch.set_rng_state(rng["cpu"])
+        if device.type == "cuda" and "cuda" in rng:
+            torch.cuda.set_rng_state_all(rng["cuda"])
+
+    def _trainer_state(self) -> dict:
+        """Everything a resumed run needs besides the model weights."""
+        state = {
+            **self._position,
+            "optimizer": self._optimizer.state_dict(),
+            "scheduler": self._scheduler.state_dict(),
+            "rng": {"cpu": torch.get_rng_state()},
+        }
+        if self._device is not None and self._device.type == "cuda":
+            state["rng"]["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _load_trainer_state(self, output_dir: str | Path) -> dict:
+        path = self._state_file(output_dir)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"--resume needs the trainer state at {path}, but it is "
+                "missing. The checkpoint predates trainer-state saving or the "
+                "output dir is wrong; re-run without --resume to start over."
+            )
+        return torch.load(path, map_location="cpu", weights_only=True)
+
     def _save(self, output_dir: str | Path) -> None:
-        """Save the full model checkpoint and this stage's history."""
+        """Save the model, this stage's history and the resume state."""
         os.makedirs(output_dir, exist_ok=True)
         # Save the original module, not a compiled wrapper (whose state dict
         # would be prefixed with ``_orig_mod.``).
         self.model.save_pretrained(output_dir)
         with open(os.path.join(output_dir, self.history_file), "w") as handle:
             json.dump(self.history, handle, indent=4)
+        if self._optimizer is not None:
+            torch.save(self._trainer_state(), self._state_file(output_dir))
 
     def train(self) -> dict:
         """Train the model and return the loss history."""
@@ -395,15 +474,57 @@ class JepaTrainer:
                 "ignore", message="Detected call of `lr_scheduler.step"
             )
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        self._optimizer = optimizer
+        self._scheduler = scheduler
         global_step = 0
+        start_epoch = 0
+        skip_batches = 0
+        resumed_totals: dict[str, torch.Tensor] = {}
+        if config.resume:
+            state = self._load_trainer_state(config.output_dir)
+            if int(state.get("total_steps", total_steps)) != total_steps:
+                warnings.warn(
+                    f"resuming with total_steps={total_steps}, but the run "
+                    f"started with total_steps={state.get('total_steps')}; the "
+                    "LR schedule will not be the one the run started with.",
+                    RuntimeWarning,
+                )
+            # Optimizer before scheduler: its param groups carry the LR the
+            # scheduler last set, and the scheduler restores its position.
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            global_step = int(state["global_step"])
+            start_epoch = int(state["epoch"])
+            skip_batches = int(state["epoch_step"])
+            resumed_totals = {
+                name: value.to(device)
+                for name, value in state.get("epoch_totals", {}).items()
+            }
+            self._restore_rng(state.get("rng", {}), device)
+            print(
+                f"Resuming: epoch {start_epoch + 1}, step "
+                f"{global_step}/{total_steps}, {skip_batches} batches into the "
+                "epoch"
+            )
 
-        for epoch in range(num_epochs):
+        self._device = device
+
+        for epoch in range(start_epoch, num_epochs):
             self._apply_stage(training=True)
             batch_sampler = getattr(train_loader, "batch_sampler", None)
             if isinstance(batch_sampler, LengthBucketBatchSampler):
                 batch_sampler.set_epoch(epoch)
-            totals: dict[str, torch.Tensor] = {}
-            n_batches = 0
+
+            # The sampler is deterministic per epoch, so replaying the epoch
+            # and skipping the already-consumed batches lands exactly after the
+            # step where the interrupted checkpoint was written.
+            resuming_epoch = epoch == start_epoch
+            totals: dict[str, torch.Tensor] = (
+                dict(resumed_totals) if resuming_epoch else {}
+            )
+            n_batches = skip_batches if resuming_epoch else 0
+            to_skip = skip_batches if resuming_epoch else 0
+            skipped = 0
             pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{num_epochs}")
 
             for labels, attention_mask in pbar:
@@ -411,14 +532,15 @@ class JepaTrainer:
                 attention_mask = attention_mask.to(device, non_blocking=True)
                 if labels.shape[1] <= horizon:
                     continue
+                if skipped < to_skip:
+                    skipped += 1
+                    continue
 
                 # 0-dim tensor, so torch.compile treats the annealing progress
                 # as a graph input instead of a Python value to guard on.
-                progress = None
-                if stage == "jepa":
-                    progress = torch.tensor(
-                        global_step / total_steps, device=device
-                    )
+                progress = torch.tensor(
+                    global_step / total_steps, device=device
+                )
 
                 with self._autocast(device):
                     values = self._losses(labels, attention_mask, progress)
@@ -464,6 +586,13 @@ class JepaTrainer:
                             for name, value in self._means(totals, n_batches).items()
                         },
                     }
+                    self._set_position(
+                        epoch=epoch,
+                        epoch_step=n_batches,
+                        global_step=global_step,
+                        total_steps=total_steps,
+                        totals=totals,
+                    )
                     pbar.write(
                         f"step {global_step}/{total_steps}: saving checkpoint "
                         f"to {config.output_dir}"
@@ -519,5 +648,13 @@ class JepaTrainer:
                 "total_steps": total_steps,
                 "end_of_epoch": True,
             }
+            # The next epoch starts at step 0 with fresh running totals.
+            self._set_position(
+                epoch=epoch + 1,
+                epoch_step=0,
+                global_step=global_step,
+                total_steps=total_steps,
+                totals={},
+            )
             self._save(config.output_dir)
         return self.history

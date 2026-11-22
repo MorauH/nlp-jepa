@@ -50,23 +50,28 @@ def expected_decoder_loss(model, labels, attention_mask, policy_name):
 
     k = model.pred_horizon
     with torch.no_grad():
-        latents = model._encode(labels, attention_mask)
+        latents = model.encode(labels, attention_mask)
         futures = model.predictor(latents[:, :-k, :])
         if policy_name == "hindsight":
             committed = futures.commit(Hindsight(), latents[:, k:, :]).future
         else:
             committed = futures.commit(PiArgmax()).future
-        z_t, hint = build_block_hints(
+        z_t, hint, valid = build_block_hints(
             latents, k, committed=committed.detach()
         )
-        out = model.decoder(
-            z_t=z_t.detach(),
-            committed=hint,
-            labels=labels,
-            training=True,
-            attention_mask=attention_mask,
+        loss_mask = (
+            valid.unsqueeze(0)
+            & attention_mask[:, :-1].bool()
+            & attention_mask[:, 1:].bool()
         )
-    return out["loss"], futures
+        total, count = model.decoder.token_loss(
+            z_t.detach(),
+            hint.detach(),
+            labels,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+        )
+    return total / count.clamp_min(1), futures
 
 
 def test_full_stack_forward():
@@ -390,7 +395,7 @@ def test_decoder_loss_does_not_update_encoder_or_predictor():
 
 
 def test_build_block_hints_never_leaks_future():
-    """Both hint parts for decoder position i come from positions <= i."""
+    """Hints come from the target's own block; the tail block is masked out."""
     for seq_len, horizon in ((12, 2), (13, 5), (8, 3)):
         latents = torch.zeros(1, seq_len, 4)
         for j in range(seq_len):
@@ -399,20 +404,57 @@ def test_build_block_hints_never_leaks_future():
         for j in range(seq_len - horizon):
             committed[0, j, 0] = j + 1
 
-        z_t, hint = build_block_hints(latents, horizon, committed=committed)
+        z_t, hint, valid = build_block_hints(latents, horizon, committed=committed)
         assert z_t.shape[1] == seq_len - 1
         assert hint.shape[1] == seq_len - 1
+        assert valid.shape == (seq_len - 1,)
 
-        for i in range(seq_len - 1):
-            z_pos = int(z_t[0, i, 0].item()) - 1
-            committed_pos = int(hint[0, i, 0].item()) - 1
-            assert z_pos <= i
-            assert committed_pos <= i
-
-        # The end clamp seq_len - horizon - 1 is exercised at least once.
         positions = torch.arange(seq_len - 1)
         block_start = (positions // horizon) * horizon
-        assert int(block_start.max()) > seq_len - horizon - 1
+        last_valid = seq_len - horizon - 1
+        # The last partial block has no committed future and is masked out.
+        assert not valid[-1]
+        assert torch.equal(valid, block_start <= last_valid)
+
+        for i in range(seq_len - 1):
+            if not valid[i]:
+                assert int(block_start[i]) > last_valid
+                continue
+            # Both hint parts come from the same block start, never from a
+            # later block, so neither can see target position i + 1.
+            z_pos = int(z_t[0, i, 0].item()) - 1
+            committed_pos = int(hint[0, i, 0].item()) - 1
+            assert z_pos == committed_pos == int(block_start[i]) <= i
+
+
+def test_decoder_loss_masks_the_last_partial_block():
+    """Targets with no committed future do not contribute to the loss."""
+    from jepa.models.commitment import Hindsight, PiArgmax
+
+    torch.manual_seed(0)
+    model = JepaModel(tiny_config())
+    labels = torch.randint(1, 64, (2, 12))
+    mask = torch.ones_like(labels)
+
+    # Positions 0..10 predict tokens 1..11; block_start <= 12 - 2 - 1 = 9, so
+    # 10 of the 11 targets count.
+    with torch.no_grad():
+        for policy in (None, PiArgmax(), Hindsight()):
+            out = model.decoder_loss(labels, attention_mask=mask, policy=policy)
+            assert int(out.diagnostics["tokens"]) == 2 * 10
+
+        # The last token is only predicted by the excluded position and only
+        # feeds latents no hint uses, so changing it leaves the loss untouched.
+        changed = labels.clone()
+        changed[:, -1] = (changed[:, -1] % 63) + 1
+        for policy in (PiArgmax(), Hindsight()):
+            before = model.decoder_loss(
+                labels, attention_mask=mask, policy=policy
+            ).loss
+            after = model.decoder_loss(
+                changed, attention_mask=mask, policy=policy
+            ).loss
+            torch.testing.assert_close(before, after)
 
 
 def test_trainer_saves_mid_epoch_checkpoints(tmp_path):
@@ -463,28 +505,209 @@ def test_trainer_saves_mid_epoch_checkpoints(tmp_path):
     assert history["last_checkpoint"]["global_step"] == 5
     JepaModel.from_pretrained(str(tmp_path))
 
+    # Every save also records the position needed to continue the run.
+    state = torch.load(
+        tmp_path / "trainer_state_jepa.pt", map_location="cpu", weights_only=True
+    )
+    assert state["global_step"] == 5
+    assert state["epoch"] == 1 and state["epoch_step"] == 0
+    assert state["total_steps"] == 5
+    assert state["optimizer"]["state"]
 
-def test_decoder_commits_by_hindsight_in_train_and_pi_argmax_in_eval():
-    """Train mode feeds the hindsight commit; eval the pi-argmax one."""
+
+def test_resume_continues_the_optimizer_schedule_and_epoch(tmp_path):
+    """--resume continues global_step, Adam state, LR and the epoch order."""
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from datasets import Dataset
+
+    from jepa.training.trainer import JepaTrainer, TrainConfig
+
+    torch.manual_seed(0)
+    data = Dataset.from_dict(
+        {"input_ids": [torch.randint(1, 64, (12,)).tolist() for _ in range(10)]}
+    )
+
+    def build(model, output_dir, *, resume=False):
+        history = None
+        if resume:
+            history_path = Path(output_dir) / "history_jepa.json"
+            if history_path.exists():
+                history = json.loads(history_path.read_text())
+        return JepaTrainer(
+            model=model,
+            config=TrainConfig(
+                output_dir=str(output_dir),
+                stage="jepa",
+                learning_rate=1e-3,
+                batch_size=2,
+                epochs=2,
+                device="cpu",
+                num_workers=0,
+                resume=resume,
+            ),
+            train_dataset=data,
+            eval_dataset=data.select(range(4)),
+            tokenizer=SimpleNamespace(pad_token_id=0),
+            history=history,
+            use_amp=False,
+            save_every_steps=2,
+        )
+
+    def run(trainer, *, stop_after_save=None):
+        """Run and record the LR each optimizer step used and the Adam counts."""
+        lrs, adam_steps = [], []
+        original_step = torch.optim.AdamW.step
+
+        def recording_step(self, closure=None):
+            lrs.append(self.param_groups[0]["lr"])
+            out = original_step(self, closure)
+            if self.state:
+                adam_steps.append(
+                    max(int(v["step"]) for v in self.state.values() if "step" in v)
+                )
+            return out
+
+        torch.optim.AdamW.step = recording_step
+        try:
+            if stop_after_save is None:
+                trainer.train()
+            else:
+                calls = {"n": 0}
+                original_save = trainer._save
+
+                class Stop(RuntimeError):
+                    pass
+
+                def save(output_dir):
+                    original_save(output_dir)
+                    calls["n"] += 1
+                    if calls["n"] == stop_after_save:
+                        raise Stop
+
+                trainer._save = save
+                with pytest.raises(Stop):
+                    trainer.train()
+        finally:
+            torch.optim.AdamW.step = original_step
+        return lrs, adam_steps, trainer.history
+
+    # Reference: an uninterrupted 2-epoch run over the same seed and data.
+    torch.manual_seed(2024)
+    reference = JepaModel(tiny_config())
+    ref_lrs, ref_steps, ref_history = run(build(reference, tmp_path / "reference"))
+    assert len(ref_lrs) == 10
+    assert ref_steps == list(range(1, 11))  # Adam's per-parameter step counts
+    assert ref_lrs[-1] < ref_lrs[0]  # cosine decay, not a warmup restart
+
+    # Interrupted on the fourth save: 6 steps in, one batch into epoch 2.
+    torch.manual_seed(2024)
+    interrupted = JepaModel(tiny_config())
+    interrupted_dir = tmp_path / "run"
+    interrupted_lrs, interrupted_steps, interrupted_history = run(
+        build(interrupted, interrupted_dir), stop_after_save=4
+    )
+    assert interrupted_lrs == ref_lrs[:6]
+    assert interrupted_steps[-1] == 6
+    assert len(interrupted_history["train_loss"]) == 1
+    state = torch.load(
+        interrupted_dir / "trainer_state_jepa.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert (state["epoch"], state["epoch_step"], state["global_step"]) == (1, 1, 6)
+
+    resumed = JepaModel.from_pretrained(str(interrupted_dir))
+    resumed_lrs, resumed_steps, history = run(
+        build(resumed, interrupted_dir, resume=True)
+    )
+
+    # global_step continues: the first resumed step is step 6 of the schedule,
+    # so the LR and the scheduled shape are the uninterrupted ones.
+    assert resumed_lrs == ref_lrs[6:]
+    assert resumed_steps == list(range(7, 11))
+
+    # Optimizer state was restored, not rebuilt: the resumed run reaches the
+    # same weights as the uninterrupted run.
+    reference_parameters = dict(reference.named_parameters())
+    for name, parameter in resumed.named_parameters():
+        torch.testing.assert_close(
+            parameter,
+            reference_parameters[name],
+            atol=1e-6,
+            rtol=1e-5,
+        )
+
+    # History continues: once per epoch, including the epoch that was
+    # interrupted and resumed, with the epoch means of the uninterrupted run.
+    assert len(history["train_loss"]) == 2
+    assert len(history["val_loss"]) == 2
+    for index in range(2):
+        assert history["train_loss"][index] == pytest.approx(
+            ref_history["train_loss"][index], rel=1e-5
+        )
+
+
+def test_resume_without_a_trainer_state_fails(tmp_path):
+    """A checkpoint without trainer_state_<stage>.pt cannot be resumed."""
+    from types import SimpleNamespace
+
+    from datasets import Dataset
+
+    from jepa.training.trainer import JepaTrainer, TrainConfig
+
+    data = Dataset.from_dict(
+        {"input_ids": [torch.randint(1, 64, (12,)).tolist() for _ in range(4)]}
+    )
+    trainer = JepaTrainer(
+        model=JepaModel(tiny_config()),
+        config=TrainConfig(
+            output_dir=str(tmp_path),
+            stage="jepa",
+            learning_rate=1e-3,
+            batch_size=2,
+            epochs=1,
+            device="cpu",
+            num_workers=0,
+            resume=True,
+        ),
+        train_dataset=data,
+        eval_dataset=data.select(range(2)),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        use_amp=False,
+    )
+    with pytest.raises(FileNotFoundError, match="trainer_state_jepa.pt"):
+        trainer.train()
+
+
+def test_decoder_loss_policy_is_an_argument_not_the_module_mode():
+    """policy=None uses train_policy; PiArgmax() is the inference condition."""
+    from jepa.models.commitment import PiArgmax
+
     torch.manual_seed(0)
     model = JepaModel(tiny_config())
     labels = torch.randint(1, 64, (2, 12))
     mask = torch.ones_like(labels)
 
     with torch.no_grad():
-        model.train()
-        actual = model.decoder_loss(labels, attention_mask=mask).loss
-        expected, _ = expected_decoder_loss(model, labels, mask, "hindsight")
-        torch.testing.assert_close(actual, expected)
+        # Module mode is irrelevant: the default is the training condition.
+        for mode in (model.train, model.eval):
+            mode()
+            actual = model.decoder_loss(labels, attention_mask=mask).loss
+            expected, _ = expected_decoder_loss(model, labels, mask, "hindsight")
+            torch.testing.assert_close(actual, expected)
 
-        model.eval()
-        actual = model.decoder_loss(labels, attention_mask=mask).loss
-        expected, _ = expected_decoder_loss(model, labels, mask, "pi_argmax")
-        torch.testing.assert_close(actual, expected)
+            # Explicit π-argmax is the inference condition, in either mode.
+            actual = model.decoder_loss(
+                labels, attention_mask=mask, policy=PiArgmax()
+            ).loss
+            expected, _ = expected_decoder_loss(model, labels, mask, "pi_argmax")
+            torch.testing.assert_close(actual, expected)
 
-        # train_policy="pi_argmax" uses the inference choice while training.
+        # train_policy="pi_argmax" changes only the default.
         model.config.decoder.train_policy = "pi_argmax"
-        model.train()
         actual = model.decoder_loss(labels, attention_mask=mask).loss
         expected, _ = expected_decoder_loss(model, labels, mask, "pi_argmax")
         torch.testing.assert_close(actual, expected)
@@ -635,9 +858,9 @@ def test_trainer_anneals_temperature(tmp_path):
     ).train()
 
     # Four training steps get an increasing 0-dim progress tensor; the single
-    # validation batch gets None, i.e. the final temperature.
+    # validation batch gets a 0-dim tensor 1.0, i.e. the final temperature.
     assert seen[:4] == [0.0, 0.25, 0.5, 0.75]
-    assert seen[4:] == [None]
+    assert seen[4:] == [1.0]
     assert history["train_jepa_temperature"][0] == pytest.approx(
         (1.0 + 0.1**0.5 + 0.1 + 0.1) / 4, rel=1e-5
     )
@@ -693,9 +916,9 @@ def test_decoder_stage_trains_only_the_decoder(tmp_path):
         save_every_steps=1,
     ).train()
 
-    # The trainer calls train() on the stage modules; the frozen backbone
-    # stays in eval mode.
-    assert model.training and model.decoder.training
+    # The trainer sets the stage modules' modes; the frozen backbone stays in
+    # eval mode.  There is no top-level model.train()/eval() dance.
+    assert model.decoder.training
     assert not model.encoder.training and not model.predictor.training
     assert training_modes and not any(training_modes)
 
@@ -768,11 +991,10 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
 
     monkeypatch.setattr(JepaTrainer, "_save", recording_save)
 
-    # The JEPA stage's history must survive when the decoder stage writes into
-    # the same directory (the default --from == --output-dir).
+    # The decoder stage writes beside --from, never over the JEPA checkpoint.
     jepa_history = {"train_jepa_loss": [1.0], "last_checkpoint": {"global_step": 7}}
     (base / "history_jepa.json").write_text(json.dumps(jepa_history))
-    out = base
+    out = tmp_path / "base-decoder"
     train.main(
         [
             "--stage", "decoder",
@@ -789,7 +1011,10 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
     assert [s["global_step"] for s in saves] == [1, 2, 2]
     assert not saves[0].get("end_of_epoch") and saves[-1]["end_of_epoch"]
 
-    assert json.loads((out / "history_jepa.json").read_text()) == jepa_history
+    assert out.is_dir()
+    assert json.loads((base / "history_jepa.json").read_text()) == jepa_history
+    assert not (base / "history_decoder.json").exists()
+    assert (out / "trainer_state_decoder.pt").exists()
     history = json.loads((out / "history_decoder.json").read_text())
     train_keys = {
         key.removeprefix("train_") for key in history if key.startswith("train_")
@@ -814,7 +1039,8 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
     )
 
     # --resume keeps training *that* decoder (not a fresh one), stays frozen
-    # elsewhere, and appends to the decoder history.
+    # elsewhere, and appends to the decoder history.  --epochs 2 because the
+    # finished first epoch is not replayed.
     loaded = {}
     original_from_pretrained = JepaModel.from_pretrained.__func__
 
@@ -830,12 +1056,11 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
         [
             "--stage", "decoder",
             "--resume",
-            "--from", str(out),
-            "--output-dir", str(out),
+            "--from", str(base),
             "--fineweb-dir", str(data_dir),
             "--tokenizer", str(tmp_path / "unused-tokenizer"),
             "--batch-size", "2",
-            "--epochs", "1",
+            "--epochs", "2",
             "--device", "cpu",
         ]
     )
@@ -854,7 +1079,34 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
         if key.startswith("train_") and key.endswith("decoder_token")
     )
     assert len(history[token_key]) == 2
-    assert json.loads((out / "history_jepa.json").read_text()) == jepa_history
+    assert json.loads((base / "history_jepa.json").read_text()) == jepa_history
+
+
+def test_decoder_stage_defaults_to_a_sibling_and_refuses_the_source(tmp_path):
+    """--output-dir defaults beside --from; reusing --from for a fresh run fails."""
+    from pathlib import Path
+
+    from jepa.training import train
+
+    args = train.parse_args(["--stage", "decoder", "--from", "runs/jepa"])
+    assert args.output_dir == Path("runs/jepa-decoder")
+
+    # Resuming may point at the source (legacy decoder-in-JEPA-dir runs).
+    args = train.parse_args(
+        [
+            "--stage", "decoder", "--resume",
+            "--from", "runs/jepa", "--output-dir", "runs/jepa",
+        ]
+    )
+    assert args.output_dir == Path("runs/jepa")
+
+    with pytest.raises(SystemExit):
+        train.parse_args(
+            [
+                "--stage", "decoder",
+                "--from", "runs/jepa", "--output-dir", "runs/jepa",
+            ]
+        )
 
 
 def test_jepa_stage_never_runs_the_decoder(tmp_path):

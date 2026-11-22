@@ -116,7 +116,7 @@ def build_bank(
             for i in order[start : start + batch_size]
         ]
         labels, mask = tokenize_batch(examples, tokenizer)
-        latents = model.encoder(labels.to(device), attention_mask=mask.to(device))
+        latents = model.encode(labels.to(device), attention_mask=mask.to(device))
         valid = latents[mask.bool().to(device)]
         chunks.append(valid.float().cpu())
         collected += valid.shape[0]
@@ -372,7 +372,14 @@ def _rollouts_section(
     }
 
 def _decoder_section(model, batches, latents, *, seed, loss_chunk_size) -> dict:
-    """Section 6: token-weighted CE per hint condition."""
+    """Section 6: token-weighted CE per hint condition.
+
+    Every condition uses the same mask: targets whose block runs past the end
+    of the sequence have no committed future and are excluded.  The π-argmax
+    row is the inference hint; the hindsight row is teacher-forced and its hint
+    carries up to log2(P) bits about the target future from the choice among
+    candidates, so it is a lower bound on CE rather than a leak-free condition.
+    """
     horizon = model.pred_horizon
     device = latents[0].device
     sample_generator = _generator(device, seed + 3)
@@ -382,7 +389,7 @@ def _decoder_section(model, batches, latents, *, seed, loss_chunk_size) -> dict:
     for (labels, mask), z in zip(batches, latents):
         futures = model.predictor(z[:, :-horizon])
         real_future = z[:, horizon:]
-        z_hint, _ = build_block_hints(z, horizon)
+        z_hint, _, hint_valid = build_block_hints(z, horizon)
         committed = {
             "pi_argmax": futures.commit(PiArgmax()).future,
             "pi_sample": futures.commit(PiSample(generator=sample_generator)).future,
@@ -399,10 +406,18 @@ def _decoder_section(model, batches, latents, *, seed, loss_chunk_size) -> dict:
             z, horizon, committed=committed["pi_argmax"][order]
         )[1]
         hints["null"] = torch.zeros_like(z_hint)
+        # Same exclusion as decoder_loss: no committed future for the tail
+        # block, so those targets are not counted.
+        loss_mask = (
+            hint_valid.unsqueeze(0)
+            & mask[:, :-1].bool()
+            & mask[:, 1:].bool()
+        )
         for name in DECODER_CONDITIONS:
             total, count = model.decoder.token_loss(
                 z_hint.detach(), hints[name].detach(), labels,
                 attention_mask=mask, chunk_size=loss_chunk_size,
+                loss_mask=loss_mask,
             )
             totals[name] += _value(total)
         token_count += int(count)
@@ -494,7 +509,7 @@ def collect_metrics(
     batches = [(labels.to(device), mask.to(device)) for labels, mask in batches]
     bank = F.normalize(bank.float().to(device), dim=-1)
     loss_chunk_size = loss_chunk_size or model.config.decoder.loss_chunk_size
-    latents = [model.encoder(labels, attention_mask=mask) for labels, mask in batches]
+    latents = [model.encode(labels, attention_mask=mask) for labels, mask in batches]
     sections = {
         "representation": _representation_section(model, batches, latents),
         "loss": _loss_section(model, batches),

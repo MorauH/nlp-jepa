@@ -36,9 +36,11 @@ latent, a clear single future instead of μ's average of all of them.
   π's cross-entropy, μ's regression, and a near-duplicate diversity penalty.
   Both return a `LossOutput`, so the total is the weighted sum of the terms.
 - **Stack** (`jepa/models/jepa.py`, `JepaConfig`): `JepaModel` owns encoder,
-  predictor, decoder and both losses. `jepa_loss` runs the encoder/predictor
-  objective; `decoder_loss` runs the decoder against a frozen JEPA;
-  `build_block_hints` aligns latents with decoder positions.
+  predictor, decoder and both losses. `encode` is the single encoder entry
+  point (right-padded batches let the causal encoder drop the padding mask);
+  `jepa_loss` runs the encoder/predictor objective; `decoder_loss` runs the
+  decoder against a frozen JEPA; `build_block_hints` aligns latents with
+  decoder positions and returns a validity mask for the tail block.
 
 ## Two stages
 
@@ -46,18 +48,56 @@ The JEPA is trained first, then a decoder is trained against the frozen JEPA.
 The reasons are in [ADR 0001](adr/0001-two-stage-training.md).
 
 ```bash
-python -m jepa train                          # stage jepa
+python -m jepa train                          # stage jepa -> runs/jepa
 python -m jepa train --resume                 # continue it
-python -m jepa train --stage decoder --from runs/jepa
+python -m jepa train --stage decoder --from runs/jepa   # -> runs/jepa-decoder
 python -m jepa train --stage decoder --resume --epochs 2
 ```
 
 `--stage jepa` optimizes the encoder and predictor; the decoder is never run.
 `--stage decoder` loads a checkpoint from `--from`, freezes its encoder and
 predictor (they run under `torch.no_grad()`), attaches a fresh decoder, and
-trains only the decoder on committed futures. By default both stages read and
-write `runs/jepa`; each stage writes `history_<stage>.json`. A checkpoint
-saved from either stage reloads as the full stack.
+trains only the decoder on committed futures. The decoder stage writes to
+`<from>-decoder` (a sibling, `runs/jepa-decoder` by default), never over the
+JEPA checkpoint: it rewrites its output dir with the full model, its history and
+its trainer state. Pointing `--output-dir` at `--from` without `--resume` is
+rejected. Each stage writes `history_<stage>.json` and
+`trainer_state_<stage>.pt`. A checkpoint saved from either stage reloads as the
+full stack.
+
+### Resuming
+
+Every save (mid-epoch and epoch end) also writes `trainer_state_<stage>.pt`:
+optimizer state, LR-scheduler state, `global_step`, the epoch and the number of
+batches consumed in it, the epoch's running loss totals, and the RNG states.
+`--resume` loads it, continues `global_step` (so warmup/cosine progress and the
+commitment temperature continue instead of restarting), restores the optimizer
+and scheduler, recreates the interrupted epoch's deterministic bucket order and
+skips the already-consumed batches, and appends to the existing history. A
+missing trainer state on `--resume` is an error: there is no silent restart.
+The schedule's `total_steps` is `len(loader) * --epochs` in both cases, so
+resuming with a different `--epochs` re-plans the remaining schedule (the
+trainer warns).
+
+### Decoder hints
+
+`decoder_loss` takes an explicit commit `policy`: `None` uses
+`DecoderConfig.train_policy` (the training condition); validation passes
+`PiArgmax()` (the inference condition). The model's `train`/`eval` flag is not
+involved.
+
+The last block of a sequence has no real latent `horizon` tokens ahead, so it
+has no committed future; `build_block_hints` marks it invalid and both the
+decoder loss and measurement mask those target positions out. No position is
+paired with an earlier block's hint.
+
+A raw block-end latent would leak the block's last token, which is a decoder
+target. A hindsight commit is still a predictor output, but its choice among
+`P` candidates was made with the real future, so it carries up to `log2(P)`
+bits about that future (intended teacher forcing). A π-argmax hint carries
+none. Validation and measurement report both, so the hindsight row is a
+teacher-forced lower bound on the decoder cross-entropy, not the inference
+number.
 
 ## Configuration
 
@@ -144,7 +184,11 @@ latents. The JSON has one dict per section:
   claim is the depth ≥ 2 manifold row: committed rollouts stay closer to real
   latents than μ.
 - `decoder`: token-weighted cross-entropy per hint condition (committed
-  futures, real latent, shuffled, null), hint use and specificity.
+  futures, real latent, shuffled, null), hint use and specificity. All rows use
+  the same mask (the tail block with no committed future is excluded). The
+  π-argmax row is the inference hint; the hindsight row is teacher-forced and
+  its hint carries up to `log2(P)` bits about the target future, so read it as
+  a lower bound rather than a leak-free condition.
 - `verdicts`: PASS/FAIL checks, each naming its metric and threshold.
 
 ## Generation

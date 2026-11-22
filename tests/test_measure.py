@@ -207,6 +207,11 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
         "shuffled",
         "null",
     }
+    # Every hint condition counts the same targets: 12-token rows with k=2 have
+    # 11 candidate positions, of which the last partial block (no committed
+    # future) is excluded, so 10 per row over 4 examples.
+    assert decoder["tokens"] == 40
+    assert metrics["context"]["tokens"] == 48
     assert "hint_use" in decoder and "selection_headroom" in decoder
     assert set(decoder["specificity"]) == {
         "shuffled_minus_hindsight",

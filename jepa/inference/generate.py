@@ -69,7 +69,7 @@ def generate(
 
         # Re-encode the current context so the committed future is grounded in
         # the tokens that have actually been generated.
-        latents = model.encoder(enc_ids)
+        latents = model.encode(enc_ids)
         z_t = latents[:, -1, :]
 
         # The predictor reads only the last latent (z_t).
