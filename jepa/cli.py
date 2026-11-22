@@ -11,16 +11,11 @@ from .data.train_tokenizer import main as train_tokenizer
 from .evaluation.verify import main as verify
 from .inference.generate import main as generate
 from .training.train import main as train
-from .training.train_decoder import main as train_decoder
 
 Command = Callable[[list[str] | None], None]
 
 COMMANDS: dict[str, tuple[Command, str]] = {
-    "train": (train, "Train the full JEPA encoder + predictor + decoder."),
-    "train-decoder": (
-        train_decoder,
-        "Fine-tune the decoder against a frozen JEPA stack.",
-    ),
+    "train": (train, "Train the JEPA stage or the decoder stage."),
     "generate": (generate, "Generate text from a trained checkpoint."),
     "prepare-data": (prepare_data, "Tokenize FineWeb-Edu into training chunks."),
     "train-tokenizer": (train_tokenizer, "Train the 32k byte-level BPE tokenizer."),

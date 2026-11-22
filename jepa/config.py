@@ -383,9 +383,8 @@ class CommitmentLossConfig(PretrainedConfig):
 class JepaConfig(PretrainedConfig):
     """Full configuration for the JEPA stack.
 
-    ``decoder`` is optional: omit it (or pass ``with_decoder=False`` to
-    :meth:`from_encoder`) when training the self-supervised JEPA objective on
-    its own.
+    The stack always has a decoder.  A missing one is built from the encoder,
+    so every checkpoint can be generated from and trained in either stage.
     """
 
     model_type = "jepa"
@@ -419,9 +418,11 @@ class JepaConfig(PretrainedConfig):
             self.commitment = CommitmentLossConfig()
         self.pred_horizon = pred_horizon
 
-        # Fill in derived predictor values before validating it.
+        # Fill in derived component configs before validating them.
         if self.predictor is None:
             self.predictor = PredictorConfig.from_encoder(self.encoder)
+        if self.decoder is None:
+            self.decoder = DecoderConfig.from_encoder(self.encoder)
         self.link()
 
     # ------------------------------------------------------------------
@@ -462,7 +463,6 @@ class JepaConfig(PretrainedConfig):
         *,
         predictor: PredictorConfig | None = None,
         decoder: DecoderConfig | None = None,
-        with_decoder: bool = True,
         pred_horizon: int = 20,
         visreg: VISRegConfig | None = None,
         commitment: CommitmentLossConfig | None = None,
@@ -470,13 +470,12 @@ class JepaConfig(PretrainedConfig):
     ) -> "JepaConfig":
         """Derive a full JEPA config from an encoder config.
 
-        Missing predictor/decoder configs are built from the encoder.  Set
-        ``with_decoder=False`` to train the JEPA objective without a decoder.
+        Missing predictor/decoder configs are built from the encoder.
         """
         encoder = cls._coerce(EncoderConfig, encoder, required=True)
         if predictor is None:
             predictor = PredictorConfig.from_encoder(encoder)
-        if decoder is None and with_decoder:
+        if decoder is None:
             decoder = DecoderConfig.from_encoder(encoder)
         return cls(
             encoder=encoder,
@@ -503,26 +502,25 @@ class JepaConfig(PretrainedConfig):
         )
         self.predictor.validate()
 
-        if self.decoder is not None:
-            self._set_or_check(
-                self.decoder,
-                "hidden_size",
-                self.encoder.hidden_size,
-                "decoder.hidden_size",
-            )
-            self._set_or_check(
-                self.decoder,
-                "vocab_size",
-                self.encoder.vocab_size,
-                "decoder.vocab_size",
-            )
-            self._set_or_check(
-                self.decoder,
-                "pad_token_id",
-                self.encoder.pad_token_id,
-                "decoder.pad_token_id",
-            )
-            self.decoder.validate()
+        self._set_or_check(
+            self.decoder,
+            "hidden_size",
+            self.encoder.hidden_size,
+            "decoder.hidden_size",
+        )
+        self._set_or_check(
+            self.decoder,
+            "vocab_size",
+            self.encoder.vocab_size,
+            "decoder.vocab_size",
+        )
+        self._set_or_check(
+            self.decoder,
+            "pad_token_id",
+            self.encoder.pad_token_id,
+            "decoder.pad_token_id",
+        )
+        self.decoder.validate()
 
         if not isinstance(self.pred_horizon, int) or self.pred_horizon < 1:
             raise ValueError(

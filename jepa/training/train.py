@@ -1,17 +1,16 @@
-"""Train the full JEPA encoder + predictor + decoder stack.
+"""Train one stage of the JEPA stack.
 
-Builds a :class:`jepa.JepaDecodeModel` from component configs and hands it to
-:class:`jepa.JepaTrainer`, which optimizes the VISReg (JEPA) loss and the
-decoder token loss together.
-
-This module owns the shared training constants and CLI helpers; the decoder-only
-entry point (`jepa/training/train_decoder.py`) imports them and runs the same
-trainer against a frozen stack.
+``--stage jepa`` (the default) trains the encoder and predictor with the JEPA
+objective.  ``--stage decoder`` trains a decoder against a frozen JEPA loaded
+from ``--from``.  The two stages are described in
+``docs/adr/0001-two-stage-training.md``.
 
 Run from the repository root::
 
-    python -m jepa train
-    python -m jepa train --resume
+    python -m jepa train                         # JEPA stage
+    python -m jepa train --resume                # continue it
+    python -m jepa train --stage decoder         # decoder stage on runs/jepa
+    python -m jepa train --stage decoder --resume --epochs 2
 """
 
 from __future__ import annotations
@@ -25,46 +24,36 @@ from transformers import set_seed
 
 from ..config import EncoderConfig, JepaConfig
 from ..data.tokenizer import load_tokenizer
-from ..models.stack import JepaDecodeModel
+from ..models.jepa import JepaModel
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
 from .trainer import JepaTrainer, TrainConfig
-
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-OUTPUT_DIR = DEFAULT_RUN_DIR
 
 # --subset trains on this many examples (smoke test).
 SUBSET_TRAIN = 4
 SUBSET_VAL = 2
-
-# Relative weights of the two objectives in the backward pass.
-JEPA_LOSS_WEIGHT = 2.0
-DECODER_LOSS_WEIGHT = 1.0
 
 SEED = 42
 WEIGHT_DECAY = 0.01
 MAX_GRAD_NORM = 1.0
 
 # ---------------------------------------------------------------------------
-# Optimization
+# Per-stage defaults
 # ---------------------------------------------------------------------------
-# Defaults for `--batch-size` / `--epochs`.  24 x <=1024 tokens is ~24k tokens
-# per step; 3 epochs over the ~500M-token set is ~90k steps.
-BATCH_SIZE = 24
-EPOCHS = 3
-# Peak AdamW LR (1% linear warmup, cosine decay to 10%).  Earlier runs found
-# 3e-4 stable at batch 3-6; square-root scaling to batch 24 gives 6e-4.  We
-# stay at the conservative end (not 8e-4+).  Rescale (~sqrt) if you change
-# BATCH_SIZE.
-# 10 batch => 4e-4
-# 24 batch => 6e-4
-LEARNING_RATE = 4e-4
+# JEPA: 24 x <=1024 tokens is ~24k tokens per step; 3 epochs over the ~500M
+# token set is ~90k steps.  Peak AdamW LR (1% linear warmup, cosine decay to
+# 10%).  Earlier runs found 3e-4 stable at batch 3-6; square-root scaling to
+# batch 24 gives 6e-4; we stay at the conservative 4e-4.
+STAGE_DEFAULTS = {
+    "jepa": {"batch_size": 24, "epochs": 3, "learning_rate": 4e-4},
+    # The frozen backbone removes most of the memory cost, so the same batch
+    # size is safe; one epoch is usually enough to adapt a fresh decoder.
+    "decoder": {"batch_size": 24, "epochs": 1, "learning_rate": 6e-4},
+}
 
-# Save a checkpoint (full stack + components + history.json, overwriting
-# OUTPUT_DIR) every N optimizer steps, in addition to the end of each epoch.
-# A crash or SLURM timeout then loses at most N steps, and `verify` can be run
-# on the partially trained model.  None disables mid-epoch saves.
+# Save a checkpoint (full model + history_<stage>.json, overwriting the output
+# dir) every N optimizer steps, in addition to the end of each epoch.  A crash
+# or SLURM timeout then loses at most N steps, and `verify` can be run on the
+# partially trained model.  None disables mid-epoch saves.
 SAVE_EVERY_STEPS = 2000
 
 # ---------------------------------------------------------------------------
@@ -77,7 +66,7 @@ AMP_DTYPE = "auto"
 
 # torch.compile with dynamic shapes. Compilation adds startup time but is
 # amortized quickly on a full run; it is caught and disabled if the backend
-# cannot compile the model.
+# cannot compile the loss.
 COMPILE_MODEL = True
 COMPILE_MODE = "default"
 
@@ -94,18 +83,14 @@ PAD_TO_MULTIPLE_OF = 64
 # them avoids a per-step stall.
 LOG_EVERY = 10
 
-# Both tokenizers pad on the right. This lets causal attention skip the padding
-# mask (Flash Attention); set False if you replace the tokenizer.
-RIGHT_PADDED = True
-
 
 def add_dataset_args(
     parser: argparse.ArgumentParser,
     *,
-    batch_size: int = BATCH_SIZE,
-    epochs: int = EPOCHS,
+    batch_size: int | None,
+    epochs: int | None,
 ) -> None:
-    """Add the data/batch/epoch flags shared with `train-decoder`."""
+    """Add the data/batch/epoch flags shared by both stages."""
     parser.add_argument(
         "--fineweb-dir",
         type=Path,
@@ -129,7 +114,8 @@ def add_dataset_args(
         "--batch-size",
         type=int,
         default=batch_size,
-        help="LEARNING_RATE is tuned for the default; rescale it if you change this.",
+        help="The stage's default learning rate is tuned for its default; "
+        "rescale it if you change this.",
     )
     parser.add_argument("--epochs", type=int, default=epochs)
 
@@ -168,22 +154,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="python -m jepa train", description=__doc__
     )
     parser.add_argument(
-        "--resume",
-        action="store_true",
-        help=f"Continue from the checkpoint in {OUTPUT_DIR}.",
+        "--stage",
+        choices=tuple(STAGE_DEFAULTS),
+        default="jepa",
+        help="Which stage to train (default: jepa).",
     )
     parser.add_argument(
-        "--jepa-only",
-        action="store_true",
-        help="Train only the encoder + predictor (JEPA loss); the decoder is "
-        "never run and is saved unchanged. Train it afterwards with "
-        "`python -m jepa train-decoder`.",
+        "--from",
+        dest="from_dir",
+        type=Path,
+        default=DEFAULT_RUN_DIR,
+        help="Decoder stage: JEPA checkpoint to load. A fresh decoder is "
+        "attached unless --resume (default: runs/jepa).",
     )
-    add_dataset_args(parser)
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Where to write the checkpoint and history_<stage>.json "
+        "(default: runs/jepa for both stages; decoder defaults to --from).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from the checkpoint in the output dir (JEPA stage) or "
+        "keep the decoder already in --from (decoder stage).",
+    )
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--device", default=None, help="cpu, cuda, cuda:0, ...")
+    add_dataset_args(parser, batch_size=None, epochs=None)
+    args = parser.parse_args(argv)
+
+    defaults = STAGE_DEFAULTS[args.stage]
+    if args.batch_size is None:
+        args.batch_size = defaults["batch_size"]
+    if args.epochs is None:
+        args.epochs = defaults["epochs"]
+    if args.lr is None:
+        args.lr = defaults["learning_rate"]
+    if args.output_dir is None:
+        args.output_dir = DEFAULT_RUN_DIR if args.stage == "jepa" else args.from_dir
+    return args
 
 
-def build_model(tokenizer) -> JepaDecodeModel:
+def build_model(tokenizer) -> JepaModel:
     """Build a fresh JEPA + decoder model from the config defaults."""
     encoder_config = EncoderConfig(
         vocab_size=len(tokenizer),
@@ -193,13 +207,15 @@ def build_model(tokenizer) -> JepaDecodeModel:
         tokenizer.model_max_length or encoder_config.max_position_embeddings,
         encoder_config.max_position_embeddings,
     )
-    return JepaDecodeModel(JepaConfig.from_encoder(encoder_config))
+    return JepaModel(JepaConfig.from_encoder(encoder_config))
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     set_seed(SEED)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stage = args.stage
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = load_training_tokenizer(args.tokenizer)
     train_dataset, val_dataset = load_datasets(args.fineweb_dir, args.subset)
@@ -208,67 +224,75 @@ def main(argv: list[str] | None = None) -> None:
         f"val examples: {len(val_dataset):,}"
     )
 
-    if args.resume:
-        model = JepaDecodeModel.from_pretrained(str(OUTPUT_DIR))
-        if model.config.encoder.vocab_size != len(tokenizer):
-            raise ValueError(
-                f"{OUTPUT_DIR} was trained with vocab_size="
-                f"{model.config.encoder.vocab_size}, but {args.tokenizer} has "
-                f"{len(tokenizer)} tokens. Pass the matching --tokenizer, or "
-                "train from scratch without --resume."
-            )
-        history_path = OUTPUT_DIR / "history.json"
-        history = None
-        if history_path.exists():
-            with open(history_path) as handle:
-                history = json.load(handle)
-    else:
-        model = build_model(tokenizer)
-        history = None
+    history = None
+    history_path = output_dir / f"history_{stage}.json"
+    if args.resume and history_path.exists():
+        with open(history_path) as handle:
+            history = json.load(handle)
 
-    if args.jepa_only:
-        model.skip_decoder()
+    if stage == "jepa":
+        if args.resume:
+            model = JepaModel.from_pretrained(str(output_dir))
+        else:
+            model = build_model(tokenizer)
+    else:
+        base = JepaModel.from_pretrained(str(args.from_dir))
+        if args.resume:
+            model = base
+        else:
+            # Fresh decoder weights, same architecture and frozen JEPA.
+            model = JepaModel(
+                base.config,
+                encoder=base.encoder,
+                predictor=base.predictor,
+            )
+        model.decoder_loss_chunk_size = DECODER_LOSS_CHUNK_SIZE
+
+    expected_vocab = model.config.encoder.vocab_size
+    if expected_vocab != len(tokenizer):
+        source = output_dir if stage == "jepa" else args.from_dir
+        raise ValueError(
+            f"{source} was trained with vocab_size={expected_vocab}, but "
+            f"{args.tokenizer} has {len(tokenizer)} tokens. Pass the matching "
+            "--tokenizer, or train from scratch without --resume."
+        )
 
     print("Model loaded")
-    if args.jepa_only:
-        print("Mode: JEPA only (encoder + predictor); the decoder is not run")
-    else:
-        print(
-            f"Decoder window: {model.decoder.sliding_window} | "
-            f"train policy: {model.config.decoder.train_policy}"
-        )
+    print(f"Stage: {stage}")
     print("Parameters:", f"{sum(p.numel() for p in model.parameters()):,}")
     print("  encoder:  ", f"{sum(p.numel() for p in model.encoder.parameters()):,}")
     print("  predictor:", f"{sum(p.numel() for p in model.predictor.parameters()):,}")
     print("  decoder:  ", f"{sum(p.numel() for p in model.decoder.parameters()):,}")
+    if stage == "decoder":
+        print(
+            f"Decoder window: {model.decoder.sliding_window} | "
+            f"train policy: {model.config.decoder.train_policy} | "
+            + ("resumed from checkpoint" if args.resume else "fresh decoder")
+        )
 
-    # FineWeb chunks are long, so keep an eye on memory. For batch 20, raise
-    # the LR to 6e-4-8e-4.
     trainer = JepaTrainer(
         model=model,
         config=TrainConfig(
-            output_dir=str(OUTPUT_DIR),
-            learning_rate=LEARNING_RATE,
+            output_dir=str(output_dir),
+            stage=stage,
+            learning_rate=args.lr,
             batch_size=args.batch_size,
             epochs=args.epochs,
             weight_decay=WEIGHT_DECAY,
             seed=SEED,
+            device=args.device,
         ),
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         tokenizer=tokenizer,
-        jepa_loss_weight=JEPA_LOSS_WEIGHT,
-        decoder_loss_weight=DECODER_LOSS_WEIGHT,
         max_grad_norm=MAX_GRAD_NORM,
         history=history,
         use_amp=USE_AMP,
         amp_dtype=AMP_DTYPE,
         compile_model=COMPILE_MODEL,
         compile_mode=COMPILE_MODE,
-        decoder_loss_chunk_size=DECODER_LOSS_CHUNK_SIZE,
         pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
         log_every=LOG_EVERY,
-        right_padded=RIGHT_PADDED,
         save_every_steps=SAVE_EVERY_STEPS,
     )
 

@@ -1,13 +1,15 @@
-"""Training loop for :class:`jepa.models.stack.JepaDecodeModel`.
+"""Training loop for :class:`jepa.models.jepa.JepaModel`.
 
-One loop serves both entry points: joint training (encoder + predictor +
-decoder, ``python -m jepa train``) and decoder-only training against a frozen
-stack (``python -m jepa train-decoder``).  A frozen model returns no JEPA loss,
-so the loop then optimizes the decoder loss alone -- same AMP, compile,
-schedule, logging and checkpointing either way.
+One loop serves both stages (see ``docs/adr/0001-two-stage-training.md``):
 
-The decoder consumes detached hints, so its loss only trains the decoder, while
-the JEPA loss trains the encoder and predictor.
+* ``stage="jepa"`` optimizes the encoder and predictor with
+  :meth:`JepaModel.jepa_loss`; the decoder is frozen and never run.
+* ``stage="decoder"`` optimizes the decoder with
+  :meth:`JepaModel.decoder_loss`; the encoder and predictor are frozen.
+
+The trainer owns the freezing and the eval/train modes; the model itself has
+no stage flags.  A stage's loss function is compiled as a whole, while
+checkpoints are always written from the uncompiled model.
 """
 
 from __future__ import annotations
@@ -26,10 +28,12 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import set_seed
 
-from ..models.stack import JepaDecodeModel
+from ..models.jepa import JepaModel
 from ..runtime import available_cpu_count, resolve_amp_dtype, select_device
 from .data import LengthBucketBatchSampler, example_lengths, tokenize_batch
 from .optim import parameter_groups
+
+STAGES = ("jepa", "decoder")
 
 
 @dataclass
@@ -44,17 +48,17 @@ class TrainConfig:
     learning_rate: float
     batch_size: int
     epochs: int = 1
+    stage: str = "jepa"
     weight_decay: float = 0.01
     seed: int = 42
     device: str | None = None
-    # Loss history written next to the checkpoint.  Both entry points save
-    # into runs/jepa, so each uses its own file: decoder-only training must
-    # not overwrite the joint run's history (which `train --resume` reads).
-    history_file: str = "history.json"
+    # DataLoader workers.  Tests use 0; the default mirrors the historical
+    # hard-coded value.
+    num_workers: int | None = None
 
 
 class JepaTrainer:
-    """Training loop for :class:`JepaDecodeModel`.
+    """Training loop for one stage of :class:`JepaModel`.
 
     Usage::
 
@@ -64,29 +68,29 @@ class JepaTrainer:
 
     def __init__(
         self,
-        model: JepaDecodeModel,
+        model: JepaModel,
         config: TrainConfig,
         train_dataset,
         eval_dataset,
         tokenizer,
         *,
-        jepa_loss_weight: float = 1.0,
-        decoder_loss_weight: float = 1.0,
         max_grad_norm: float | None = 1.0,
         history: dict | None = None,
         use_amp: bool = True,
         amp_dtype: str = "auto",
         compile_model: bool = False,
         compile_mode: str = "default",
-        decoder_loss_chunk_size: int | None = None,
         pad_to_multiple_of: int = 64,
         log_every: int = 10,
-        right_padded: bool = False,
         save_every_steps: int | None = None,
     ):
-        # Keep an uncompiled reference: ``torch.compile`` wraps the module and
-        # prefixes state-dict keys with ``_orig_mod.``, so checkpoints must be
-        # written from the original model.
+        if config.stage not in STAGES:
+            raise ValueError(
+                f"stage must be one of {STAGES}; got {config.stage!r}"
+            )
+
+        # Keep an uncompiled reference: checkpoints are always written from the
+        # original model.
         self.model = model
         self._raw_model = model
         self.config = config
@@ -94,17 +98,19 @@ class JepaTrainer:
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
 
-        self.jepa_loss_weight = jepa_loss_weight
-        self.decoder_loss_weight = decoder_loss_weight
         self.max_grad_norm = max_grad_norm
 
         self.use_amp = use_amp
         self.amp_dtype = amp_dtype
         self.compile_model = compile_model
         self.compile_mode = compile_mode
-        self.decoder_loss_chunk_size = decoder_loss_chunk_size
         self.pad_to_multiple_of = pad_to_multiple_of
         self.log_every = max(1, int(log_every))
+        self.num_workers = (
+            min(8, available_cpu_count())
+            if config.num_workers is None
+            else max(0, int(config.num_workers))
+        )
         # Also checkpoint every N optimizer steps (not only at epoch end), so
         # a crash/timeout loses at most N steps and `verify` can be run on a
         # partially trained model.  None or 0 disables mid-epoch saves.
@@ -112,18 +118,76 @@ class JepaTrainer:
             int(save_every_steps) if save_every_steps else None
         )
 
-        # Set True when the tokenizer pads on the right (jepa/training/train.py
-        # does).  A causal encoder then never lets a real token attend to a pad,
-        # so the padding mask can be dropped and SDPA uses its fused causal
-        # kernel.  Keep False for a left-padding tokenizer.
-        self.right_padded = right_padded
+        self.history_file = f"history_{config.stage}.json"
 
         self._amp_dtype: torch.dtype | None = None
         self._scaler: torch.amp.GradScaler | None = None
+        # Replaced by the compiled stage loss when compilation succeeds.
+        self._loss_fn = self._raw_loss
 
         # Fresh training starts empty; every key is created on first use, so a
-        # frozen run has no fake JEPA entries.
+        # stage never gets the other stage's fake entries.
         self.history = history if history is not None else {}
+
+    # ------------------------------------------------------------------
+    # Stage ownership
+    # ------------------------------------------------------------------
+    def _stage_modules(self):
+        """Return ``(trainable, frozen)`` module lists for this stage."""
+        if self.config.stage == "jepa":
+            return (
+                [self._raw_model.encoder, self._raw_model.predictor],
+                [self._raw_model.decoder],
+            )
+        return (
+            [self._raw_model.decoder],
+            [self._raw_model.encoder, self._raw_model.predictor],
+        )
+
+    def _apply_stage(self, training: bool) -> None:
+        """Set requires_grad and train/eval modes owned by the stage."""
+        # Set the top-level flag too: JepaModel.decoder_loss reads
+        # ``self.training`` to pick the commit policy.
+        self._raw_model.train(training)
+        trainable, frozen = self._stage_modules()
+        for module in trainable:
+            module.requires_grad_(True)
+            module.train(training)
+        for module in frozen:
+            module.requires_grad_(False)
+            module.eval()
+
+    # ------------------------------------------------------------------
+    # Loss
+    # ------------------------------------------------------------------
+    def _raw_loss(self, labels, attention_mask=None, progress=None):
+        if self.config.stage == "jepa":
+            return self._raw_model.jepa_loss(
+                labels, attention_mask=attention_mask, progress=progress
+            )
+        return self._raw_model.decoder_loss(
+            labels, attention_mask=attention_mask
+        )
+
+    def _losses(
+        self, labels, attention_mask, progress=None
+    ) -> dict[str, torch.Tensor]:
+        """Forward one batch; return the total and its components.
+
+        The JEPA stage prefixes every term and diagnostic with ``jepa_``.  The
+        decoder stage logs the unweighted token loss and nothing JEPA-related.
+        """
+        out = self._loss_fn(labels, attention_mask, progress)
+        if self.config.stage == "jepa":
+            values = {"jepa_loss": out.loss}
+            for name, value in out.terms.items():
+                values[f"jepa_{name}"] = value
+            for name, value in out.diagnostics.items():
+                values[f"jepa_{name}"] = value
+        else:
+            values = {"decoder_token": out.terms["token"]}
+        values["loss"] = out.loss
+        return values
 
     def _resolve_amp_dtype(self, device: torch.device) -> torch.dtype | None:
         """Pick the autocast dtype, or None when AMP is off."""
@@ -150,7 +214,7 @@ class JepaTrainer:
     def _make_loader(
         self, dataset, shuffle: bool, device, collate_fn
     ) -> DataLoader:
-        num_workers = min(8, available_cpu_count())
+        num_workers = self.num_workers
         kwargs = dict(
             num_workers=num_workers,
             persistent_workers=num_workers > 0,
@@ -179,42 +243,6 @@ class JepaTrainer:
             **kwargs,
         )
 
-    def _losses(
-        self, labels, attention_mask, progress=None
-    ) -> dict[str, torch.Tensor]:
-        """Forward one batch; return the weighted total and its components.
-
-        A frozen JEPA part reports ``loss=None`` and a skipped decoder returns
-        ``decoder_out=None``: the missing term is left out of the total, and
-        its key never reaches the history.
-
-        Every JEPA loss term and diagnostic is returned as
-        ``jepa_<name>``, so the history records the full breakdown next to the
-        totals.
-        """
-        jepa_out, decoder_out = self.model(
-            labels=labels,
-            attention_mask=attention_mask,
-            training=True,
-            right_padded=self.right_padded,
-            loss_chunk_size=self.decoder_loss_chunk_size,
-            progress=progress,
-        )
-        values = {}
-        terms = []
-        if jepa_out["loss"] is not None:
-            values["jepa_loss"] = jepa_out["loss"]
-            terms.append(self.jepa_loss_weight * jepa_out["loss"])
-            for name, value in jepa_out["terms"].items():
-                values[f"jepa_{name}"] = value
-            for name, value in jepa_out["diagnostics"].items():
-                values[f"jepa_{name}"] = value
-        if decoder_out is not None:
-            values["decoder_loss"] = decoder_out["loss"]
-            terms.append(self.decoder_loss_weight * decoder_out["loss"])
-        values["loss"] = sum(terms[1:], terms[0])
-        return values
-
     @staticmethod
     def _means(totals: dict[str, torch.Tensor], n: int) -> dict[str, float]:
         """Average the per-key totals with a single device synchronization."""
@@ -241,7 +269,7 @@ class JepaTrainer:
     def evaluate(self, val_loader: DataLoader, device: torch.device) -> dict[str, float]:
         """Return the average validation losses."""
         self.model.eval()
-        horizon = getattr(self.model, "pred_horizon", 1)
+        horizon = self.model.pred_horizon
         totals: dict[str, torch.Tensor] = {}
         n_batches = 0
 
@@ -249,7 +277,7 @@ class JepaTrainer:
             labels = labels.to(device, non_blocking=True)
             attention_mask = attention_mask.to(device, non_blocking=True)
 
-            # The trajectory decoder needs at least k + 1 tokens.
+            # Both stages need at least k + 1 tokens.
             if labels.shape[1] <= horizon:
                 continue
 
@@ -259,25 +287,31 @@ class JepaTrainer:
                 )
             n_batches += 1
 
-        self.model.train()
+        self._apply_stage(training=True)
 
         if n_batches == 0:
             return {"loss": float("nan")}
 
         averages = self._means(totals, n_batches)
-        if "decoder_loss" in averages:  # absent in JEPA-only training
-            averages["perplexity"] = math.exp(min(averages["decoder_loss"], 20.0))
+        if self.config.stage == "decoder":
+            averages["perplexity"] = math.exp(
+                min(averages["decoder_token"], 20.0)
+            )
         return averages
 
     def train(self) -> dict:
         """Train the model and return the loss history."""
         config = self.config
+        stage = config.stage
         device = select_device(config.device)
-        print(f"Device: {device} | dataloader workers: {min(8, available_cpu_count())}")
+        print(f"Device: {device} | dataloader workers: {self.num_workers}")
 
         set_seed(config.seed)
         self._configure_backends(device)
         self.model.to(device)
+        # Freeze the other stage before building the optimizer so its
+        # parameters never enter a group.
+        self._apply_stage(training=True)
 
         self._amp_dtype = self._resolve_amp_dtype(device)
         self._scaler = torch.amp.GradScaler(
@@ -286,9 +320,8 @@ class JepaTrainer:
         )
         amp_label = str(self._amp_dtype).replace("torch.", "") if self._amp_dtype else "off"
         print(
-            f"AMP: {amp_label} | compile: {self.compile_model} "
+            f"stage: {stage} | AMP: {amp_label} | compile: {self.compile_model} "
             f"(mode={self.compile_mode}) | "
-            f"decoder loss chunk: {self.decoder_loss_chunk_size} | "
             f"pad multiple: {self.pad_to_multiple_of}"
         )
 
@@ -305,25 +338,27 @@ class JepaTrainer:
             torch._dynamo.config.cache_size_limit = 64
             torch._dynamo.config.suppress_errors = True
             try:
-                self.model = torch.compile(
-                    self.model,
+                # Compile only the stage's loss: the other stage's modules are
+                # frozen and must stay out of the graph.
+                self._loss_fn = torch.compile(
+                    self._raw_loss,
                     mode=self.compile_mode,
                     dynamic=True,
                 )
-                print("torch.compile: enabled")
+                print(f"torch.compile: enabled for {stage} loss")
             except Exception as exc:  # pragma: no cover - depends on the backend
                 warnings.warn(
                     f"torch.compile failed ({exc!r}); continuing eagerly.",
                     RuntimeWarning,
                 )
-                self.model = self._raw_model
+                self._loss_fn = self._raw_loss
 
         optimizer_kwargs = {}
         if device.type == "cuda":
             # Fused AdamW keeps the whole update in one CUDA kernel.
             optimizer_kwargs["fused"] = True
-        # ``parameter_groups`` skips frozen parameters, so a frozen run only
-        # optimizes the decoder.
+        # ``parameter_groups`` skips frozen parameters, so only the stage's
+        # modules are optimized.
         param_groups = parameter_groups(self._raw_model, config.weight_decay)
         try:
             optimizer = torch.optim.AdamW(
@@ -353,7 +388,7 @@ class JepaTrainer:
             self.eval_dataset, shuffle=False, device=device, collate_fn=collate
         )
 
-        horizon = getattr(self.model, "pred_horizon", 1)
+        horizon = self.model.pred_horizon
         num_epochs = max(1, int(config.epochs))
 
         # Linear warmup for the first 1% of steps, then cosine decay to 10%.
@@ -378,10 +413,10 @@ class JepaTrainer:
                 "ignore", message="Detected call of `lr_scheduler.step"
             )
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        self.model.train()
         global_step = 0
 
         for epoch in range(num_epochs):
+            self._apply_stage(training=True)
             batch_sampler = getattr(train_loader, "batch_sampler", None)
             if isinstance(batch_sampler, LengthBucketBatchSampler):
                 batch_sampler.set_epoch(epoch)
@@ -401,10 +436,12 @@ class JepaTrainer:
 
                 # Annealed winner-takes-all temperature.  A 0-dim tensor, so
                 # torch.compile treats it as a graph input instead of a Python
-                # value to guard on.
-                progress = torch.tensor(
-                    global_step / total_steps, device=device
-                )
+                # value to guard on.  Only the JEPA stage reads it.
+                progress = None
+                if stage == "jepa":
+                    progress = torch.tensor(
+                        global_step / total_steps, device=device
+                    )
 
                 with self._autocast(device):
                     values = self._losses(labels, attention_mask, progress)
@@ -416,7 +453,7 @@ class JepaTrainer:
                 if self.max_grad_norm is not None:
                     self._scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.max_grad_norm
+                        self._raw_model.parameters(), self.max_grad_norm
                     )
 
                 self._scaler.step(optimizer)
@@ -432,8 +469,8 @@ class JepaTrainer:
                     postfix = {"loss": f"{means['loss']:.4f}"}
                     if "jepa_loss" in means:
                         postfix["jepa"] = f"{means['jepa_loss']:.4f}"
-                    if "decoder_loss" in means:
-                        postfix["dec"] = f"{means['decoder_loss']:.4f}"
+                    if "decoder_token" in means:
+                        postfix["dec"] = f"{means['decoder_token']:.4f}"
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
                     pbar.set_postfix(postfix)
 
@@ -465,14 +502,13 @@ class JepaTrainer:
             for name, value in train_means.items():
                 self.history.setdefault(f"train_{name}", []).append(value)
             for name, value in val_means.items():
-                if name != "perplexity":
-                    self.history.setdefault(f"val_{name}", []).append(value)
+                self.history.setdefault(f"val_{name}", []).append(value)
 
             def describe(means: dict[str, float]) -> str:
                 parts = ", ".join(
                     f"{name.replace('_loss', '')} {value:.4f}"
                     for name, value in means.items()
-                    if name in ("jepa_loss", "decoder_loss")
+                    if name in ("jepa_loss", "decoder_token")
                 )
                 return f"{means['loss']:.4f} ({parts})"
 
@@ -484,7 +520,7 @@ class JepaTrainer:
                 )
 
             summary = (
-                f"epoch {epoch + 1}: train {describe(train_means)} | "
+                f"epoch {epoch + 1} [{stage}]: train {describe(train_means)} | "
                 f"val {describe(val_means)}"
             )
             if "perplexity" in val_means:
@@ -516,16 +552,12 @@ class JepaTrainer:
         return self.history
 
     def _save(self, output_dir: str | Path) -> None:
-        """Save the full stack and each component separately."""
+        """Save the full model checkpoint and this stage's history."""
         os.makedirs(output_dir, exist_ok=True)
 
-        # Save the original module, not the OptimizedModule wrapper (whose
-        # state dict would be prefixed with ``_orig_mod.``).
+        # Save the original module, not a compiled wrapper (whose state dict
+        # would be prefixed with ``_orig_mod.``).
         self._raw_model.save_pretrained(output_dir)
-        for name in ("encoder", "predictor", "decoder"):
-            getattr(self._raw_model, name).save_pretrained(
-                os.path.join(output_dir, name)
-            )
 
-        with open(os.path.join(output_dir, self.config.history_file), "w") as handle:
+        with open(os.path.join(output_dir, self.history_file), "w") as handle:
             json.dump(self.history, handle, indent=4)

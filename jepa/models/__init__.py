@@ -11,17 +11,16 @@ from .commitment import (
 )
 from .decoder import DecoderModel
 from .encoder import EncodeTransformer
-from .jepa import JepaModel
+from .jepa import JepaModel, build_block_hints
 from .losses import CommitmentLoss, LossOutput, VISReg
 from .predictor import PredictorModel
-from .stack import JepaDecodeModel
 
 __all__ = [
     "EncodeTransformer",
     "PredictorModel",
     "DecoderModel",
     "JepaModel",
-    "JepaDecodeModel",
+    "build_block_hints",
     "VISReg",
     "CommitmentLoss",
     "LossOutput",

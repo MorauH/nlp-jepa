@@ -1,4 +1,4 @@
-"""JEPA language model: encoder + predictor + optional decoder.
+"""JEPA language model: encoder + predictor + decoder.
 
 Component models can be used on their own::
 
@@ -13,9 +13,9 @@ Component models can be used on their own::
 
 The full stack takes a single composed config::
 
-    from jepa import JepaConfig, JepaDecodeModel
+    from jepa import JepaConfig, JepaModel
     config = JepaConfig.from_encoder(encoder.config)
-    model = JepaDecodeModel(config)
+    model = JepaModel(config)
 """
 
 from .config import (
@@ -29,10 +29,9 @@ from .config import (
 )
 from .models.decoder import DecoderModel
 from .models.encoder import EncodeTransformer
-from .models.jepa import JepaModel
+from .models.jepa import JepaModel, build_block_hints
 from .models.losses import CommitmentLoss, LossOutput, VISReg
 from .models.predictor import PredictorModel
-from .models.stack import JepaDecodeModel
 
 __all__ = [
     # Configs
@@ -48,7 +47,7 @@ __all__ = [
     "PredictorModel",
     "DecoderModel",
     "JepaModel",
-    "JepaDecodeModel",
+    "build_block_hints",
     # Loss
     "VISReg",
     "CommitmentLoss",

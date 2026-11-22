@@ -51,6 +51,11 @@ class EncodeTransformer(PreTrainedModel):
     def forward(self, labels, attention_mask=None):
         """The forward pass of the Transformer encoder.
 
+        Batches are right-padded and the attention is causal, so no real query
+        can attend a pad key.  Callers may therefore drop ``attention_mask``
+        (``JepaModel`` does) and let SDPA use its fused causal kernel; the mask
+        is still needed for loss validity.
+
         Args:
             labels: The input tensor (2D), a batch of integer-encoded texts.
             attention_mask: Optional (2D) mask, 1 = real token, 0 = padding.

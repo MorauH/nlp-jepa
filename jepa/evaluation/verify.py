@@ -29,7 +29,7 @@ from datasets import load_from_disk
 
 from ..data.tokenizer import load_tokenizer
 from ..models.commitment import Hindsight, MuSafe, PiArgmax
-from ..models.stack import JepaDecodeModel, build_block_hints
+from ..models.jepa import JepaModel, build_block_hints
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
 
 DEFAULT_MODEL = DEFAULT_RUN_DIR
@@ -182,7 +182,8 @@ def main(argv: list[str] | None = None) -> None:
     tokenizer.model_max_length = min(
         tokenizer.model_max_length or args.max_length, args.max_length
     )
-    model = JepaDecodeModel.from_pretrained(str(args.model)).to(device).eval()
+    model = JepaModel.from_pretrained(str(args.model)).to(device).eval()
+    model.decoder_loss_chunk_size = args.loss_chunk_size
     if len(tokenizer) != model.config.encoder.vocab_size:
         raise ValueError(
             f"{args.model} was trained with vocab_size="
@@ -208,11 +209,9 @@ def main(argv: list[str] | None = None) -> None:
 
     with torch.no_grad():
         latents = model.encoder(labels, attention_mask=attention_mask)
-        jepa_out, decoder_out = model(
-            labels=labels,
-            attention_mask=attention_mask,
-            training=True,
-            loss_chunk_size=args.loss_chunk_size,
+        jepa_loss = model.jepa_loss(labels=labels, attention_mask=attention_mask)
+        decoder_loss = model.decoder_loss(
+            labels=labels, attention_mask=attention_mask
         )
 
         # ---------------------------------------------------------------
@@ -527,8 +526,8 @@ def main(argv: list[str] | None = None) -> None:
             )
 
         print("\n--- loss context ---")
-        print(f"JEPA loss:    {fmt(jepa_out['loss'])}")
-        print(f"decoder loss: {fmt(decoder_out['loss'])}")
+        print(f"JEPA loss:    {fmt(jepa_loss.loss)}")
+        print(f"decoder loss: {fmt(decoder_loss.loss)}")
         print(
             "The absolute decoder loss is not comparable to leaky checkpoints; "
             "judge it with the ablation above."

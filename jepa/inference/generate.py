@@ -19,7 +19,7 @@ import torch
 
 from ..data.tokenizer import eos_token_id, load_tokenizer
 from ..models.commitment import PiSample
-from ..models.stack import JepaDecodeModel
+from ..models.jepa import JepaModel
 from ..paths import DEFAULT_RUN_DIR, TOKENIZER_DIR
 from ..runtime import select_device
 
@@ -30,7 +30,7 @@ DEFAULT_STEPS = 1
 
 @torch.no_grad()
 def generate(
-    model: JepaDecodeModel,
+    model: JepaModel,
     tokenizer,
     prompt: str,
     steps: int,
@@ -152,7 +152,7 @@ def main(argv: list[str] | None = None) -> None:
     device = select_device(args.device)
 
     tokenizer = load_tokenizer(args.tokenizer)
-    model = JepaDecodeModel.from_pretrained(args.model).to(device).eval()
+    model = JepaModel.from_pretrained(args.model).to(device).eval()
 
     vocab_size = model.config.encoder.vocab_size
     if len(tokenizer) != vocab_size:

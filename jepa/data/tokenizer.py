@@ -80,7 +80,11 @@ def load_tokenizer(path: str | Path = TOKENIZER_DIR) -> HFTokenizer:
             f"{path} not found. Run `python -m jepa train-tokenizer` to create "
             f"{TOKENIZER_DIR}."
         )
-    return HFTokenizer(AutoTokenizer.from_pretrained(path))
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    # The causal encoder relies on right-padded batches: no real query may
+    # attend a pad, which lets attention drop the mask and use fused SDPA.
+    tokenizer.padding_side = "right"
+    return HFTokenizer(tokenizer)
 
 
 def eos_token_id(tokenizer) -> int | None:
