@@ -58,12 +58,15 @@ a point between the plausible outcomes that need not correspond to any of them.
 In a joint-embedding predictive architecture (JEPA) this blur lives in latent
 space, and it compounds when predictions are chained: a multi-step rollout that
 feeds a blurred latent back into the predictor drifts away from the latents
-real text produces. We study a simple alternative. The predictor proposes
-\(P\) candidate future latents together with a distribution \(\pi\) over which
-candidate will be closest to the real future, and every prediction step
-<em>commits</em> to exactly one candidate instead of averaging. Training uses a
-relaxed winner-takes-all objective, and a separate head estimates the mean
-future \(\mu\), which serves as an in-model single-prediction baseline.
+real text produces. Recent JEPA world models for control and driving replace
+the single predicted successor with a finite set of candidate futures. We bring
+this idea to language and study what it does to multi-step rollouts. The
+predictor proposes \(P\) candidate future latents together with a distribution
+\(\pi\) over which candidate will be closest to the real future, and every
+prediction step <em>commits</em> to exactly one candidate instead of
+averaging. Training uses a relaxed winner-takes-all objective, and a separate
+detached head estimates the mean future \(\mu\), which serves as an in-model
+single-prediction baseline.
 We train the model on FineWeb-Edu with a horizon of \(k = 20\) tokens and
 compare committed rollouts with the \(\mu\) path and with an otherwise
 identical single-candidate model (\(P = 1\)), at depths of up to four steps
@@ -98,7 +101,15 @@ from a point that is off the distribution of real latents.
 </p>
 
 <p>
-We test whether <strong>committing</strong> avoids this. The predictor proposes
+Representing the future as a finite set of hypotheses is an established
+remedy [Guzman-Rivera et al. 2012; Rupprecht et al. 2017]. It has recently
+been brought into JEPA world models for maze navigation and driving [Song et
+al. 2026; Huang 2026]. Those works evaluate whether the candidate set contains
+the real successors and supports planning. We study a different question in a
+different domain: in a JEPA over <em>text</em>, does
+<strong>committing</strong> to one candidate at every step keep a
+<em>multi-step</em> latent rollout close to the latents real text produces,
+where averaging drifts away? The predictor proposes
 \(P\) candidates for the latent \(k\) tokens ahead, and a learned distribution
 \(\pi\) says how likely each candidate is to be the closest to the real future.
 A <em>commit</em> chooses exactly one candidate according to a <em>policy</em>
@@ -109,12 +120,16 @@ them, we expect it to stay close to the latents real text produces, even after
 several steps.
 </p>
 
-<p>Contributions:</p>
+<p>
+The prediction mechanism is not new (Section&nbsp;2). Our contributions are
+its application to language, the rollout analysis, and the evaluation:
+</p>
 <ol>
-  <li>A multi-hypothesis JEPA for text with an explicit commitment step, a
-      win-probability head \(\pi\), and a detached mean-future head \(\mu\) that
-      provides an in-model single-prediction baseline and a per-context
-      uncertainty estimate (\(\lvert\mu\rvert\)).</li>
+  <li>A finite-hypothesis JEPA for text over token-level latents with a
+      \(k\)-token horizon. It has an explicit commitment step, a win-probability
+      head \(\pi\), and a detached mean-future head \(\mu\) that provides an
+      in-model single-prediction baseline and a per-context uncertainty
+      estimate (\(\lvert\mu\rvert\)) at no cost to the rest of the model.</li>
   <li>An evaluation protocol for multi-step latent rollouts: rollout error,
       manifold distance calibrated against real latents, and best-of-\(K\)
       rollout error. We argue that error against the single realized future is
@@ -129,46 +144,84 @@ several steps.
 <!-- ===================================================================== -->
 <h2>2&nbsp; Related work</h2>
 
-<p class="note">Draft. Verify every citation (authors, year, venue) before release,
-and add the source of the VISReg regularizer.</p>
+<p class="note">Draft. The 2026 entries were checked against their arXiv
+abstracts only. Read the full papers and verify every citation before
+release.</p>
 
 <p>
-<strong>Multiple-hypothesis prediction.</strong>
+<strong>Finite-hypothesis prediction in JEPA world models (closest work).</strong>
+Branch-JEPA [Song et al. 2026] (an earlier version is titled MoP-JEPA) replaces
+the point-valued JEPA transition with a context-weighted finite set of latent
+successors: \(K\) predictor heads and a router that sees only the context. It
+argues, as we do, that squared or cosine regression returns a conditional
+mean that may match no valid successor. Its evaluation is on maze navigation
+(OGBench), where it checks whether the predicted transitions form real routes,
+and on driving trajectories (Argoverse&nbsp;2). MDN-VJEPA [Huang 2026] makes the
+JEPA predictor a mixture density network, keeps the full mixture instead of
+its mean, and studies temporally coherent multimodal trajectories and their
+consistency across horizons. Our candidates and \(\pi\) play the same roles
+as their branches and router weights or mixture components. The differences
+are the domain (text, with a token decoder conditioned on the latents), the
+explicit commitment step inside multi-step rollouts, the detached \(\mu\) head
+as an in-model averaging baseline, and an evaluation centred on whether
+chained committed latents stay close to real text latents.
+<span class="todo">TODO: after reading both papers in full, state the overlap and differences precisely; decide whether to add an MDN predictor as a baseline</span>
+</p>
+
+<p>
+<strong>Multiple-hypothesis learning.</strong>
 Producing several outputs and training only the best one is the idea behind
 multiple choice learning [Guzman-Rivera et al. 2012] and its stochastic
 variant for deep ensembles [Lee et al. 2016]. Rupprecht et al. [2017] show
-that a relaxed winner-takes-all loss, which gives a small weight to the
-non-winning hypotheses, avoids dead hypotheses, and characterize what the
-hypotheses converge to. Our move loss is such a relaxation, with an annealed,
-distance-relative temperature and uniform smoothing. Mixture density networks
-[Bishop 1994] model multimodality with an explicit mixture likelihood instead.
-Trajectory forecasting routinely evaluates multimodal predictors with
-best-of-\(K\) errors [e.g. Gupta et al. 2018]; we adopt this for rollouts.
+that a relaxed winner-takes-all loss, which also gives the non-winning
+hypotheses a small weight, avoids dead hypotheses. Our move loss is such a
+relaxation, with an annealed, distance-relative temperature and uniform
+smoothing. Mixture density networks [Bishop 1994] model multimodality with an
+explicit mixture likelihood instead. Multimodal trajectory forecasting
+routinely evaluates with best-of-\(K\) errors [e.g. Gupta et al. 2018], which
+we adopt for rollouts.
 </p>
 
 <p>
-<strong>JEPA and non-contrastive regularization.</strong>
+<strong>JEPA and collapse prevention.</strong>
 JEPAs predict a target representation from a context representation [LeCun
 2022], with instances for images [Assran et al. 2023] and video [Bardes et
-al. 2024]. Training against a target produced by the same encoder needs a
-mechanism against collapse; variance-invariance-covariance regularization
-[Bardes et al. 2022] is a common choice. We regularize the encoder latents
-toward a centered, unit-scale, Gaussian-shaped distribution, with the shape
-matched by sliced projections.
-<span class="todo">TODO: cite the source of this "VISReg" regularizer (scale/shape/center with sliced Gaussian matching)</span>
+al. 2024], and recently for language models [Huang et al. 2026]. Training
+against a target produced by the same encoder needs a mechanism against
+collapse. VICReg [Bardes et al. 2022] regularizes variance and covariance.
+LeJEPA's SIGReg [Balestriero and LeCun 2025] matches embeddings to an
+isotropic Gaussian along random projections. We use VISReg [VISReg 2026], which keeps
+VICReg's scale term, replaces covariance with a sliced-Wasserstein shape term
+toward a standard normal, and adds a centering term. We apply it to the
+online encoder latents.
 </p>
 
 <p>
-<strong>Latent world models and latent language modeling.</strong>
-World models learn latent dynamics and plan or imagine in latent space [Ha and
+<strong>Latent prediction and planning for language.</strong>
+Large Concept Models [LCM team et al. 2024] predict the next sentence embedding
+and report that mean-squared-error regression averages plausible
+continuations. They address it with diffusion in embedding space, or with
+residual quantization into discrete codes, which is also a form of
+commitment. JEPA-Reasoner [JEPA-Reasoner 2025] separates a latent JEPA reasoner from a token
+"talker" and deliberately keeps several hypotheses as <em>mixed</em> latent
+vectors, the opposite of our design choice. Next-Latent Prediction [NextLat 2025] and Hierarchical Latent Prediction [HiLP 2026] train language models with
+latent dynamics objectives, and identify compounding error in multi-step
+latent rollouts as the obstacle. Plan-then-generate models condition a token
+generator on a latent plan obtained from a VAE, diffusion or clustering
+(e.g. PLANNER, DGLM, Cornille et al.); PLaT [PLaT 2026] rolls out latent planning
+states and reads them out with a separate decoder. Our decoder is a small
+instance of this pattern; the plan is a sequence of committed candidates.
+<span class="todo">TODO: replace the bracketed short keys with author names for VISReg, NextLat, JEPA-Reasoner, HiLP and PLaT; add the plan-then-generate primary references (or cite the survey of alternatives to next-token prediction)</span>
+</p>
+
+<p>
+<strong>Latent world models and stochastic prediction.</strong>
+World models learn latent dynamics and imagine in latent space [Ha and
 Schmidhuber 2018; Hafner et al. 2020]. Stochastic latent variables are the
 usual answer to multimodal futures there, and in stochastic video prediction
-[Babaeizadeh et al. 2018]. For language, Large Concept Models predict the next
-sentence embedding [LCM team, Barrault et al. 2024] and discuss the limitation
-of mean-squared-error prediction in embedding space. Our setting is a small
-JEPA over token-level latents, with a horizon of \(k\) tokens and a token
-decoder conditioned on latent hints.
-<span class="todo">TODO: position more precisely against latent-planning language models</span>
+[Babaeizadeh et al. 2018]. Blurry predictions from mean-squared error in video
+[Mathieu et al. 2016] are the pixel-space version of the problem we study in
+latent space.
 </p>
 
 <!-- ===================================================================== -->
@@ -253,7 +306,7 @@ candidate receiving some gradient. The commitment loss is
 with margin \(m = 0.5\), so only near-duplicate candidates are pushed apart.
 The \(\pi\) term is a cross-entropy against \(r\). It is bounded below by
 \(H(r)\), so we report \(\mathrm{KL}(r \,\Vert\, \pi)\) separately. The
-encoder is regularized by VISReg, applied to all valid encoder latents: a
+encoder is regularized by VISReg [VISReg 2026], applied to all valid encoder latents: a
 centering term (squared mean), a scale term (\((1 - \mathrm{std})^2\) per
 dimension), and a shape term (squared distance between sorted projections on
 256 random directions and standard-normal quantiles). The JEPA loss is the
@@ -341,6 +394,7 @@ validation chunk continues a training document.
     <tr><td>No annealing</td><td>\(s\) fixed at 0.1</td><td>Does annealing prevent dead candidates?</td></tr>
     <tr><td>No diversity</td><td>diversity weight 0</td><td>Is the diversity term needed?</td></tr>
     <tr><td>Decoder: \(\pi\)-argmax hints</td><td>decoder trained on \(\pi\)-argmax hints</td><td>Cost and benefit of hindsight teacher forcing</td></tr>
+    <tr><td>MDN predictor <span class="muted">(optional)</span></td><td>mixture density predictor, as in MDN-VJEPA</td><td>Finite candidates vs a mixture likelihood <span class="todo">TODO: decide; needs code</span></td></tr>
   </tbody>
   <caption>Table 2. Runs. Each runs with <span class="todo">TODO: n</span> seeds.
   Running variants requires ticket 002.</caption>
@@ -554,6 +608,7 @@ python -m jepa measure --model runs/jepa-decoder --json runs/jepa-decoder/metric
 <ol class="refs">
   <li>Assran, M., et al. (2023). Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture. <em>CVPR</em>.</li>
   <li>Babaeizadeh, M., et al. (2018). Stochastic Variational Video Prediction. <em>ICLR</em>.</li>
+  <li>Balestriero, R., LeCun, Y. (2025). LeJEPA: Provable and Scalable Self-Supervised Learning Without the Heuristics. <em>arXiv</em>.</li>
   <li>Bardes, A., Ponce, J., LeCun, Y. (2022). VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning. <em>ICLR</em>.</li>
   <li>Bardes, A., et al. (2024). Revisiting Feature Prediction for Learning Visual Representations from Video (V-JEPA). <em>arXiv</em>.</li>
   <li>Bishop, C. M. (1994). Mixture Density Networks. Technical report, Aston University.</li>
@@ -561,14 +616,22 @@ python -m jepa measure --model runs/jepa-decoder --json runs/jepa-decoder/metric
   <li>Guzman-Rivera, A., Batra, D., Kohli, P. (2012). Multiple Choice Learning: Learning to Produce Multiple Structured Outputs. <em>NeurIPS</em>.</li>
   <li>Ha, D., Schmidhuber, J. (2018). World Models. <em>arXiv / NeurIPS</em>.</li>
   <li>Hafner, D., et al. (2020). Dream to Control: Learning Behaviors by Latent Imagination. <em>ICLR</em>.</li>
+  <li>[HiLP 2026] Hierarchical Latent Prediction for Language Models. <em>arXiv:2608.05806</em>. <span class="todo">TODO: authors</span></li>
+  <li>Huang, H., LeCun, Y., Balestriero, R. (2026). LLM-JEPA: Large Language Models Meet Joint Embedding Predictive Architectures. <em>ICLR</em>. arXiv:2509.14252.</li>
+  <li>Huang, Y. (2026). MDN-VJEPA: Multimodal Probabilistic Joint-Embedding World Models. <em>arXiv:2610.13956</em>.</li>
+  <li>[JEPA-Reasoner 2025] JEPA-Reasoner: Decoupling Latent Reasoning from Token Generation. <em>arXiv:2512.19171</em>. <span class="todo">TODO: authors</span></li>
   <li>LCM team, Barrault, L., et al. (2024). Large Concept Models: Language Modeling in a Sentence Representation Space. <em>arXiv</em>.</li>
   <li>LeCun, Y. (2022). A Path Towards Autonomous Machine Intelligence. <em>OpenReview</em> position paper.</li>
   <li>Lee, S., et al. (2016). Stochastic Multiple Choice Learning for Training Diverse Deep Ensembles. <em>NeurIPS</em>.</li>
   <li>Maddison, C. J., Tarlow, D., Minka, T. (2014). A* Sampling. <em>NeurIPS</em>. (Gumbel-max sampling.)</li>
   <li>Mathieu, M., Couprie, C., LeCun, Y. (2016). Deep Multi-Scale Video Prediction Beyond Mean Square Error. <em>ICLR</em>.</li>
+  <li>[NextLat 2025] Next-Latent Prediction Transformers Learn Compact World Models. <em>arXiv:2511.05963</em>. <span class="todo">TODO: authors</span></li>
   <li>Penedo, G., et al. (2024). The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale. <em>arXiv</em>.</li>
+  <li>[PLaT 2026] Latent Chain-of-Thought as Planning: Decoupling Reasoning from Verbalization. <em>arXiv:2601.21358</em>. <span class="todo">TODO: authors</span></li>
   <li>Rupprecht, C., et al. (2017). Learning in an Uncertain World: Representing Ambiguity Through Multiple Hypotheses. <em>ICCV</em>.</li>
-  <li><span class="todo">TODO: the source of the VISReg regularizer</span></li>
+  <li>Song, Z., et al. (2026). Branch-JEPA: Finite-Support Predictive Distributions for JEPA World Models. <em>arXiv:2607.05238</em> (v1/v2 titled MoP-JEPA).</li>
+  <li>[VISReg 2026] VISReg: Variance-Invariance-Sketching Regularization for JEPA Training. <em>arXiv:2606.02572</em>. <span class="todo">TODO: authors</span></li>
+  <li><span class="todo">TODO: plan-then-generate primary references (PLANNER, DGLM, Cornille et al.) or the survey "Alternatives to Next Token Prediction in Text Generation" (arXiv:2509.24435)</span></li>
 </ol>
 
 </main>
