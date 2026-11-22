@@ -11,7 +11,7 @@ JEPA text model (causal encoder → latent predictor → autoregressive decoder)
 - Quick end-to-end training check: `python -m jepa train --subset` (needs the prepared data and tokenizer in `data/`).
 
 ## Layout / boundaries
-- `jepa/config.py`: all component configs. `jepa/models/`: encoder, predictor, decoder, VISReg loss, `JepaModel` (no decoder), `JepaDecodeModel` (full stack).
+- `jepa/config.py`: all component configs. `jepa/models/`: encoder, predictor, decoder, `commitment.py` (`Futures`, policies, `commit`), VISReg loss, `JepaModel` (no decoder), `JepaDecodeModel` (full stack).
 - `jepa/paths.py`: `data/` and `runs/` are resolved from the package location, not the CWD.
 - `data/` (tokenizer + prepared chunks) and `runs/` (checkpoints) are gitignored generated artifacts. Don't hand-edit them. Regenerating them streams FineWeb-Edu from the network and takes a long time.
 - `docs/verification.md` contains temporary planning notes, `docs/vision.md` the long-term predictor direction (head revival/growth), and `docs/tickets/` open work items. None of them describes implemented behavior.
@@ -19,7 +19,7 @@ JEPA text model (causal encoder → latent predictor → autoregressive decoder)
 ## Gotchas
 - Training hyperparameters (model size, AMP, `torch.compile`, decoder window, loss weights) are **module-level constants** in `jepa/training/train.py`, not CLI flags. Only data paths, batch size, epochs, `--resume`, `--jepa-only`, and `--subset` are flags; `train-decoder` adds `--model-dir`, `--output-dir`, `--lr`, `--device`, and its own `--resume`.
 - Both entry points share one trainer (`JepaTrainer`/`TrainConfig`) and the constants in `train.py`; `jepa/training/train_decoder.py` only defines its decoder-only CLI defaults (`DECODER_BATCH_SIZE`, `DECODER_LEARNING_RATE`, `DECODER_EPOCHS`).
-- `JepaDecodeModel.freeze_jepa()` (used by `train-decoder`) freezes the encoder/predictor and makes `forward` skip the JEPA loss (they run under `torch.no_grad()`); its `train()` re-asserts eval mode for them. The frozen path selects the hindsight waypoint in fp32 so it matches the VISReg loss's winner under bf16 autocast. The mirror image, `skip_decoder()` (`train --jepa-only`), makes `forward` return `decoder_out=None`; the trainer drops whichever loss term is missing.
+- `JepaDecodeModel.freeze_jepa()` (used by `train-decoder`) freezes the encoder/predictor and makes `forward` skip the JEPA loss (they run under `torch.no_grad()`); its `train()` re-asserts eval mode for them. The frozen path commits by hindsight with the same fp32 `Futures.distances` the VISReg loss uses, so both paths pick the same candidate under bf16 autocast. The mirror image, `skip_decoder()` (`train --jepa-only`), makes `forward` return `decoder_out=None`; the trainer drops whichever loss term is missing.
 - `MODEL_MAX_LENGTH` in `train.py` must match `prepare-data --max-length` (default 1024).
 - The encoder owns `hidden_size`, `vocab_size`, and `pad_token_id`. Build the other configs with `PredictorConfig.from_encoder` / `DecoderConfig.from_encoder` / `JepaConfig.from_encoder`. If you pass conflicting explicit values, construction raises `ValueError`.
 - The checkpoint `config.json` nests the component configs (`encoder`/`predictor`/`decoder`/`visreg`) with no top-level duplicates. Keep it that way when adding config fields.

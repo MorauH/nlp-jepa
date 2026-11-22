@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import torch
 from transformers import PreTrainedModel
 
 from ..config import JepaConfig
+from .commitment import Hindsight, PiArgmax
 from .encoder import EncodeTransformer
 from .losses import VISRegLoss
 from .predictor import PredictorModel
@@ -86,12 +86,12 @@ class JepaModel(PreTrainedModel):
                       causal SDPA kernel.
         Returns:
             dict with:
-              training: ``loss``, ``latents``, ``preds``, ``scores``,
-                        ``mean``, ``z_future``, ``valid``, ``stats``
-              inference: ``latents``, ``z_t``, ``preds``, ``scores``,
-                         ``mean``, ``z_future``
-            ``scores`` are win-probability logits (pi); ``mean`` is mu, the
-            predicted mean normalized future (auxiliary).
+              training: ``loss``, ``latents``, ``futures``, ``committed``,
+                        ``valid``, ``stats``
+              inference: ``latents``, ``z_t``, ``futures``, ``committed``
+            ``futures`` is the predictor's :class:`Futures` (candidates, pi,
+            mu); ``committed`` is one candidate, chosen by hindsight during
+            training and by pi-argmax at inference.
         """
         enc_hidden = self._encode(labels, attention_mask, right_padded)
 
@@ -113,34 +113,26 @@ class JepaModel(PreTrainedModel):
                 valid = None
 
             # From each hidden[i, t, :] predict hidden[i, t+k, :]
-            preds, scores, mean = self.predictor(X, return_all_timesteps=True)
+            futures = self.predictor(X, return_all_timesteps=True)
             loss, stats = self.criterion(
-                preds,
+                futures,
                 Y,
                 mask=valid,
-                scores=scores,
-                mean=mean,
                 reg_source=enc_hidden,
                 reg_mask=attention_mask,
                 return_stats=True,
             )
 
-            # Commit to the closest candidate for the (detached) decoder
-            # target.  At inference the score head makes this choice instead.
-            win = stats["win"]  # (B, T)
-            z_future = torch.gather(
-                preds,
-                2,
-                win[..., None, None].expand(-1, -1, 1, preds.shape[-1]),
-            ).squeeze(2)
+            # Commit by hindsight for the (detached) decoder target: the
+            # candidate closest to the real future.  At inference a policy
+            # that cannot see the future commits instead.
+            committed = futures.commit(Hindsight(), Y).future
 
             return {
                 "loss": loss,
                 "latents": enc_hidden,
-                "preds": preds,
-                "scores": scores,
-                "mean": mean,
-                "z_future": z_future,
+                "futures": futures,
+                "committed": committed,
                 "valid": valid,
                 "stats": stats,
             }
@@ -149,20 +141,15 @@ class JepaModel(PreTrainedModel):
             "Inference expects no padding at the end of the sequence"
         )
 
-        preds, scores, mean = self.predictor(enc_hidden, return_all_timesteps=False)
+        futures = self.predictor(enc_hidden, return_all_timesteps=False)
 
         # Greedy commitment by default: the most likely future under pi.
-        # Callers that want stochastic directions can sample from ``scores``.
-        best = scores.argmax(dim=-1)  # (B,)
-        z_future = preds[
-            torch.arange(preds.shape[0], device=preds.device), best
-        ]
+        # Callers that want stochastic futures commit with ``PiSample``.
+        committed = futures.commit(PiArgmax()).future
 
         return {
             "latents": enc_hidden,
             "z_t": enc_hidden[:, -1, :],
-            "preds": preds,
-            "scores": scores,
-            "mean": mean,
-            "z_future": z_future,
+            "futures": futures,
+            "committed": committed,
         }

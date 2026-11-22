@@ -15,9 +15,9 @@ class VISRegLoss(nn.Module):
     """
     VISReg regularization plus a multi-hypothesis prediction objective.
 
-    The predictor returns a set of candidate latents, per-candidate
-    win-probability logits (pi) and a mean-future vector (mu).  The
-    single-prediction invariance term is replaced by:
+    The predictor returns :class:`jepa.models.commitment.Futures`: candidates,
+    per-candidate win-probability logits (pi) and a mean-future vector (mu).
+    The single-prediction invariance term is replaced by:
 
     * a relaxed winner-takes-all move loss that pulls each target toward its
       nearest candidate (with a small uniform component so no candidate dies),
@@ -132,10 +132,10 @@ class VISRegLoss(nn.Module):
         return l_scale, l_shape, l_center
 
     def _multi_hypothesis_loss(
-        self, candidates, target, scores, mean, mask, reg_source, reg_mask
+        self, futures, target, mask, reg_source, reg_mask
     ):
-        """Loss for ``(B, T, P, D)`` candidates, ``(B, T, P)`` pi logits and
-        an optional ``(B, T, D)`` mu.
+        """Loss for ``(B, T, P, D)`` candidates, ``(B, T, P)`` pi logits and a
+        ``(B, T, D)`` mu from the same :class:`Futures`.
 
         ``r`` is the detached soft assignment derived from the true
         candidate-target distances.  The move loss pulls candidates through
@@ -151,6 +151,7 @@ class VISRegLoss(nn.Module):
         the distribution terms by transforming its own output while leaving
         the encoder collapsed.
         """
+        candidates = futures.candidates
         batch, seq, count, _ = candidates.shape
         device = candidates.device
 
@@ -161,19 +162,15 @@ class VISRegLoss(nn.Module):
 
         cand = candidates.float()
         tgt = target.float()
-        logits = scores.float()
+        logits = futures.pi.float()
+        mu = futures.mu.float()
         valid_f = valid.to(cand.dtype)
         denom = valid_f.sum().clamp_min(1.0)
 
-        cand_cmp = F.normalize(cand, dim=-1)
-        tgt_cmp = F.normalize(tgt, dim=-1)
-        # Both sides are unit vectors, so the squared distance is
-        # 2 - 2 * (a . b).  Computing it from the dot product avoids
-        # materializing the (B, T, P, D) fp32 difference and its square
-        # (about 1.4 GB each at batch 32 x 1024).  Clamping at zero hides
-        # the fp32 rounding when a == b.
-        dot = torch.einsum("btpd,btd->btp", cand_cmp, tgt_cmp)
-        d = (2.0 - 2.0 * dot).clamp_min(0.0)
+        # The one candidate-target distance in the codebase: fp32, normalized,
+        # computed from the dot product (no (B, T, P, D) difference).  The
+        # clamp hides fp32 rounding when a candidate equals the target.
+        d = futures.distances(target)
 
         # Adaptive temperature: relative differences stay usable even as the
         # overall distance shrinks during training.
@@ -208,22 +205,17 @@ class VISRegLoss(nn.Module):
 
         # mu: regress onto the normalized target, so mu -> E[ŷ | z_t].  Its
         # input is detached in the predictor, so this only trains mean_head.
-        mean_stats = {}
-        if mean is not None:
-            mu = mean.float()
-            tgt_unit = tgt_cmp
-            l_mean = masked_mean((mu - tgt_unit).pow(2).sum(-1))
-            with torch.no_grad():
-                mean_stats = {
-                    "mean_norm": masked_mean(mu.norm(dim=-1)),
-                    # The direction of mu is the optimal single-head
-                    # prediction: what multiple candidates must beat.
-                    "mean_dir_d": masked_mean(
-                        2.0 - 2.0 * (F.normalize(mu, dim=-1) * tgt_unit).sum(-1)
-                    ),
-                }
-        else:
-            l_mean = cand.new_zeros(())
+        tgt_unit = F.normalize(tgt, dim=-1)
+        l_mean = masked_mean((mu - tgt_unit).pow(2).sum(-1))
+        with torch.no_grad():
+            mean_stats = {
+                "mean_norm": masked_mean(mu.norm(dim=-1)),
+                # The direction of mu is the optimal single-head
+                # prediction: what multiple candidates must beat.
+                "mean_dir_d": masked_mean(
+                    2.0 - 2.0 * (F.normalize(mu, dim=-1) * tgt_unit).sum(-1)
+                ),
+            }
 
         # Optional repulsion between candidates.  Off-diagonal cosine
         # similarity is penalized only above ``diversity_margin``, i.e. only
@@ -231,7 +223,7 @@ class VISRegLoss(nn.Module):
         # and pointing orthogonal to everything becomes a free hiding place
         # for unused slots.
         if self.diversity_w > 0 and count > 1:
-            dirs = cand_cmp
+            dirs = F.normalize(cand, dim=-1)
             n_valid = valid_f.sum()
             # Pairwise similarities for every position, then sum only over the
             # valid ones.  Gathering the valid rows first (the old path) copied
@@ -249,13 +241,10 @@ class VISRegLoss(nn.Module):
         else:
             l_div = cand.new_zeros(())
 
-        # The candidate closest to the target is the committed future under
-        # teacher forcing.  It is also returned for the decoder.
-        win = d.detach().argmin(dim=-1)  # (B, T)
-
         # VISReg acts on the online encoder latents, not on the predictor
-        # output.  Applying it to the winner would let the predictor cancel
-        # the encoder's mean in its own output without fixing the encoder.
+        # output.  Applying it to the committed future would let the predictor
+        # cancel the encoder's mean in its own output without fixing the
+        # encoder.
         reg_z = reg_source.float()
         if reg_mask is not None:
             reg_valid = reg_mask.bool().to(reg_z.device)
@@ -286,47 +275,50 @@ class VISRegLoss(nn.Module):
             "selected_d": selected_d,
             **mean_stats,
             "temperature": temperature.detach(),
-            "win": win,
         }
         return loss, stats
 
     def forward(
         self,
-        pred,
+        futures,
         target,
         mask=None,
-        scores=None,
         reg_source=None,
         reg_mask=None,
         return_stats=False,
-        mean=None,
     ):
         """
         Args:
-            pred: (B, T, P, D) candidate predictions.
+            futures: :class:`jepa.models.commitment.Futures` with
+                ``(B, T, P, D)`` candidates, ``(B, T, P)`` pi logits and
+                ``(B, T, D)`` mu.
             target: (B, T, D)
             mask: (B, T), 1 => valid prediction position
-            scores: (B, T, P) win-probability logits (pi).
-            mean: optional (B, T, D) mu, the predicted mean normalized future.
             reg_source: (B, S, D) online encoder latents for VISReg.
             reg_mask: (B, S), 1 => valid token in ``reg_source``.
-            return_stats: also return detached diagnostics for logging.
+            return_stats: also return detached (scalar) diagnostics for
+                logging.
 
         Returns:
             The loss, or ``(loss, stats)`` when ``return_stats`` is True.
         """
-        if pred.ndim != 4:
+        candidates = futures.candidates
+        if candidates.ndim != 4:
             raise ValueError(
-                f"Expected candidate predictions (B, T, P, D); got {tuple(pred.shape)}"
+                "Expected candidate predictions (B, T, P, D); got "
+                f"{tuple(candidates.shape)}"
             )
-        if scores is None:
-            raise ValueError("scores is required for candidate predictions")
+        if target.shape != futures.mu.shape:
+            raise ValueError(
+                f"target shape {tuple(target.shape)} must match mu shape "
+                f"{tuple(futures.mu.shape)}"
+            )
         if reg_source is None:
             raise ValueError("reg_source (online encoder latents) is required")
 
-        device_type = "cuda" if pred.is_cuda else "cpu"
+        device_type = "cuda" if candidates.is_cuda else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             loss, stats = self._multi_hypothesis_loss(
-                pred, target, scores, mean, mask, reg_source, reg_mask
+                futures, target, mask, reg_source, reg_mask
             )
         return (loss, stats) if return_stats else loss

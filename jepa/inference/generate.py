@@ -1,9 +1,9 @@
 """Interactive generator for a trained JEPA encoder + predictor + decoder.
 
-Each block re-encodes the current context, samples a latent waypoint from the
+Each block re-encodes the current context, samples a committed future from the
 predictor, and generates ``k`` tokens autoregressively. The decoder sees the
 last ``sliding_window`` tokens, so grammar comes from the token context and
-semantics from the JEPA waypoint.
+semantics from the committed future.
 
 Usage:
     python -m jepa generate --prompt "Once upon a time"
@@ -18,6 +18,7 @@ import argparse
 import torch
 
 from ..data.tokenizer import eos_token_id, load_tokenizer
+from ..models.commitment import PiSample
 from ..models.stack import JepaDecodeModel
 from ..paths import DEFAULT_RUN_DIR, TOKENIZER_DIR
 from ..runtime import select_device
@@ -25,37 +26,6 @@ from ..runtime import select_device
 DEFAULT_MODEL = str(DEFAULT_RUN_DIR)
 DEFAULT_TOKENIZER = str(TOKENIZER_DIR)
 DEFAULT_STEPS = 1
-
-
-@torch.no_grad()
-def sample_direction(
-    candidates: torch.Tensor,
-    scores: torch.Tensor,
-    *,
-    temperature: float,
-    top_k: int | None,
-) -> torch.Tensor:
-    """Sample one candidate per batch row from ``scores``.
-
-    candidates: (batch, prediction_count, target_dim)
-    scores:     (batch, prediction_count) win-probability logits (pi)
-    Returns:    (batch, target_dim)
-    """
-    if temperature <= 0:
-        indices = scores.argmax(dim=-1)
-    else:
-        logits = scores / temperature
-
-        if top_k is not None and top_k > 0:
-            k = min(top_k, logits.shape[-1])
-            kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
-            logits = logits.masked_fill(logits < kth, float("-inf"))
-
-        probabilities = torch.softmax(logits, dim=-1)
-        indices = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
-
-    rows = torch.arange(candidates.shape[0], device=candidates.device)
-    return candidates[rows, indices]
 
 
 @torch.no_grad()
@@ -73,10 +43,10 @@ def generate(
 ) -> tuple[str, list[int]]:
     """Generate ``steps * k`` tokens from ``prompt``.
 
-    Each block re-encodes the current context, samples a latent waypoint, and
+    Each block re-encodes the current context, samples a committed future, and
     generates ``k`` tokens autoregressively. The decoder sees the last
-    ``sliding_window`` tokens and the latent waypoint, so grammar comes from
-    the token context and semantics from the JEPA plan.
+    ``sliding_window`` tokens and the committed future, so grammar comes from
+    the token context and semantics from the JEPA prediction.
     """
     encoded = tokenizer([prompt], return_tensors="pt", padding=False)
     context_ids = encoded["input_ids"].to(device)
@@ -97,23 +67,20 @@ def generate(
         if max_context is not None:
             enc_ids = enc_ids[:, -max_context:]
 
-        # Re-encode the current context so the waypoint is grounded in the
-        # tokens that have actually been generated.
+        # Re-encode the current context so the committed future is grounded in
+        # the tokens that have actually been generated.
         latents = model.encoder(enc_ids)
         z_t = latents[:, -1, :]
 
         # The predictor reads only the last latent (z_t).
-        candidates, scores, _ = model.predictor(latents, return_all_timesteps=False)
-        z_future = sample_direction(
-            candidates,
-            scores,
-            temperature=direction_temperature,
-            top_k=direction_top_k,
-        )
+        futures = model.predictor(latents, return_all_timesteps=False)
+        committed = futures.commit(
+            PiSample(temperature=direction_temperature, top_k=direction_top_k)
+        ).future
 
         new_ids = model.decoder.generate(
             z_t=z_t,
-            z_future=z_future,
+            committed=committed,
             context_ids=context_ids,
             k=k,
             temperature=temperature,
@@ -160,14 +127,14 @@ def main(argv: list[str] | None = None) -> None:
         "--direction-temperature",
         type=float,
         default=1.0,
-        help="Temperature for sampling a future direction from the "
-        "win-probability head; 0 picks the most likely one.",
+        help="Temperature for sampling a committed future from the "
+        "win-probability head (pi); 0 picks the most likely one.",
     )
     parser.add_argument(
         "--direction-top-k",
         type=int,
         default=0,
-        help="Top-k cutoff for direction sampling; 0 disables it.",
+        help="Top-k cutoff for committed-future sampling; 0 disables it.",
     )
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Prediction steps")
     parser.add_argument("--prompt", required=True, help="Prompt text")

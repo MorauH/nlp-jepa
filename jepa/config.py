@@ -209,14 +209,17 @@ class DecoderConfig(TransformerConfig):
     (``tie_word_embeddings``), and the latent hint is re-injected into the
     residual stream before every transformer layer.
 
-    ``train_policy`` selects the committed future the decoder is trained
-    against: ``"hindsight"`` uses the candidate closest to the real future,
-    ``"pi_argmax"`` the most likely candidate under pi (the inference
-    condition).  Evaluation always uses ``"pi_argmax"``.
+    ``train_policy`` selects the policy that commits the future the decoder is
+    trained against: ``"hindsight"`` uses the candidate closest to the real
+    future, ``"pi_argmax"`` the most likely candidate under pi (the inference
+    condition).  Evaluation always uses ``"pi_argmax"``.  The names are
+    registered in :data:`jepa.models.commitment.POLICIES`.
     """
 
     model_type = "jepa_decoder"
 
+    # The subset of ``commitment.POLICIES`` that makes sense for training the
+    # decoder (sampling policies would make the target noisy).
     TRAIN_POLICIES = ("hindsight", "pi_argmax")
 
     def __init__(

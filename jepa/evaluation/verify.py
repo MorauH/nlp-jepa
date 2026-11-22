@@ -9,8 +9,9 @@ and reports:
 
 * representation health (scale, mean, effective rank, temporal cosine),
 * predictor candidate diversity, the win-probability head (pi) against a
-  constant distribution, |mu|, and pi / mu / fixed-slot / oracle waypoints,
-* the `win` histogram,
+  constant distribution, |mu|, and the pi / mu / fixed-slot / hindsight
+  commits,
+* the commit-index histogram,
 * a teacher-forced hint ablation: predicted vs shuffled vs null vs raw
   block-end latent, overall and per block offset.
 
@@ -27,8 +28,8 @@ import torch.nn.functional as F
 from datasets import load_from_disk
 
 from ..data.tokenizer import load_tokenizer
-from ..models.predictor import expected_distances
-from ..models.stack import JepaDecodeModel, build_block_hints, select_waypoints
+from ..models.commitment import Hindsight, MuSafe, PiArgmax
+from ..models.stack import JepaDecodeModel, build_block_hints
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
 
 DEFAULT_MODEL = DEFAULT_RUN_DIR
@@ -118,7 +119,7 @@ def flag_pi_gain(value: float) -> str:
     return "UNINFORMATIVE"
 
 
-def flag_win(top_share: float, prediction_count: int) -> str:
+def flag_commit_share(top_share: float, prediction_count: int) -> str:
     if prediction_count <= 1:
         return "COLLAPSED"
     if top_share > max(0.25, 2.5 / prediction_count):
@@ -231,26 +232,22 @@ def main(argv: list[str] | None = None) -> None:
         seq_len = labels.shape[1]
         horizon_len = seq_len - k
         z_t = latents[:, :horizon_len, :]
-        z_future = latents[:, k:, :]
+        real_future = latents[:, k:, :]
         valid = attention_mask[:, :horizon_len].bool() & attention_mask[:, k:].bool()
         temporal_cos = F.cosine_similarity(
             F.normalize(z_t[valid], dim=-1),
-            F.normalize(z_future[valid], dim=-1),
+            F.normalize(real_future[valid], dim=-1),
             dim=-1,
         )
 
-        preds, scores, mean_future = model.predictor(
-            latents[:, :-k, :], return_all_timesteps=True
-        )
-        distances = (
-            F.normalize(preds, dim=-1)
-            - F.normalize(z_future, dim=-1).unsqueeze(2)
-        ).pow(2).sum(-1)
-        delta = (preds - latents[:, :-k, :].unsqueeze(2)).norm(dim=-1)
+        futures = model.predictor(latents[:, :-k, :], return_all_timesteps=True)
+        candidates = futures.candidates
+        distances = futures.distances(real_future)
+        delta = (candidates - latents[:, :-k, :].unsqueeze(2)).norm(dim=-1)
         if prediction_count > 1:
             pairwise = F.cosine_similarity(
-                F.normalize(preds, dim=-1).unsqueeze(3),
-                F.normalize(preds, dim=-1).unsqueeze(2),
+                F.normalize(candidates, dim=-1).unsqueeze(3),
+                F.normalize(candidates, dim=-1).unsqueeze(2),
                 dim=-1,
             )
             off_diagonal = 1 - torch.eye(prediction_count, device=device)
@@ -267,7 +264,7 @@ def main(argv: list[str] | None = None) -> None:
         # it by likelihood, against the best constant distribution (the
         # marginal win shares on this batch): information gained from z_t.
         hard_win = distances.argmin(dim=-1)[valid]
-        log_pi = F.log_softmax(scores.float(), dim=-1)[valid]
+        log_pi = F.log_softmax(futures.pi.float(), dim=-1)[valid]
         pi_nll = -log_pi.gather(-1, hard_win[:, None]).mean()
         marginal = torch.bincount(hard_win, minlength=prediction_count).float()
         marginal = marginal / marginal.sum().clamp_min(1)
@@ -278,7 +275,7 @@ def main(argv: list[str] | None = None) -> None:
 
         # mu = predicted mean normalized future.  Its norm: ~1 predictable,
         # short = divergent futures.
-        mean_norm = mean_future.float().norm(dim=-1)[valid].mean()
+        mean_norm = futures.mu.float().norm(dim=-1)[valid].mean()
 
         print("\n--- representation health ---")
         print(
@@ -322,32 +319,25 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         # ---------------------------------------------------------------
-        # Oracle vs selected waypoint
+        # Oracle vs committed future
         # ---------------------------------------------------------------
-        selected = select_waypoints(preds, scores)
-        best_index = distances.argmin(dim=-1)
-        oracle = preds.gather(
-            2,
-            best_index[..., None, None].expand(-1, -1, 1, preds.shape[-1]),
-        ).squeeze(2)
+        oracle_commit = futures.commit(Hindsight(), real_future)
+        committed = futures.commit(PiArgmax()).future
 
         # Best constant slot: the single index with the lowest mean distance.
         fixed_index = distances[valid].mean(dim=0).argmin()
-        fixed = preds[:, :, fixed_index, :]
-        # mu-safe: the candidate with the lowest expected distance.
-        safe_index = expected_distances(preds, mean_future).argmin(dim=-1)
-        safe = preds.gather(
-            2, safe_index[..., None, None].expand(-1, -1, 1, preds.shape[-1])
-        ).squeeze(2)
+        fixed = candidates[:, :, fixed_index, :]
+        # mu-safe: the policy that commits by the expected distance under mu.
+        safe = futures.commit(MuSafe()).future
 
         query_copy = z_t[valid]
-        query_selected = selected[valid]
+        query_committed = committed[valid]
         query_fixed = fixed[valid]
         query_safe = safe[valid]
         # mu's direction = the optimal single-head prediction.
-        query_mean = mean_future[valid]
-        query_oracle = oracle[valid]
-        retrieval_keys = z_future[valid]
+        query_mean = futures.mu[valid]
+        query_oracle = oracle_commit.future[valid]
+        retrieval_keys = real_future[valid]
 
         def norm_distance(query):
             return (
@@ -358,11 +348,11 @@ def main(argv: list[str] | None = None) -> None:
             )
 
         d_copy = float(norm_distance(query_copy))
-        d_selected = float(norm_distance(query_selected))
+        d_committed = float(norm_distance(query_committed))
         d_mean = float(norm_distance(query_mean))
         d_oracle = float(norm_distance(query_oracle))
 
-        print("\n--- oracle vs selected waypoint ---")
+        print("\n--- oracle vs pi-argmax commit ---")
         print(
             f"{'query':12s}{'distance':>10s}{'top1':>10s}"
             f"{'top5':>10s}{'mean_rank':>12s}"
@@ -370,7 +360,7 @@ def main(argv: list[str] | None = None) -> None:
         retrieval_pool = 0
         for name, query in (
             ("copy z_t", query_copy),
-            ("pi argmax", query_selected),
+            ("pi argmax", query_committed),
             ("mu-safe", query_safe),
             ("mu dir", query_mean),
             (f"fixed slot {int(fixed_index)}", query_fixed),
@@ -389,7 +379,7 @@ def main(argv: list[str] | None = None) -> None:
             f"(chance top1 ~{1 / max(1, retrieval_pool):.5f})"
         )
         print(f"oracle improvement over copy:   {fmt(d_copy - d_oracle)}")
-        print(f"selected improvement over copy: {fmt(d_copy - d_selected)}")
+        print(f"pi-argmax improvement over copy: {fmt(d_copy - d_committed)}")
         print(
             f"oracle gain over mu dir:        {fmt(d_mean - d_oracle)}  "
             "[what P candidates buy over the best single prediction; "
@@ -401,51 +391,52 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         oracle_good = d_oracle < d_copy - 0.1
-        selected_good = d_selected < d_copy - 0.1
-        if oracle_good and not selected_good:
+        committed_good = d_committed < d_copy - 0.1
+        if oracle_good and not committed_good:
             print(
                 "SCORER PROBLEM: the candidate set is better than copy, "
-                "but the selected waypoint is not."
+                "but the pi-argmax commit is not."
             )
-        elif oracle_good and selected_good:
-            print("HINT USEFUL: the selected waypoint is better than copy.")
+        elif oracle_good and committed_good:
+            print("HINT USEFUL: the committed future is better than copy.")
         elif not oracle_good:
             print(
-                "CANDIDATE SET WEAK: the oracle best candidate is not better "
+                "CANDIDATE SET WEAK: the hindsight candidate is not better "
                 "than copy; improve the representation/predictor/data."
             )
         else:
-            print("INCONCLUSIVE: the oracle/selected differences are small.")
-        if d_selected - d_oracle < 0.05 and selected_good:
-            print("selection is close to the oracle.")
+            print("INCONCLUSIVE: the oracle/pi-argmax differences are small.")
+        if d_committed - d_oracle < 0.05 and committed_good:
+            print("the pi-argmax commit is close to the oracle.")
 
         # ---------------------------------------------------------------
-        # win histogram
+        # commit-index histogram (hindsight)
         # ---------------------------------------------------------------
-        win = jepa_out["stats"]["win"][valid]
-        win_counts = torch.bincount(win, minlength=prediction_count)
-        win_shares = win_counts.float() / win_counts.sum().clamp_min(1)
-        top_share = win_shares.max()
-        print("\n--- win histogram (oracle argmin) ---")
-        print("counts:", win_counts.tolist())
-        print("shares:", [round(float(x), 3) for x in win_shares])
+        commit_index = oracle_commit.index[valid]
+        commit_counts = torch.bincount(commit_index, minlength=prediction_count)
+        commit_shares = commit_counts.float() / commit_counts.sum().clamp_min(1)
+        top_share = commit_shares.max()
+        print("\n--- commit index histogram (hindsight) ---")
+        print("counts:", commit_counts.tolist())
+        print("shares:", [round(float(x), 3) for x in commit_shares])
         print(
             f"top share: {fmt(top_share)}  "
-            f"[{flag_win(float(top_share), prediction_count)}; uniform ~{1/prediction_count:.3f}]"
+            f"[{flag_commit_share(float(top_share), prediction_count)}; "
+            f"uniform ~{1/prediction_count:.3f}]"
         )
 
         # ---------------------------------------------------------------
         # Hint ablation
         # ---------------------------------------------------------------
-        predicted = selected
+        predicted = committed
         z_t_hint, future_predicted = build_block_hints(
-            latents, k, predicted_future=predicted
+            latents, k, committed=predicted
         )
         _, future_real = build_block_hints(latents, k)
         generator = torch.Generator().manual_seed(args.seed)
         perm = torch.randperm(predicted.shape[0], generator=generator).to(device)
         _, future_shuffled = build_block_hints(
-            latents, k, predicted_future=predicted[perm]
+            latents, k, committed=predicted[perm]
         )
         future_null = torch.zeros_like(future_predicted)
 
@@ -504,16 +495,16 @@ def main(argv: list[str] | None = None) -> None:
         gap = float(predicted_overall - shuffled_overall)
         if gap < -0.05:
             print(
-                f"decoder USES the waypoint: predicted is {abs(gap):.4f} CE "
-                "better than shuffled"
+                f"decoder USES the committed future: predicted is {abs(gap):.4f} "
+                "CE better than shuffled"
             )
         elif abs(gap) < 0.02:
             print(
-                "decoder IGNORES the waypoint: predicted and shuffled are "
-                "within noise"
+                "decoder IGNORES the committed future: predicted and shuffled "
+                "are within noise"
             )
         else:
-            print(f"weak/inconclusive waypoint effect: gap={gap:.4f}")
+            print(f"weak/inconclusive committed-future effect: gap={gap:.4f}")
 
         semantic_offsets = [
             o
@@ -554,10 +545,10 @@ def main(argv: list[str] | None = None) -> None:
     print("pi gain:            NLL below the constant win distribution; >0 = pi uses z_t")
     print("|mu|:               ~1 predictable future; short = divergent futures")
     print("oracle gain over mu dir: small = one prediction is about as good as P")
-    print("win share:          uniform ~1/P; >25% concentrated; >50% collapse")
-    print("oracle vs selected: oracle << copy and selected ~ copy = scorer problem;")
-    print("                    oracle and selected << copy = hint useful;")
-    print("                    oracle ~ copy = candidate set weak")
+    print("commit share:       uniform ~1/P; >25% concentrated; >50% collapse")
+    print("hindsight vs pi:    hindsight << copy and pi ~ copy = scorer problem;")
+    print("                    hindsight and pi << copy = hint useful;")
+    print("                    hindsight ~ copy = candidate set weak")
     print("retrieval:          higher top1/top5, lower mean rank; chance ~1/N")
     print("hint ablation:      predicted < shuffled-0.05 = uses hint;")
     print("                    predicted ~ shuffled ~ null = ignores hint;")

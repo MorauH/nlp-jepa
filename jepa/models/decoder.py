@@ -1,4 +1,4 @@
-# Autoregressive token decoder conditioned on latent waypoints.
+# Autoregressive token decoder conditioned on latent hints.
 
 from __future__ import annotations
 
@@ -27,12 +27,12 @@ class DecoderModel(PreTrainedModel):
 
     The decoder is trained with standard next-token cross-entropy. It sees the
     last ``sliding_window`` tokens and a latent hint for the current block:
-    ``z_t`` (the latent at the block start) and ``z_future`` (the latent at the
-    block end). The hint is added to every token embedding in the block, so the
-    token transformer keeps the grammar while the latent supplies the semantic
-    waypoint. It is also re-injected (through a zero-initialized per-layer
-    projection) before every layer, and the token embedding is tied to the
-    output projection.
+    ``z_t`` (the latent at the block start) and ``committed`` (the committed
+    future at the block end). The hint is added to every token embedding in
+    the block, so the token transformer keeps the grammar while the latent
+    supplies the semantics. It is also re-injected (through a zero-initialized
+    per-layer projection) before every layer, and the token embedding is tied
+    to the output projection.
     """
 
     config_class = DecoderConfig
@@ -86,9 +86,9 @@ class DecoderModel(PreTrainedModel):
         # zero-initialized per-layer hint projections at zero.
         return
 
-    def _hint(self, z_t, z_future):
-        """Project the block-start and block-end latents into decoder space."""
-        return self.latent_proj_t(z_t) + self.latent_proj_f(z_future)
+    def _hint(self, z_t, committed):
+        """Project the block-start latent and committed future to decoder space."""
+        return self.latent_proj_t(z_t) + self.latent_proj_f(committed)
 
     def _run(self, input_ids, hint, attention_mask=None):
         hidden_states = self.embedding(input_ids) + hint
@@ -122,7 +122,7 @@ class DecoderModel(PreTrainedModel):
     def forward(
         self,
         z_t,
-        z_future,
+        committed,
         labels,
         training: bool = True,
         loss_chunk_size: int | None = None,
@@ -132,7 +132,8 @@ class DecoderModel(PreTrainedModel):
 
         Args:
             z_t: (B, S, H) latent at the start of each token's block.
-            z_future: (B, S, H) latent at the end of each token's block.
+            committed: (B, S, H) committed future at the end of each token's
+                block.
             labels: (B, S) token ids.
             training: must be True; use :meth:`generate` for inference.
             loss_chunk_size: optional number of positions per ``lm_head`` chunk.
@@ -145,7 +146,7 @@ class DecoderModel(PreTrainedModel):
         targets = labels[:, 1:]
         steps = input_ids.shape[1]
 
-        hint = self._hint(z_t[:, :steps], z_future[:, :steps])
+        hint = self._hint(z_t[:, :steps], committed[:, :steps])
         mask = attention_mask[:, :-1] if attention_mask is not None else None
         hidden_states = self._run(input_ids, hint, mask)
 
@@ -180,7 +181,7 @@ class DecoderModel(PreTrainedModel):
     def generate(
         self,
         z_t,
-        z_future,
+        committed,
         context_ids,
         k: int,
         *,
@@ -191,7 +192,7 @@ class DecoderModel(PreTrainedModel):
 
         Args:
             z_t: (B, H) latent at the start of the block.
-            z_future: (B, H) waypoint latent for the block.
+            committed: (B, H) committed future for the block.
             context_ids: (B, C) tokens already known/generated.
             k: number of tokens to generate.
             temperature: token sampling temperature; 0 means greedy.
@@ -203,7 +204,7 @@ class DecoderModel(PreTrainedModel):
         for _ in range(k):
             window = context_ids[:, -self.sliding_window :]
             hint = self._hint(
-                z_t.unsqueeze(1), z_future.unsqueeze(1)
+                z_t.unsqueeze(1), committed.unsqueeze(1)
             ).expand(-1, window.shape[1], -1)
             hidden_states = self._run(window, hint)
             logits = self.lm_head(hidden_states[:, -1, :])

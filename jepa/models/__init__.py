@@ -1,5 +1,14 @@
 """Model components and the composed JEPA stack."""
 
+from .commitment import (
+    Commit,
+    Futures,
+    Hindsight,
+    MuSafe,
+    PiArgmax,
+    PiSample,
+    policy,
+)
 from .decoder import DecoderModel
 from .encoder import EncodeTransformer
 from .jepa import JepaModel
@@ -14,4 +23,11 @@ __all__ = [
     "JepaModel",
     "JepaDecodeModel",
     "VISRegLoss",
+    "Commit",
+    "Futures",
+    "Hindsight",
+    "MuSafe",
+    "PiArgmax",
+    "PiSample",
+    "policy",
 ]

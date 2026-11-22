@@ -63,7 +63,8 @@ def test_full_stack_forward():
 
     assert jepa_out["loss"].ndim == 0
     assert decoder_out["loss"].ndim == 0
-    assert jepa_out["preds"].shape == (2, 10, 4, 32)
+    assert jepa_out["futures"].candidates.shape == (2, 10, 4, 32)
+    assert jepa_out["committed"].shape == (2, 10, 32)
 
 
 def test_predictor_reads_only_z_t():
@@ -83,29 +84,34 @@ def test_predictor_reads_only_z_t():
     torch.nn.init.normal_(predictor.mean_head[-1].weight)
 
     with torch.no_grad():
-        preds, scores, mean = predictor(latents, return_all_timesteps=True)
-        assert preds.shape == (2, 6, 4, 32)
-        assert scores.shape == (2, 6, 4)
-        assert mean.shape == (2, 6, 32)
+        futures = predictor(latents, return_all_timesteps=True)
+        candidates, pi, mu = futures
+        assert candidates.shape == (2, 6, 4, 32)
+        assert pi.shape == (2, 6, 4)
+        assert mu.shape == (2, 6, 32)
         # The single-step path on z_t alone matches every position.
         for t in range(6):
-            p, s, m = predictor(latents[:, t : t + 1], return_all_timesteps=False)
-            torch.testing.assert_close(p, preds[:, t], atol=1e-5, rtol=1e-4)
-            torch.testing.assert_close(s, scores[:, t], atol=1e-5, rtol=1e-4)
-            torch.testing.assert_close(m, mean[:, t], atol=1e-5, rtol=1e-4)
+            step = predictor(latents[:, t : t + 1], return_all_timesteps=False)
+            torch.testing.assert_close(
+                step.candidates, candidates[:, t], atol=1e-5, rtol=1e-4
+            )
+            torch.testing.assert_close(step.pi, pi[:, t], atol=1e-5, rtol=1e-4)
+            torch.testing.assert_close(step.mu, mu[:, t], atol=1e-5, rtol=1e-4)
 
         # Changing one latent changes only that position.
         shifted = latents.clone()
         shifted[:, 3] += 1.0
-        shifted_preds, shifted_scores, shifted_mean = predictor(
-            shifted, return_all_timesteps=True
-        )
+        shifted_futures = predictor(shifted, return_all_timesteps=True)
         keep = [0, 1, 2, 4, 5]
-        torch.testing.assert_close(shifted_preds[:, keep], preds[:, keep])
-        torch.testing.assert_close(shifted_scores[:, keep], scores[:, keep])
-        torch.testing.assert_close(shifted_mean[:, keep], mean[:, keep])
-        assert not torch.allclose(shifted_preds[:, 3], preds[:, 3])
-        assert not torch.allclose(shifted_mean[:, 3], mean[:, 3])
+        torch.testing.assert_close(
+            shifted_futures.candidates[:, keep], candidates[:, keep]
+        )
+        torch.testing.assert_close(shifted_futures.pi[:, keep], pi[:, keep])
+        torch.testing.assert_close(shifted_futures.mu[:, keep], mu[:, keep])
+        assert not torch.allclose(
+            shifted_futures.candidates[:, 3], candidates[:, 3]
+        )
+        assert not torch.allclose(shifted_futures.mu[:, 3], mu[:, 3])
 
 
 def test_mean_head_starts_at_zero_and_is_detached():
@@ -119,25 +125,14 @@ def test_mean_head_starts_at_zero_and_is_detached():
         )
     )
     latents = torch.randn(2, 5, 32, requires_grad=True)
-    _, _, mean = predictor(latents)
-    assert torch.count_nonzero(mean) == 0
+    mu = predictor(latents).mu
+    assert torch.count_nonzero(mu) == 0
 
     torch.nn.init.normal_(predictor.mean_head[-1].weight)
-    _, _, mean = predictor(latents)
-    mean.pow(2).sum().backward()
+    mu = predictor(latents).mu
+    mu.pow(2).sum().backward()
     assert latents.grad is None
     assert predictor.mean_head[0].weight.grad is not None
-
-
-def test_expected_distances_identity():
-    """2 - 2 ĉ·mu equals the actual distance when mu is the unit target."""
-    from jepa.models.predictor import expected_distances
-
-    torch.manual_seed(0)
-    cand = torch.randn(3, 4, 16)
-    target = F.normalize(torch.randn(3, 16), dim=-1)
-    actual = (F.normalize(cand, dim=-1) - target[:, None]).pow(2).sum(-1)
-    torch.testing.assert_close(expected_distances(cand, target), actual)
 
 
 def test_jepa_inference_without_decoder():
@@ -148,11 +143,12 @@ def test_jepa_inference_without_decoder():
     out = model(labels=labels, attention_mask=attention_mask, training=False)
 
     assert out["z_t"].shape == (2, 32)
-    assert out["z_future"].shape == (2, 32)
+    assert out["committed"].shape == (2, 32)
 
 
 def test_visreg_dot_product_distance_matches_reference():
     """The dot-product distance and masked diversity equal the direct formulas."""
+    from jepa.models.commitment import Futures
     from jepa.models.losses import VISRegLoss
 
     torch.manual_seed(0)
@@ -165,7 +161,7 @@ def test_visreg_dot_product_distance_matches_reference():
 
     mean = torch.randn(2, 5, 16)
     _, stats = criterion(
-        cand, tgt, mask=mask, scores=scores, mean=mean,
+        Futures(cand, scores, mean), tgt, mask=mask,
         reg_source=tgt, reg_mask=mask, return_stats=True,
     )
 
@@ -307,9 +303,9 @@ def test_hint_and_generate_path_agree():
         )
     ).eval()
     z_t = torch.randn(1, 32)
-    z_future = torch.randn(1, 32)
+    committed = torch.randn(1, 32)
     context_ids = torch.randint(1, 64, (1, 6))
-    hint = decoder._hint(z_t[:, None], z_future[:, None])
+    hint = decoder._hint(z_t[:, None], committed[:, None])
 
     with torch.no_grad():
         # Teacher-forced path: exactly what forward() builds (the whole prefix
@@ -325,7 +321,7 @@ def test_hint_and_generate_path_agree():
         )
         torch.testing.assert_close(generated_logits, teacher_logits)
 
-        greedy = decoder.generate(z_t, z_future, context_ids, k=1, temperature=0.0)
+        greedy = decoder.generate(z_t, committed, context_ids, k=1, temperature=0.0)
         assert int(greedy[0, 0]) == int(teacher_logits.argmax(dim=-1)[0])
 
 
@@ -343,7 +339,7 @@ def test_full_stack_forward_with_chunked_decoder_loss():
         training=True,
         loss_chunk_size=4,
     )
-    assert jepa_out["preds"].shape == (2, 10, 4, 32)
+    assert jepa_out["futures"].candidates.shape == (2, 10, 4, 32)
     assert torch.isfinite(jepa_out["loss"]) and torch.isfinite(decoder_out["loss"])
 
     (2 * jepa_out["loss"] + decoder_out["loss"]).backward()
@@ -427,13 +423,10 @@ def test_trainer_saves_mid_epoch_checkpoints(tmp_path):
     JepaDecodeModel.from_pretrained(str(tmp_path))
 
 
-def test_decoder_hindsight_waypoints_in_train_selected_in_eval():
-    """Train mode feeds the hindsight-best candidate; eval the score-selected."""
-    from jepa.models.stack import (
-        build_block_hints,
-        hindsight_waypoints,
-        select_waypoints,
-    )
+def test_decoder_commits_by_hindsight_in_train_and_pi_argmax_in_eval():
+    """Train mode feeds the hindsight commit; eval the pi-argmax one."""
+    from jepa.models.commitment import Hindsight, PiArgmax
+    from jepa.models.stack import build_block_hints
 
     torch.manual_seed(0)
     model = JepaDecodeModel(tiny_config())
@@ -441,39 +434,41 @@ def test_decoder_hindsight_waypoints_in_train_selected_in_eval():
     mask = torch.ones_like(labels)
     k = model.pred_horizon
 
-    def decoder_loss_with(future, jepa_out):
-        z_t, z_future = build_block_hints(
-            jepa_out["latents"], k, predicted_future=future.detach()
+    def decoder_loss_with(committed, jepa_out):
+        z_t, hint = build_block_hints(
+            jepa_out["latents"], k, committed=committed.detach()
         )
         return model.decoder(
-            z_t=z_t.detach(), z_future=z_future, labels=labels,
+            z_t=z_t.detach(), committed=hint, labels=labels,
             training=True, attention_mask=mask,
         )["loss"]
 
     with torch.no_grad():
         model.train()
         jepa_out, decoder_out = model(labels=labels, attention_mask=mask, training=True)
-        hindsight = hindsight_waypoints(jepa_out["preds"], jepa_out["latents"][:, k:])
-        # Same choice as the multi-hypothesis loss's winner.
-        torch.testing.assert_close(hindsight, jepa_out["z_future"])
+        hindsight = jepa_out["futures"].commit(
+            Hindsight(), jepa_out["latents"][:, k:]
+        ).future
+        # Same choice as the futures' own hindsight commit.
+        torch.testing.assert_close(hindsight, jepa_out["committed"])
         torch.testing.assert_close(
             decoder_out["loss"], decoder_loss_with(hindsight, jepa_out)
         )
 
         model.eval()
         jepa_out, decoder_out = model(labels=labels, attention_mask=mask, training=True)
-        selected = select_waypoints(jepa_out["preds"], jepa_out["scores"])
+        pi_argmax = jepa_out["futures"].commit(PiArgmax()).future
         torch.testing.assert_close(
-            decoder_out["loss"], decoder_loss_with(selected, jepa_out)
+            decoder_out["loss"], decoder_loss_with(pi_argmax, jepa_out)
         )
 
         # train_policy="pi_argmax" uses the inference choice while training.
         model.config.decoder.train_policy = "pi_argmax"
         model.train()
         jepa_out, decoder_out = model(labels=labels, attention_mask=mask, training=True)
-        selected = select_waypoints(jepa_out["preds"], jepa_out["scores"])
+        pi_argmax = jepa_out["futures"].commit(PiArgmax()).future
         torch.testing.assert_close(
-            decoder_out["loss"], decoder_loss_with(selected, jepa_out)
+            decoder_out["loss"], decoder_loss_with(pi_argmax, jepa_out)
         )
 
 
@@ -484,8 +479,8 @@ def test_candidates_are_rms_normalized():
     predictor = PredictorModel(
         PredictorConfig.from_encoder(tiny_config().encoder, prediction_count=4)
     )
-    preds, _, _ = predictor(torch.randn(2, 5, 32) * 7.0)
-    rms = preds.pow(2).mean(-1).sqrt()
+    candidates = predictor(torch.randn(2, 5, 32) * 7.0).candidates
+    rms = candidates.pow(2).mean(-1).sqrt()
     torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-3, rtol=1e-3)
 
 
@@ -513,6 +508,7 @@ def test_annealed_temperature_schedule_and_loading(tmp_path):
 
 
 def test_diversity_margin_ignores_dissimilar_pairs():
+    from jepa.models.commitment import Futures
     from jepa.models.losses import VISRegLoss
 
     torch.manual_seed(0)
@@ -525,8 +521,13 @@ def test_diversity_margin_ignores_dissimilar_pairs():
 
     def div(cands, margin):
         crit = VISRegLoss(VISRegConfig(num_slices=4, diversity_w=1.0, diversity_margin=margin))
+        futures = Futures(
+            cands[None, None],
+            torch.zeros(1, 1, 2),
+            torch.randn(1, 1, 16),
+        )
         _, stats = crit(
-            cands[None, None], torch.randn(1, 1, 16), scores=torch.zeros(1, 1, 2),
+            futures, torch.randn(1, 1, 16),
             reg_source=torch.randn(1, 4, 16), return_stats=True,
         )
         return stats["loss_diversity"].item()
@@ -663,9 +664,8 @@ def test_frozen_decoder_loss_matches_joint_mode(amp_dtype):
     )
 
     with torch.no_grad(), autocast:
-        # Training: hindsight waypoint (the default train policy).  The frozen
-        # path computes it from hindsight_waypoints(); joint mode uses the
-        # loss's winner.
+        # Training: hindsight commit (the default train policy).  Both paths
+        # commit from Futures with the same fp32 distance.
         joint.train()
         frozen.train()
         joint_jepa, joint_decoder = joint(
@@ -675,10 +675,10 @@ def test_frozen_decoder_loss_matches_joint_mode(amp_dtype):
             labels=labels, attention_mask=mask, training=True, right_padded=True
         )
         assert frozen_jepa["loss"] is None
-        torch.testing.assert_close(frozen_jepa["z_future"], joint_jepa["z_future"])
+        torch.testing.assert_close(frozen_jepa["committed"], joint_jepa["committed"])
         torch.testing.assert_close(frozen_decoder["loss"], joint_decoder["loss"])
 
-        # Evaluation: score-selected waypoint (the inference condition).
+        # Evaluation: pi-argmax commit (the inference condition).
         joint.eval()
         frozen.eval()
         _, joint_decoder = joint(labels=labels, attention_mask=mask, training=True)

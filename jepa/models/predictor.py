@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import NamedTuple
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -12,39 +10,7 @@ from transformers import PreTrainedModel
 
 from ..config import PredictorConfig
 from .blocks import DecoderLayer, RMSNorm
-
-
-class PredictorOutput(NamedTuple):
-    """What :class:`PredictorModel` returns (unpacks as a 3-tuple).
-
-    Shapes are for ``return_all_timesteps=True``; with ``False`` the ``seq``
-    dimension is dropped.
-
-    candidates: (batch, seq, P, D) candidate future latents.
-    scores:     (batch, seq, P) win-probability logits (pi): how likely each
-                candidate is the closest one to the real future.  Sample from
-                these to commit to one future.
-    mean:       (batch, seq, D) mu, the predicted mean of the *normalized*
-                future latent.  Its norm measures how spread the real futures
-                are (~1 = predictable, short = divergent); see
-                :func:`expected_distances`.
-    """
-
-    candidates: torch.Tensor
-    scores: torch.Tensor
-    mean: torch.Tensor
-
-
-def expected_distances(candidates, mean):
-    """Expected candidate-target distance under the loss's normalized metric.
-
-    For unit vectors ``d = 2 - 2 c·y``, and the candidate is fixed given
-    ``z_t``, so ``E[d_i | z_t] = 2 - 2 ĉ_i · E[ŷ | z_t] = 2 - 2 ĉ_i · mu``.
-
-    candidates: (..., P, D), mean: (..., D) -> (..., P)
-    """
-    directions = F.normalize(candidates.float(), dim=-1)
-    return 2.0 - 2.0 * torch.einsum("...pd,...d->...p", directions, mean.float())
+from .commitment import Futures
 
 
 class MatrixExpansion(nn.Module):
@@ -158,8 +124,8 @@ class PredictorModel(PreTrainedModel):
     non-causal transformer across the slots, and turned into
 
     * candidates ``z_t + delta_i`` (residual in latent space), and
-    * win-probability logits ``scores`` (pi): which candidate is likely the
-      closest to the real future.  Generation samples from these.
+    * win-probability logits ``pi``: which candidate is likely the closest to
+      the real future.  Commitment samples or takes the argmax of these.
 
     Separately, the mean head maps ``z_t`` to ``mu ≈ E[ŷ | z_t]``, the mean
     normalized future.  It is an auxiliary instrument (uncertainty, a
@@ -169,7 +135,8 @@ class PredictorModel(PreTrainedModel):
     Configured by :class:`jepa.config.PredictorConfig` and usable on its own::
 
         predictor = PredictorModel(PredictorConfig.from_encoder(enc_config))
-        candidates, scores, mean = predictor(latents, return_all_timesteps=False)
+        futures = predictor(latents, return_all_timesteps=False)
+        committed = futures.commit(PiArgmax()).future
     """
 
     config_class = PredictorConfig
@@ -223,7 +190,7 @@ class PredictorModel(PreTrainedModel):
                                   independently.  If False, predict only from
                                   the final latent (the others are ignored).
         Returns:
-            :class:`PredictorOutput` ``(candidates, scores, mean)`` with shapes
+            :class:`Futures` with ``candidates``, ``pi`` and ``mu`` of shapes
             (batch, seq, P, D), (batch, seq, P), (batch, seq, D) when
             ``return_all_timesteps`` is True, or (batch, P, D), (batch, P),
             (batch, D) otherwise.
@@ -245,11 +212,11 @@ class PredictorModel(PreTrainedModel):
         hidden_states = self.transformer(hidden_states)
 
         pred_deltas = self.delta_head(hidden_states)  # (N, prediction_count, target_dim)
-        scores = self.score_head(hidden_states).squeeze(-1)  # (N, prediction_count)
+        pi = self.score_head(hidden_states).squeeze(-1)  # (N, prediction_count)
         # Detached: mu is a measuring instrument and must not shape z_t.
-        mean = self.mean_head(z_t.detach())  # (N, target_dim)
+        mu = self.mean_head(z_t.detach())  # (N, target_dim)
 
-        predictions = z_t.unsqueeze(1) + pred_deltas  # (N, prediction_count, target_dim)
+        candidates = z_t.unsqueeze(1) + pred_deltas  # (N, prediction_count, target_dim)
 
         # Fix every candidate to the encoder-latent scale (per-dim RMS 1, i.e.
         # norm ~sqrt(target_dim)).  The loss compares directions only, so
@@ -258,17 +225,17 @@ class PredictorModel(PreTrainedModel):
         # (~1/norm) vanishes and they could never recover.  No learnable gain:
         # it would reintroduce the free scale.  Runs in fp32 for precise
         # statistics, like the other norms.
-        predictions = F.rms_norm(
-            predictions.float(),
+        candidates = F.rms_norm(
+            candidates.float(),
             (target_dim,),
             eps=self.config.rms_norm_eps,
-        ).to(predictions.dtype)
+        ).to(candidates.dtype)
 
         if return_all_timesteps:
-            return PredictorOutput(
-                predictions.view(batch_size, seq_len, prediction_count, target_dim),
-                scores.view(batch_size, seq_len, prediction_count),
-                mean.view(batch_size, seq_len, target_dim),
+            return Futures(
+                candidates.view(batch_size, seq_len, prediction_count, target_dim),
+                pi.view(batch_size, seq_len, prediction_count),
+                mu.view(batch_size, seq_len, target_dim),
             )
 
-        return PredictorOutput(predictions, scores, mean)
+        return Futures(candidates, pi, mu)
