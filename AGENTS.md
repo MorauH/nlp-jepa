@@ -14,7 +14,7 @@ JEPA text model (causal encoder → latent predictor → autoregressive decoder)
 - `jepa/config.py`: all component configs. `jepa/models/`: encoder, predictor, decoder, VISReg loss, `JepaModel` (no decoder), `JepaDecodeModel` (full stack).
 - `jepa/paths.py`: `data/` and `runs/` are resolved from the package location, not the CWD.
 - `data/` (tokenizer + prepared chunks) and `runs/` (checkpoints) are gitignored generated artifacts. Don't hand-edit them. Regenerating them streams FineWeb-Edu from the network and takes a long time.
-- `docs/verification.md` contains temporary planning notes, and `docs/vision.md` the long-term predictor direction (head revival/growth). Neither describes implemented behavior.
+- `docs/verification.md` contains temporary planning notes, `docs/vision.md` the long-term predictor direction (head revival/growth), and `docs/tickets/` open work items. None of them describes implemented behavior.
 
 ## Gotchas
 - Training hyperparameters (model size, AMP, `torch.compile`, decoder window, loss weights) are **module-level constants** in `jepa/training/train.py`, not CLI flags. Only data paths, batch size, epochs, `--resume`, `--jepa-only`, and `--subset` are flags; `train-decoder` adds `--model-dir`, `--output-dir`, `--lr`, `--device`, and its own `--resume`.
