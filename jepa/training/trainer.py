@@ -11,6 +11,10 @@ The trainer owns the freezing and the eval/train modes; the model itself has
 no stage flags.  A stage's loss function is compiled as a whole, while
 checkpoints are always written from the uncompiled model.
 
+Engineering settings live here as module-level constants, the single source.
+:class:`TrainConfig` carries only the per-run values.  AMP and
+``torch.compile`` are enabled only on CUDA, so a CPU run is always eager fp32.
+
 Every save also writes ``trainer_state_<stage>.pt`` (optimizer, scheduler,
 position, RNG).  ``TrainConfig.resume`` continues from it: the schedule is not
 restarted and the interrupted epoch is replayed only to skip consumed batches.
@@ -26,38 +30,44 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Callable
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import set_seed
 
-from ..models.commitment import PiArgmax
+from ..models.commitment import PiArgmax, Policy
 from ..models.jepa import JepaModel
+from ..models.losses import LossOutput
 from ..runtime import select_device
 from .data import LengthBucketBatchSampler, example_lengths, tokenize_batch
 
 STAGES = ("jepa", "decoder")
 
-
-@dataclass
-class TrainConfig:
-    """The few training knobs the loop reads.
-
-    Everything else (optimizer, AMP, compile, LR schedule, data padding) is
-    fixed by the module-level constants in ``jepa/training/train.py``.
-    """
-
-    output_dir: str | Path
-    learning_rate: float
-    batch_size: int
-    epochs: int = 1
-    stage: str = "jepa"
-    weight_decay: float = 0.01
-    seed: int = 42
-    device: str | None = None
-    num_workers: int | None = None
-    resume: bool = False
+# ---------------------------------------------------------------------------
+# Engineering settings: the single source for constants the loop reads.
+# ---------------------------------------------------------------------------
+# bf16 autocast and torch.compile apply only on CUDA; CPU runs stay eager fp32
+# so the test suite never needs a switch.
+USE_AMP = True
+COMPILE_MODEL = True
+COMPILE_MODE = "default"
+# Pad every batch to a multiple of this many tokens: aligned tensor-core tiles
+# and fewer distinct compiled shapes.
+PAD_TO_MULTIPLE_OF = 64
+# Steps between tqdm updates.  Each update synchronizes the GPU.
+LOG_EVERY = 10
+MAX_GRAD_NORM = 1.0
+WEIGHT_DECAY = 0.01
+SEED = 42
+# Linear warmup for the first WARMUP_FRACTION of steps, then cosine decay to
+# LR_FLOOR_FRACTION of the peak.
+WARMUP_FRACTION = 0.01
+LR_FLOOR_FRACTION = 0.1
+# Checkpoint every N optimizer steps as well as at epoch end.  None or 0
+# disables mid-epoch saves.
+SAVE_EVERY_STEPS = 2000
 
 
 def _cpu_count() -> int:
@@ -69,6 +79,24 @@ def _cpu_count() -> int:
     else:
         count = os.cpu_count()
     return max(1, count or 1)
+
+
+DEFAULT_NUM_WORKERS = min(8, _cpu_count())
+
+
+@dataclass
+class TrainConfig:
+    """Per-run values.  Engineering settings are the module constants above."""
+
+    output_dir: str | Path
+    learning_rate: float
+    batch_size: int
+    epochs: int = 1
+    stage: str = "jepa"
+    device: str | None = None
+    num_workers: int | None = None
+    resume: bool = False
+    save_every_steps: int | None = SAVE_EVERY_STEPS
 
 
 def _parameter_groups(model, weight_decay: float):
@@ -91,6 +119,59 @@ def _parameter_groups(model, weight_decay: float):
     ]
 
 
+def _jepa_loss(model, labels, attention_mask, progress, policy):
+    return model.jepa_loss(labels, attention_mask=attention_mask, progress=progress)
+
+
+def _decoder_loss(model, labels, attention_mask, progress, policy):
+    return model.decoder_loss(labels, attention_mask=attention_mask, policy=policy)
+
+
+# Stateless; one instance keeps torch.compile from recompiling the validation
+# graph (it guards on the object).
+_EVAL_POLICY = PiArgmax()
+
+
+@dataclass(frozen=True)
+class _Stage:
+    """The per-stage differences the loop reads, looked up once.
+
+    modules:          model attributes this stage trains; the rest freeze.
+    loss:             ``(model, labels, attention_mask, progress, policy)``.
+    prefix:           log-key prefix.
+    logs_total:       log the weighted total under ``<prefix>loss``.
+    token_weighted:   validation perplexity = exp(token-weighted mean loss).
+    validation_policy: commit rule for validation (None = stage default).
+    """
+
+    modules: tuple[str, ...]
+    loss: Callable[..., LossOutput]
+    prefix: str
+    logs_total: bool
+    token_weighted: bool
+    validation_policy: Policy | None
+
+
+_STAGES = {
+    "jepa": _Stage(
+        modules=("encoder", "predictor"),
+        loss=_jepa_loss,
+        prefix="jepa_",
+        logs_total=True,
+        token_weighted=False,
+        validation_policy=None,
+    ),
+    "decoder": _Stage(
+        modules=("decoder",),
+        loss=_decoder_loss,
+        prefix="decoder_",
+        logs_total=False,
+        token_weighted=True,
+        validation_policy=_EVAL_POLICY,
+    ),
+}
+
+
 class JepaTrainer:
     """Training loop for one stage of :class:`JepaModel`.
 
@@ -108,50 +189,33 @@ class JepaTrainer:
         eval_dataset,
         tokenizer,
         *,
-        max_grad_norm: float | None = 1.0,
         history: dict | None = None,
-        use_amp: bool = True,
-        compile_model: bool = False,
-        compile_mode: str = "default",
-        pad_to_multiple_of: int = 64,
-        log_every: int = 10,
-        save_every_steps: int | None = None,
     ):
-        if config.stage not in STAGES:
+        if config.stage not in _STAGES:
             raise ValueError(
                 f"stage must be one of {STAGES}; got {config.stage!r}"
             )
 
         self.model = model
         self.config = config
+        self.stage = _STAGES[config.stage]
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
 
-        self.max_grad_norm = max_grad_norm
-        self.use_amp = use_amp
-        self.compile_model = compile_model
-        self.compile_mode = compile_mode
-        self.pad_to_multiple_of = pad_to_multiple_of
-        self.log_every = max(1, int(log_every))
         self.num_workers = (
-            min(8, _cpu_count())
+            DEFAULT_NUM_WORKERS
             if config.num_workers is None
             else max(0, int(config.num_workers))
         )
-        # Checkpoint every N optimizer steps as well as at epoch end, so a
-        # crash loses at most N steps.  None or 0 disables mid-epoch saves.
         self.save_every_steps = (
-            int(save_every_steps) if save_every_steps else None
+            int(config.save_every_steps) if config.save_every_steps else None
         )
 
         self.history_file = f"history_{config.stage}.json"
         self._amp_dtype: torch.dtype | None = None
-        # Replaced by the compiled stage loss when compilation succeeds.
-        self._loss_fn = self._raw_loss
-        # One instance, reused: torch.compile guards on the object, so a fresh
-        # PiArgmax() per epoch would recompile the validation graph.
-        self._eval_policy = PiArgmax()
+        # Replaced by the compiled stage loss when compilation is enabled.
+        self._loss_fn = partial(self.stage.loss, self.model)
         self.history = history if history is not None else {}
         # Set by train(); _save writes them so --resume can continue the run.
         self._optimizer = None
@@ -164,15 +228,13 @@ class JepaTrainer:
     # ------------------------------------------------------------------
     def _stage_modules(self):
         """Return ``(trainable, frozen)`` module lists for this stage."""
-        if self.config.stage == "jepa":
-            return (
-                [self.model.encoder, self.model.predictor],
-                [self.model.decoder],
-            )
-        return (
-            [self.model.decoder],
-            [self.model.encoder, self.model.predictor],
-        )
+        trainable = [getattr(self.model, name) for name in self.stage.modules]
+        frozen = [
+            getattr(self.model, name)
+            for name in ("encoder", "predictor", "decoder")
+            if name not in self.stage.modules
+        ]
+        return trainable, frozen
 
     def _apply_stage(self, training: bool) -> None:
         """Set requires_grad and train/eval modes owned by the stage.
@@ -192,30 +254,23 @@ class JepaTrainer:
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
-    def _raw_loss(self, labels, attention_mask=None, progress=None, policy=None):
-        if self.config.stage == "jepa":
-            return self.model.jepa_loss(
-                labels, attention_mask=attention_mask, progress=progress
-            )
-        return self.model.decoder_loss(
-            labels, attention_mask=attention_mask, policy=policy
-        )
-
     def _losses(
         self, labels, attention_mask, progress=None, policy=None
     ) -> dict[str, torch.Tensor]:
         """Forward one batch; return the total and its components.
 
-        The JEPA stage prefixes every term and diagnostic with ``jepa_``.  The
-        decoder stage logs only the unweighted token loss.
+        Terms and diagnostics are logged under the stage's prefix.  The JEPA
+        stage also logs its weighted total as ``jepa_loss``; the decoder's
+        total is its token term.
         """
         out = self._loss_fn(labels, attention_mask, progress, policy)
-        if self.config.stage == "jepa":
-            values = {"jepa_loss": out.loss}
-            for name, value in (*out.terms.items(), *out.diagnostics.items()):
-                values[f"jepa_{name}"] = value
-        else:
-            values = {"decoder_token": out.terms["token"]}
+        prefix = self.stage.prefix
+        values = {
+            f"{prefix}{name}": value
+            for name, value in (*out.terms.items(), *out.diagnostics.items())
+        }
+        if self.stage.logs_total:
+            values[f"{prefix}loss"] = out.loss
         values["loss"] = out.loss
         return values
 
@@ -244,7 +299,7 @@ class JepaTrainer:
             # a base seed from the global RNG, which would desynchronize a
             # resumed run from the uninterrupted schedule (the shapes of the
             # VISReg slices depend on the global stream).
-            generator=torch.Generator().manual_seed(self.config.seed),
+            generator=torch.Generator().manual_seed(SEED),
         )
         if self.num_workers > 0:
             kwargs["prefetch_factor"] = 4
@@ -256,7 +311,7 @@ class JepaTrainer:
                 batch_sampler=LengthBucketBatchSampler(
                     example_lengths(dataset),
                     self.config.batch_size,
-                    seed=self.config.seed,
+                    seed=SEED,
                 ),
                 **kwargs,
             )
@@ -298,8 +353,8 @@ class JepaTrainer:
         # 0-dim tensor, not None: the same graph inputs as training under
         # torch.compile.  1.0 means the final commitment temperature.
         progress = torch.ones((), device=device)
-        # Validation is the inference condition: π-argmax, no real future.
-        policy = self._eval_policy if self.config.stage == "decoder" else None
+        policy = self.stage.validation_policy
+        token_sum = token_count = None
 
         for labels, attention_mask in val_loader:
             labels = labels.to(device, non_blocking=True)
@@ -307,9 +362,16 @@ class JepaTrainer:
             if labels.shape[1] <= horizon:
                 continue
             with self._autocast(device):
-                self._accumulate(
-                    totals, self._losses(labels, attention_mask, progress, policy)
+                values = self._losses(labels, attention_mask, progress, policy)
+                self._accumulate(totals, values)
+            if self.stage.token_weighted:
+                prefix = self.stage.prefix
+                count = values[f"{prefix}tokens"]
+                contribution = values[f"{prefix}token"] * count
+                token_sum = (
+                    contribution if token_sum is None else token_sum + contribution
                 )
+                token_count = count if token_count is None else token_count + count
             n_batches += 1
 
         self._apply_stage(training=True)
@@ -317,10 +379,10 @@ class JepaTrainer:
             return {"loss": float("nan")}
 
         averages = self._means(totals, n_batches)
-        if self.config.stage == "decoder":
-            averages["perplexity"] = math.exp(
-                min(averages["decoder_token"], 20.0)
-            )
+        if self.stage.token_weighted:
+            # One path: perplexity of the token-weighted mean token loss.
+            mean_token_loss = (token_sum / token_count.clamp_min(1)).item()
+            averages["perplexity"] = math.exp(min(mean_token_loss, 20.0))
         return averages
 
     def _state_file(self, output_dir: str | Path) -> str:
@@ -386,7 +448,7 @@ class JepaTrainer:
         device = select_device(config.device)
         print(f"Device: {device} | dataloader workers: {self.num_workers}")
 
-        set_seed(config.seed)
+        set_seed(SEED)
         self._configure_backends(device)
         self.model.to(device)
         # Freeze the other stage before building the optimizer so its
@@ -394,14 +456,17 @@ class JepaTrainer:
         self._apply_stage(training=True)
 
         # bf16 autocast on CUDA; the CPU path runs in fp32.
-        self._amp_dtype = torch.bfloat16 if self.use_amp and device.type == "cuda" else None
+        self._amp_dtype = (
+            torch.bfloat16 if USE_AMP and device.type == "cuda" else None
+        )
         amp_label = "bf16" if self._amp_dtype else "off"
+        compile_enabled = COMPILE_MODEL and device.type == "cuda"
         print(
-            f"stage: {stage} | AMP: {amp_label} | compile: {self.compile_model} "
-            f"(mode={self.compile_mode}) | pad multiple: {self.pad_to_multiple_of}"
+            f"stage: {stage} | AMP: {amp_label} | compile: {compile_enabled} "
+            f"(mode={COMPILE_MODE}) | pad multiple: {PAD_TO_MULTIPLE_OF}"
         )
 
-        if self.compile_model:
+        if compile_enabled:
             # ``dynamic=True`` keeps the varying sequence lengths and the
             # variable number of valid tokens from triggering a recompile for
             # every batch shape; ``suppress_errors`` falls back to eager
@@ -413,7 +478,7 @@ class JepaTrainer:
                 # Compile only the stage's loss: the other stage's modules are
                 # frozen and must stay out of the graph.
                 self._loss_fn = torch.compile(
-                    self._raw_loss, mode=self.compile_mode, dynamic=True
+                    self._loss_fn, mode=COMPILE_MODE, dynamic=True
                 )
                 print(f"torch.compile: enabled for {stage} loss")
             except Exception as exc:  # pragma: no cover - depends on the backend
@@ -421,13 +486,13 @@ class JepaTrainer:
                     f"torch.compile failed ({exc!r}); continuing eagerly.",
                     RuntimeWarning,
                 )
-                self._loss_fn = self._raw_loss
+                self._loss_fn = partial(self.stage.loss, self.model)
 
         optimizer_kwargs = {}
         if device.type == "cuda":
             # Fused AdamW keeps the whole update in one CUDA kernel.
             optimizer_kwargs["fused"] = True
-        groups = _parameter_groups(self.model, config.weight_decay)
+        groups = _parameter_groups(self.model, WEIGHT_DECAY)
         try:
             optimizer = torch.optim.AdamW(
                 groups, lr=config.learning_rate, **optimizer_kwargs
@@ -443,7 +508,7 @@ class JepaTrainer:
         collate = partial(
             tokenize_batch,
             tokenizer=self.tokenizer,
-            pad_to_multiple_of=self.pad_to_multiple_of,
+            pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
         )
         train_loader = self._make_loader(
             self.train_dataset, shuffle=True, device=device, collate_fn=collate
@@ -455,16 +520,14 @@ class JepaTrainer:
         horizon = self.model.pred_horizon
         num_epochs = max(1, int(config.epochs))
 
-        # Linear warmup for the first 1% of steps, then cosine decay to 10%.
         total_steps = max(1, len(train_loader) * num_epochs)
-        warmup_steps = max(1, int(total_steps * 0.01))
-        eta_min_ratio = 0.1
+        warmup_steps = max(1, int(total_steps * WARMUP_FRACTION))
 
         def lr_lambda(step):
             if step < warmup_steps:
                 return (step + 1) / warmup_steps
             progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return eta_min_ratio + (1 - eta_min_ratio) * 0.5 * (
+            return LR_FLOOR_FRACTION + (1 - LR_FLOOR_FRACTION) * 0.5 * (
                 1 + math.cos(math.pi * progress)
             )
 
@@ -508,6 +571,8 @@ class JepaTrainer:
             )
 
         self._device = device
+        prefix = self.stage.prefix
+        score_key = prefix + ("loss" if self.stage.logs_total else "token")
 
         for epoch in range(start_epoch, num_epochs):
             self._apply_stage(training=True)
@@ -548,9 +613,9 @@ class JepaTrainer:
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                if self.max_grad_norm is not None:
+                if MAX_GRAD_NORM is not None:
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.max_grad_norm
+                        self.model.parameters(), MAX_GRAD_NORM
                     )
                 optimizer.step()
                 scheduler.step()
@@ -559,13 +624,13 @@ class JepaTrainer:
                 n_batches += 1
                 global_step += 1
 
-                if n_batches % self.log_every == 0:
+                if n_batches % LOG_EVERY == 0:
                     means = self._means(totals, n_batches)
                     postfix = {"loss": f"{means['loss']:.4f}"}
-                    if "jepa_loss" in means:
-                        postfix["jepa"] = f"{means['jepa_loss']:.4f}"
-                    if "decoder_token" in means:
-                        postfix["dec"] = f"{means['decoder_token']:.4f}"
+                    if score_key in means:
+                        postfix[score_key.removeprefix(prefix)] = (
+                            f"{means[score_key]:.4f}"
+                        )
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
                     pbar.set_postfix(postfix)
 
@@ -607,18 +672,20 @@ class JepaTrainer:
                 self.history.setdefault(f"val_{name}", []).append(value)
 
             def describe(means: dict[str, float]) -> str:
-                parts = ", ".join(
-                    f"{name.replace('_loss', '')} {value:.4f}"
-                    for name, value in means.items()
-                    if name in ("jepa_loss", "decoder_token")
+                parts = (
+                    f"{score_key.removeprefix(prefix)} {means[score_key]:.4f}"
+                    if score_key in means
+                    else ""
                 )
                 return f"{means['loss']:.4f} ({parts})"
 
             def describe_terms(means: dict[str, float]) -> str:
+                if not self.stage.logs_total:
+                    return ""
                 return ", ".join(
-                    f"{name.removeprefix('jepa_')} {value:.4f}"
+                    f"{name.removeprefix(prefix)} {value:.4f}"
                     for name, value in means.items()
-                    if name.startswith("jepa_") and name != "jepa_loss"
+                    if name.startswith(prefix) and name != score_key
                 )
 
             summary = (

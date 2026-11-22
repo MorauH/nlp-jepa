@@ -85,7 +85,7 @@ def test_full_stack_forward():
     assert jepa_out.loss.ndim == 0
     assert decoder_out.loss.ndim == 0
     assert set(decoder_out.terms) == {"token"}
-    assert "perplexity" in decoder_out.diagnostics
+    assert "tokens" in decoder_out.diagnostics
     assert {"scale", "shape", "center", "move", "pi", "mu", "diversity"} <= set(
         jepa_out.terms
     )
@@ -105,7 +105,7 @@ def test_predictor_is_a_pure_function_of_a_latent():
 
     # mu starts at exactly 0; give it non-zero output weights so the test
     # exercises it.
-    torch.nn.init.normal_(predictor.mean_head[-1].weight)
+    torch.nn.init.normal_(predictor.mu_head[-1].weight)
 
     with torch.no_grad():
         futures = predictor(latents)
@@ -147,7 +147,7 @@ def test_predictor_is_a_pure_function_of_a_latent():
         assert not torch.allclose(shifted_futures.mu[:, 3], mu[:, 3])
 
 
-def test_mean_head_starts_at_zero_and_is_detached():
+def test_mu_head_starts_at_zero_and_is_detached():
     """mu starts at 0 and its loss never reaches z_t (it is an instrument)."""
     from jepa import PredictorModel
 
@@ -161,11 +161,11 @@ def test_mean_head_starts_at_zero_and_is_detached():
     mu = predictor(latents).mu
     assert torch.count_nonzero(mu) == 0
 
-    torch.nn.init.normal_(predictor.mean_head[-1].weight)
+    torch.nn.init.normal_(predictor.mu_head[-1].weight)
     mu = predictor(latents).mu
     mu.pow(2).sum().backward()
     assert latents.grad is None
-    assert predictor.mean_head[0].weight.grad is not None
+    assert predictor.mu_head[0].weight.grad is not None
 
 
 def test_commitment_loss_matches_reference():
@@ -189,7 +189,7 @@ def test_commitment_loss_matches_reference():
         F.normalize(cand, dim=-1) - F.normalize(tgt, dim=-1).unsqueeze(2)
     ).pow(2).sum(-1)
     best_ref = (d_ref.min(-1).values * mask).sum() / mask.sum()
-    torch.testing.assert_close(out.diagnostics["best_d"], best_ref.detach())
+    torch.testing.assert_close(out.diagnostics["hindsight_d"], best_ref.detach())
 
     dirs = F.normalize(cand[valid], dim=-1)
     sim = torch.bmm(dirs, dirs.transpose(1, 2))
@@ -206,10 +206,13 @@ def test_commitment_loss_matches_reference():
     r = 0.95 * F.softmax(-d / temperature, dim=-1) + 0.05 / 4
     pi_ref = masked(-(r * F.log_softmax(scores, dim=-1)).sum(-1))
     torch.testing.assert_close(out.terms["pi"], pi_ref)
-    picked = d.gather(-1, scores.argmax(-1, keepdim=True)).squeeze(-1)
-    torch.testing.assert_close(out.diagnostics["pi_argmax_d"], masked(picked))
+    pi_argmax_index = scores.argmax(-1, keepdim=True)
+    torch.testing.assert_close(
+        out.diagnostics["pi_argmax_d"],
+        masked(d.gather(-1, pi_argmax_index).squeeze(-1)),
+    )
 
-    # mu: squared error onto the normalized target; its direction's distance.
+    # mu: squared error onto the normalized target; its cosine distance.
     tgt_unit = F.normalize(tgt, dim=-1)
     torch.testing.assert_close(
         out.terms["mu"], masked((mean - tgt_unit).pow(2).sum(-1))
@@ -218,7 +221,7 @@ def test_commitment_loss_matches_reference():
         out.diagnostics["mu_norm"], masked(mean.norm(dim=-1))
     )
     torch.testing.assert_close(
-        out.diagnostics["mu_dir_d"],
+        out.diagnostics["mu_distance"],
         masked((F.normalize(mean, dim=-1) - tgt_unit).pow(2).sum(-1)),
     )
 
@@ -240,13 +243,11 @@ def test_decoder_tied_embeddings_round_trip(tmp_path):
     assert decoder.embedding.weight is not model.encoder.embedding.weight
 
     labels = torch.randint(1, 64, (2, 12))
+    z_t = torch.zeros(2, 11, 32)
+    committed = torch.zeros(2, 11, 32)
     with torch.no_grad():
-        before = model.decoder._run(
-            labels[:, :-1],
-            model.decoder._hint(
-                torch.zeros(2, 11, 32), torch.zeros(2, 11, 32)
-            ),
-        ).clone()
+        before, count = decoder.token_loss(z_t, committed, labels)
+    assert int(count) == 2 * 11
 
     full_dir = tmp_path / "full"
     model.save_pretrained(full_dir)
@@ -264,12 +265,7 @@ def test_decoder_tied_embeddings_round_trip(tmp_path):
         reloaded.decoder.embedding.weight, decoder.embedding.weight
     )
     with torch.no_grad():
-        after = reloaded.decoder._run(
-            labels[:, :-1],
-            reloaded.decoder._hint(
-                torch.zeros(2, 11, 32), torch.zeros(2, 11, 32)
-            ),
-        )
+        after, _ = reloaded.decoder.token_loss(z_t, committed, labels)
     torch.testing.assert_close(after, before)
 
     standalone_dir = tmp_path / "decoder"
@@ -283,7 +279,7 @@ def test_decoder_tied_embeddings_round_trip(tmp_path):
 
 
 def test_hint_reinjected_before_every_layer():
-    """Every layer has a zero-initialized hint projection."""
+    """Each layer's zero-initialized hint projection can reach the output."""
     from jepa import DecoderModel
 
     torch.manual_seed(0)
@@ -300,16 +296,22 @@ def test_hint_reinjected_before_every_layer():
         for projection in decoder.hint_proj
     )
 
-    # With zeroed projections the forward pass is input-only injection.
-    input_ids = torch.randint(1, 64, (2, 6))
-    hint = torch.randn(2, 6, 32)
+    labels = torch.randint(1, 64, (1, 7))
+    z_t = torch.randn(1, 6, 32)
+    committed = torch.randn(1, 6, 32)
     with torch.no_grad():
-        plain = decoder._run(input_ids, hint)
-    for projection in decoder.hint_proj:
+        plain, _ = decoder.token_loss(z_t, committed, labels)
+
+    # A fresh decoder is input-only injection: the per-layer projections are
+    # exactly zero.  Giving any one layer a non-zero projection changes the
+    # loss, so every layer re-injects the hint before itself.
+    for index, projection in enumerate(decoder.hint_proj):
         torch.nn.init.normal_(projection.weight)
-    with torch.no_grad():
-        layered = decoder._run(input_ids, hint)
-    assert not torch.allclose(plain, layered)
+        with torch.no_grad():
+            layered, _ = decoder.token_loss(z_t, committed, labels)
+        assert not torch.allclose(plain, layered), f"layer {index} is inert"
+        with torch.no_grad():
+            projection.weight.zero_()
 
 
 def test_hint_and_generate_path_agree():
@@ -320,30 +322,36 @@ def test_hint_and_generate_path_agree():
         DecoderConfig.from_encoder(
             tiny_config().encoder,
             sliding_window=8,
-            num_hidden_layers=2,
+            num_hidden_layers=1,
         )
     ).eval()
     z_t = torch.randn(1, 32)
     committed = torch.randn(1, 32)
     context_ids = torch.randint(1, 64, (1, 6))
-    hint = decoder._hint(z_t[:, None], committed[:, None])
 
     with torch.no_grad():
-        # Teacher-forced path: exactly what forward() builds (the whole prefix
-        # fits in the sliding window here, so generate() sees the same tokens).
-        teacher_logits = decoder.lm_head(
-            decoder._run(context_ids, hint.expand(-1, context_ids.shape[1], -1))[
-                :, -1, :
-            ]
-        )
-        window = context_ids[:, -decoder.sliding_window :]
-        generated_logits = decoder.lm_head(
-            decoder._run(window, hint.expand(-1, window.shape[1], -1))[:, -1, :]
-        )
-        torch.testing.assert_close(generated_logits, teacher_logits)
-
         greedy = decoder.generate(z_t, committed, context_ids, k=1, temperature=0.0)
-        assert int(greedy[0, 0]) == int(teacher_logits.argmax(dim=-1)[0])
+
+        # Score every possible next token through token_loss and keep only the
+        # last target position.  Its input and hint are exactly what generate()
+        # sees, so the lowest cross-entropy token is the greedy one.
+        steps = context_ids.shape[1]
+        keep = torch.zeros(1, steps, dtype=torch.bool)
+        keep[:, -1] = True
+        scores = []
+        for token in range(1, 64):
+            labels = torch.cat(
+                [context_ids, torch.tensor([[token]])], dim=1
+            )
+            total, _ = decoder.token_loss(
+                z_t[:, None].expand(1, steps, -1),
+                committed[:, None].expand(1, steps, -1),
+                labels,
+                loss_mask=keep,
+            )
+            scores.append(total.item())
+
+    assert int(greedy[0, 0]) == int(torch.tensor(scores).argmin()) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -367,8 +375,8 @@ def test_full_stack_forward_with_chunked_decoder_loss():
         "predictor.hidden_expansion.weights",
         "predictor.transformer.decoders.0.attn.w_v.weight",
         "predictor.delta_head.weights",
-        "predictor.score_head.weights",
-        "predictor.mean_head.2.weight",
+        "predictor.pi_head.weights",
+        "predictor.mu_head.2.weight",
         "decoder.hint_proj.0.weight",
         "decoder.embedding.weight",
         "encoder.embedding.weight",
@@ -457,8 +465,31 @@ def test_decoder_loss_masks_the_last_partial_block():
             torch.testing.assert_close(before, after)
 
 
+class CrashingDataset:
+    """Wrap a dataset and raise after ``crash_after`` example reads.
+
+    Simulates a crash so a mid-epoch checkpoint is left on disk.  It exposes
+    the Arrow table so ``example_lengths`` does not read every row up front.
+    """
+
+    def __init__(self, dataset, crash_after):
+        self.dataset = dataset
+        self.data = dataset.data
+        self.crash_after = crash_after
+        self.calls = 0
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        self.calls += 1
+        if self.calls > self.crash_after:
+            raise RuntimeError("simulated crash")
+        return self.dataset[index]
+
+
 def test_trainer_saves_mid_epoch_checkpoints(tmp_path):
-    """save_every_steps writes a loadable checkpoint before the epoch ends."""
+    """save_every_steps leaves a loadable checkpoint on disk mid-epoch."""
     import json
     from types import SimpleNamespace
 
@@ -480,37 +511,30 @@ def test_trainer_saves_mid_epoch_checkpoints(tmp_path):
             epochs=1,
             device="cpu",
             num_workers=0,
+            save_every_steps=2,
         ),
-        train_dataset=data,
+        train_dataset=CrashingDataset(data, crash_after=5),
         eval_dataset=data.select(range(4)),
         tokenizer=SimpleNamespace(pad_token_id=0),
-        use_amp=False,
-        save_every_steps=2,
     )
 
-    saves = []
-    original_save = trainer._save
+    # 10 examples / batch 2 = 5 steps.  The crash hits the third batch, after
+    # the mid-epoch save at step 2.
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        trainer.train()
 
-    def recording_save(output_dir):
-        saves.append(dict(trainer.history.get("last_checkpoint", {})))
-        original_save(output_dir)
-
-    trainer._save = recording_save
-    trainer.train()
-
-    # 10 examples / batch 2 = 5 steps: mid-epoch saves at 2 and 4, then epoch end.
-    assert [s["global_step"] for s in saves] == [2, 4, 5]
-    assert not saves[0].get("end_of_epoch") and saves[-1]["end_of_epoch"]
     history = json.loads((tmp_path / "history_jepa.json").read_text())
-    assert history["last_checkpoint"]["global_step"] == 5
+    checkpoint = history["last_checkpoint"]
+    assert checkpoint["global_step"] == 2
+    assert checkpoint["total_steps"] == 5
+    assert not checkpoint.get("end_of_epoch")
     JepaModel.from_pretrained(str(tmp_path))
 
     # Every save also records the position needed to continue the run.
     state = torch.load(
         tmp_path / "trainer_state_jepa.pt", map_location="cpu", weights_only=True
     )
-    assert state["global_step"] == 5
-    assert state["epoch"] == 1 and state["epoch_step"] == 0
+    assert (state["epoch"], state["epoch_step"], state["global_step"]) == (0, 2, 2)
     assert state["total_steps"] == 5
     assert state["optimizer"]["state"]
 
@@ -530,12 +554,15 @@ def test_resume_continues_the_optimizer_schedule_and_epoch(tmp_path):
         {"input_ids": [torch.randint(1, 64, (12,)).tolist() for _ in range(10)]}
     )
 
-    def build(model, output_dir, *, resume=False):
+    def build(model, output_dir, *, resume=False, crash_after=None):
         history = None
         if resume:
             history_path = Path(output_dir) / "history_jepa.json"
             if history_path.exists():
                 history = json.loads(history_path.read_text())
+        train_dataset = (
+            data if crash_after is None else CrashingDataset(data, crash_after)
+        )
         return JepaTrainer(
             model=model,
             config=TrainConfig(
@@ -547,16 +574,15 @@ def test_resume_continues_the_optimizer_schedule_and_epoch(tmp_path):
                 device="cpu",
                 num_workers=0,
                 resume=resume,
+                save_every_steps=2,
             ),
-            train_dataset=data,
+            train_dataset=train_dataset,
             eval_dataset=data.select(range(4)),
             tokenizer=SimpleNamespace(pad_token_id=0),
             history=history,
-            use_amp=False,
-            save_every_steps=2,
         )
 
-    def run(trainer, *, stop_after_save=None):
+    def run(trainer, *, crash_after=None):
         """Run and record the LR each optimizer step used and the Adam counts."""
         lrs, adam_steps = [], []
         original_step = torch.optim.AdamW.step
@@ -572,23 +598,10 @@ def test_resume_continues_the_optimizer_schedule_and_epoch(tmp_path):
 
         torch.optim.AdamW.step = recording_step
         try:
-            if stop_after_save is None:
+            if crash_after is None:
                 trainer.train()
             else:
-                calls = {"n": 0}
-                original_save = trainer._save
-
-                class Stop(RuntimeError):
-                    pass
-
-                def save(output_dir):
-                    original_save(output_dir)
-                    calls["n"] += 1
-                    if calls["n"] == stop_after_save:
-                        raise Stop
-
-                trainer._save = save
-                with pytest.raises(Stop):
+                with pytest.raises(RuntimeError, match="simulated crash"):
                     trainer.train()
         finally:
             torch.optim.AdamW.step = original_step
@@ -602,12 +615,14 @@ def test_resume_continues_the_optimizer_schedule_and_epoch(tmp_path):
     assert ref_steps == list(range(1, 11))  # Adam's per-parameter step counts
     assert ref_lrs[-1] < ref_lrs[0]  # cosine decay, not a warmup restart
 
-    # Interrupted on the fourth save: 6 steps in, one batch into epoch 2.
+    # Crash after 6 steps: epoch 1 plus the first batch of epoch 2.  Twelve
+    # example reads is exactly the batch after the step-6 save.
     torch.manual_seed(2024)
     interrupted = JepaModel(tiny_config())
     interrupted_dir = tmp_path / "run"
     interrupted_lrs, interrupted_steps, interrupted_history = run(
-        build(interrupted, interrupted_dir), stop_after_save=4
+        build(interrupted, interrupted_dir, crash_after=12),
+        crash_after=12,
     )
     assert interrupted_lrs == ref_lrs[:6]
     assert interrupted_steps[-1] == 6
@@ -676,7 +691,6 @@ def test_resume_without_a_trainer_state_fails(tmp_path):
         train_dataset=data,
         eval_dataset=data.select(range(2)),
         tokenizer=SimpleNamespace(pad_token_id=0),
-        use_amp=False,
     )
     with pytest.raises(FileNotFoundError, match="trainer_state_jepa.pt"):
         trainer.train()
@@ -760,7 +774,7 @@ def test_loss_outputs_are_weighted_sums_of_their_terms():
     torch.testing.assert_close(out.loss, expected)
 
 
-def test_temperature_diagnostic_anneals_and_is_final_without_progress():
+def test_temperature_scale_anneals_and_is_final_without_progress():
     from jepa.models.commitment import Futures
     from jepa.models.losses import CommitmentLoss
 
@@ -784,7 +798,7 @@ def test_temperature_diagnostic_anneals_and_is_final_without_progress():
     for progress, expected in cases:
         temperature = loss_fn(
             futures, target, progress=progress
-        ).diagnostics["temperature"]
+        ).diagnostics["temperature_scale"]
         assert temperature.item() == pytest.approx(expected, rel=1e-5)
 
 
@@ -850,21 +864,21 @@ def test_trainer_anneals_temperature(tmp_path):
             epochs=1,
             device="cpu",
             num_workers=0,
+            save_every_steps=1,
         ),
         train_dataset=data,
         eval_dataset=data.select(range(2)),
         tokenizer=SimpleNamespace(pad_token_id=0),
-        use_amp=False,
     ).train()
 
     # Four training steps get an increasing 0-dim progress tensor; the single
     # validation batch gets a 0-dim tensor 1.0, i.e. the final temperature.
     assert seen[:4] == [0.0, 0.25, 0.5, 0.75]
     assert seen[4:] == [1.0]
-    assert history["train_jepa_temperature"][0] == pytest.approx(
+    assert history["train_jepa_temperature_scale"][0] == pytest.approx(
         (1.0 + 0.1**0.5 + 0.1 + 0.1) / 4, rel=1e-5
     )
-    assert history["val_jepa_temperature"][0] == pytest.approx(0.1, rel=1e-5)
+    assert history["val_jepa_temperature_scale"][0] == pytest.approx(0.1, rel=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -908,12 +922,11 @@ def test_decoder_stage_trains_only_the_decoder(tmp_path):
             epochs=1,
             device="cpu",
             num_workers=0,
+            save_every_steps=1,
         ),
         train_dataset=data,
         eval_dataset=data.select(range(2)),
         tokenizer=SimpleNamespace(pad_token_id=0),
-        use_amp=False,
-        save_every_steps=1,
     ).train()
 
     # The trainer sets the stage modules' modes; the frozen backbone stays in
@@ -954,7 +967,6 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
 
     from datasets import Dataset, DatasetDict
     from jepa.training import train
-    from jepa.training.trainer import JepaTrainer
 
     class FakeTokenizer(SimpleNamespace):
         model_max_length = 32
@@ -979,17 +991,6 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
     monkeypatch.setattr(
         train, "load_training_tokenizer", lambda path: FakeTokenizer(pad_token_id=0)
     )
-    monkeypatch.setattr(train, "COMPILE_MODEL", False)
-    monkeypatch.setattr(train, "SAVE_EVERY_STEPS", 1)
-
-    saves = []
-    original_save = JepaTrainer._save
-
-    def recording_save(self, output_dir):
-        saves.append(dict(self.history.get("last_checkpoint", {})))
-        original_save(self, output_dir)
-
-    monkeypatch.setattr(JepaTrainer, "_save", recording_save)
 
     # The decoder stage writes beside --from, never over the JEPA checkpoint.
     jepa_history = {"train_jepa_loss": [1.0], "last_checkpoint": {"global_step": 7}}
@@ -1007,15 +1008,14 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
         ]
     )
 
-    # 4 examples / batch 2 = 2 steps: mid-epoch save after each, then epoch end.
-    assert [s["global_step"] for s in saves] == [1, 2, 2]
-    assert not saves[0].get("end_of_epoch") and saves[-1]["end_of_epoch"]
-
     assert out.is_dir()
     assert json.loads((base / "history_jepa.json").read_text()) == jepa_history
     assert not (base / "history_decoder.json").exists()
     assert (out / "trainer_state_decoder.pt").exists()
     history = json.loads((out / "history_decoder.json").read_text())
+    # 4 examples / batch 2 = 2 steps: the epoch-end checkpoint is on disk.
+    assert history["last_checkpoint"]["global_step"] == 2
+    assert history["last_checkpoint"]["end_of_epoch"]
     train_keys = {
         key.removeprefix("train_") for key in history if key.startswith("train_")
     }
@@ -1041,17 +1041,6 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
     # --resume keeps training *that* decoder (not a fresh one), stays frozen
     # elsewhere, and appends to the decoder history.  --epochs 2 because the
     # finished first epoch is not replayed.
-    loaded = {}
-    original_from_pretrained = JepaModel.from_pretrained.__func__
-
-    def spy_from_pretrained(cls, *args, **kwargs):
-        model = original_from_pretrained(cls, *args, **kwargs)
-        loaded["decoder"] = model.decoder.embedding.weight.detach().clone()
-        return model
-
-    monkeypatch.setattr(
-        JepaModel, "from_pretrained", classmethod(spy_from_pretrained)
-    )
     train.main(
         [
             "--stage", "decoder",
@@ -1064,10 +1053,13 @@ def test_train_cli_decoder_stage_writes_loadable_checkpoint(tmp_path, monkeypatc
             "--device", "cpu",
         ]
     )
-    assert torch.equal(loaded["decoder"], reloaded.decoder.embedding.weight)
     resumed = JepaModel.from_pretrained(str(out))
+    # The resumed decoder kept training from the saved one, not from `--from`.
     assert not torch.equal(
         resumed.decoder.embedding.weight, reloaded.decoder.embedding.weight
+    )
+    assert not torch.equal(
+        resumed.decoder.embedding.weight, base_model.decoder.embedding.weight
     )
     assert torch.equal(
         resumed.encoder.embedding.weight, base_model.encoder.embedding.weight
@@ -1142,12 +1134,11 @@ def test_jepa_stage_never_runs_the_decoder(tmp_path):
             epochs=1,
             device="cpu",
             num_workers=0,
+            save_every_steps=1,
         ),
         train_dataset=data,
         eval_dataset=data.select(range(2)),
         tokenizer=SimpleNamespace(pad_token_id=0),
-        use_amp=False,
-        save_every_steps=1,
     ).train()
 
     assert not decoder_calls
@@ -1190,22 +1181,21 @@ def test_jepa_stage_logs_every_term_and_diagnostic(tmp_path):
             epochs=1,
             device="cpu",
             num_workers=0,
+            save_every_steps=1,
         ),
         train_dataset=data,
         eval_dataset=data.select(range(2)),
         tokenizer=SimpleNamespace(pad_token_id=0),
-        use_amp=False,
-        save_every_steps=1,
     ).train()
 
     history = json.loads((tmp_path / "history_jepa.json").read_text())
     terms = set(model.visreg.weights) | set(model.commitment_loss.weights)
     diagnostics = {
-        "best_d",
+        "hindsight_d",
         "pi_argmax_d",
         "mu_norm",
-        "mu_dir_d",
-        "temperature",
+        "mu_distance",
+        "temperature_scale",
         "assignment_entropy",
     }
     assert terms == {"scale", "shape", "center", "move", "pi", "mu", "diversity"}

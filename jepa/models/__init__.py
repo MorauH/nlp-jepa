@@ -7,6 +7,8 @@ from .commitment import (
     MuSafe,
     PiArgmax,
     PiSample,
+    distance,
+    pairwise_distance,
     policy,
     rollout,
 )
@@ -31,6 +33,8 @@ __all__ = [
     "MuSafe",
     "PiArgmax",
     "PiSample",
+    "distance",
+    "pairwise_distance",
     "policy",
     "rollout",
 ]

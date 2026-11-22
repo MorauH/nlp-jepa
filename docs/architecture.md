@@ -20,12 +20,15 @@ latent, a clear single future instead of μ's average of all of them.
   function of one latent. It expands `z_t` into `P` slots, mixes them with a
   small non-causal Transformer, and returns candidate futures, π logits and μ.
   Candidates are RMS-normalized to the encoder-latent scale, so the loss
-  compares directions.
+  compares normalized latents.
 - **Commitment** (`jepa/models/commitment.py`): `Futures` holds candidates, π
-  and μ, and owns the candidate-target distance `2 - 2 cos`. A **policy**
-  ranks candidates (hindsight, π-argmax, π-sample, μ-safe); `commit` returns
-  one candidate and its index; `rollout` repeats that from the committed
-  future. Averaging candidates is never a commit.
+  and μ. The module owns `distance` (the cosine distance `2 - 2 cos`, fp32,
+  autocast off, clamped at 0) and `candidate_similarity` (the pairwise cosine
+  matrix). A **policy** ranks candidates (hindsight, π-argmax, π-sample,
+  μ-safe); `commit` returns one candidate and its index; `rollout` repeats
+  that from the committed future. Averaging candidates is never a commit.
+  `jepa/models/sampling.py` holds the top-k mask shared by π-sample and the
+  token decoder.
 - **Decoder** (`jepa/models/decoder.py`, `DecoderConfig`): an autoregressive
   token Transformer. Each position is conditioned on a **hint**: the latent at
   the block start and the committed future at the block end. The hint is added
@@ -97,7 +100,8 @@ target. A hindsight commit is still a predictor output, but its choice among
 bits about that future (intended teacher forcing). A π-argmax hint carries
 none. Validation and measurement report both, so the hindsight row is a
 teacher-forced lower bound on the decoder cross-entropy, not the inference
-number.
+number. Validation perplexity is `exp` of the token-weighted mean token loss
+(weighted by the `tokens` diagnostic), not a mean of per-batch perplexities.
 
 ## Configuration
 
@@ -122,11 +126,14 @@ raises `ValueError` on a conflict. `DecoderConfig.loss_chunk_size` bounds the
 logits tensor in the token loss.
 
 Engineering choices that are not the experiment live as module-level constants
-in `jepa/training/train.py` and `jepa/training/trainer.py`: bf16 autocast on
-CUDA, fused AdamW, TF32, `torch.compile` of the stage loss, the warmup+cosine
-schedule, batch padding, `LOG_EVERY`, `SAVE_EVERY_STEPS`, and the stage batch
-size / epoch / learning-rate defaults. Checkpoints are saved from the
-uncompiled module.
+in `jepa/training/trainer.py`, the single source: bf16 autocast and
+`torch.compile` (both CUDA-only), fused AdamW, TF32, the warmup+cosine
+schedule (`WARMUP_FRACTION`, `LR_FLOOR_FRACTION`), gradient clipping, weight
+decay, the seed, batch padding, `LOG_EVERY` and `SAVE_EVERY_STEPS`.
+`TrainConfig` carries only per-run values (stage, output dir, batch size,
+epochs, learning rate, device, resume, workers, save interval); the CLI sets
+per-stage defaults and nothing else. Checkpoints are saved from the uncompiled
+module.
 
 ## Data preparation
 
@@ -172,12 +179,13 @@ latents. The JSON has one dict per section:
   and VISReg terms — the no-collapse checks.
 - `loss`: every JEPA term with its weight and weighted contribution, plus the
   π floor (`H(r)` and `KL(r||π)`).
-- `heads`: candidate separations, win shares and live slots, π's NLL gain over
-  a constant distribution and its accuracy, μ's norm and calibration.
+- `heads`: candidate separation, hindsight shares and live slots, π's NLL
+  gain over a constant distribution and its accuracy, μ's norm and distance
+  calibration.
 - `policies`: depth-1 distance to the real future for copy, hindsight,
-  π-argmax, π-sample, μ-safe, μ-direction and the best fixed slot. The paper's
-  main table is this one plus the rollout rows: oracle gain over μ-direction
-  is what candidates buy; selection headroom is what a better selector could
+  π-argmax, π-sample, μ-safe, μ and the lowest-distance fixed slot. The
+  paper's main table is this one plus the rollout rows: hindsight gain over μ
+  is what candidates buy; commit headroom is what a better commit rule could
   add.
 - `rollouts`: **rollout error** and **manifold distance** per depth for
   hindsight, π-argmax, π-sample and μ, with the `real` row as calibration. The
@@ -201,5 +209,5 @@ decoder:
 python -m jepa generate --prompt "When in Rome, " --steps 3 --temperature 0.8
 ```
 
-`--direction-temperature` / `--direction-top-k` control the commit from π;
+`--commit-temperature` / `--commit-top-k` control the commit from π;
 `--temperature` / `--top-k` control token sampling.

@@ -17,16 +17,24 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from ..config import EncoderConfig
 from ..data.tokenizer import load_tokenizer
-from ..models.commitment import Hindsight, MuSafe, PiArgmax, PiSample, rollout
+from ..models.commitment import (
+    Hindsight,
+    MuSafe,
+    PiArgmax,
+    PiSample,
+    distance,
+    pairwise_distance,
+    rollout,
+)
 from ..models.jepa import JepaModel, build_block_hints
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
 from ..runtime import select_device
-from ..training.data import tokenize_batch
-from ..training.train import load_datasets
+from ..training.data import load_datasets, tokenize_batch
 
 DEFAULT_QUERY_EXAMPLES = 64
-DEFAULT_MAX_LENGTH = 1024
+DEFAULT_MAX_LENGTH = EncoderConfig().max_position_embeddings
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_BANK_SIZE = 50_000
 DEFAULT_ROLLOUT_POSITIONS = 2_048
@@ -48,11 +56,6 @@ def _generator(device, seed: int) -> torch.Generator:
     generator.manual_seed(seed)
     return generator
 
-def _cosine_distance(a, b):
-    """``2 - 2 cos`` for vectors that are not candidates."""
-    a, b = F.normalize(a.float(), dim=-1), F.normalize(b.float(), dim=-1)
-    return (2.0 - 2.0 * (a * b).sum(-1)).clamp_min(0.0)
-
 def _prediction_mask(mask, horizon: int):
     """A real token with a real token ``horizon`` ahead."""
     return mask[:, :-horizon].bool() & mask[:, horizon:].bool()
@@ -61,8 +64,9 @@ def _walk(latents, masks, horizon: int):
     for z, mask in zip(latents, masks):
         yield z[:, :-horizon], z[:, horizon:], _prediction_mask(mask, horizon)
 
-def _picked_distance(distances, futures, policy, valid):
-    index = futures.commit(policy).index[valid]
+def _commit_distance(distances, futures, policy, valid, target=None):
+    """Distance of the candidate ``policy`` commits to, one per valid position."""
+    index = futures.commit(policy, target).index[valid]
     return distances.gather(-1, index[:, None]).squeeze(-1)
 
 def _mu_path(predictor, z, steps: int):
@@ -75,11 +79,10 @@ def _mu_path(predictor, z, steps: int):
     return torch.stack(path, dim=-2)
 
 def _manifold_scores(points, bank, chunk_size):
-    """Nearest-neighbour distance of each row to the normalized bank."""
-    points = F.normalize(points.float(), dim=-1)
+    """Nearest-neighbour distance of each row to the bank."""
     chunk_size = chunk_size or max(1, 4_000_000 // bank.shape[0])
     rows = [
-        (2.0 - 2.0 * (points[i : i + chunk_size] @ bank.T).max(-1).values).clamp_min(0.0)
+        pairwise_distance(points[i : i + chunk_size], bank).min(dim=-1).values
         for i in range(0, points.shape[0], chunk_size)
     ]
     return torch.cat(rows)
@@ -200,47 +203,53 @@ def _heads_section(model, batches, latents) -> dict:
     masks = [mask for _, mask in batches]
     prediction_count = model.config.predictor.prediction_count
     count = 0
-    best_sum = pair_sim_sum = delta_sum = z_norm_sum = 0.0
-    pi_nll_sum = mu_norm_sum = mu_dir_sum = 0.0
+    pair_sim_sum = delta_sum = z_norm_sum = 0.0
+    pi_nll_sum = mu_norm_sum = mu_distance_sum = 0.0
     pair_count = correct = 0
-    win_counts = torch.zeros(prediction_count, dtype=torch.long)
+    hindsight_counts = torch.zeros(prediction_count, dtype=torch.long)
     for z_t, future, valid in _walk(latents, masks, horizon):
         if not valid.any():
             continue
         futures = model.predictor(z_t)
-        distances = futures.distances(future)[valid]
         future_valid, z_valid = future[valid].float(), z_t[valid].float()
-        n = distances.shape[0]
+        n = int(valid.sum())
         count += n
-        best_sum += distances.min(dim=-1).values.sum().item()
+        # The hindsight commit decides the reference slot and the π target.
+        hindsight_index = futures.commit(Hindsight(), future).index[valid]
         if prediction_count > 1:
-            dirs = F.normalize(futures.candidates[valid].float(), dim=-1)
-            sim = torch.bmm(dirs, dirs.transpose(1, 2))
-            off_diagonal = 1.0 - torch.eye(prediction_count, device=sim.device, dtype=sim.dtype)
+            sim = futures.candidate_similarity()[valid]  # (N, P, P)
+            off_diagonal = 1.0 - torch.eye(
+                prediction_count, device=sim.device, dtype=sim.dtype
+            )
             pair_sim_sum += (sim * off_diagonal).sum().item()
             pair_count += n * prediction_count * (prediction_count - 1)
         delta_sum += (
             futures.candidates[valid].float() - z_valid.unsqueeze(-2)
         ).norm(dim=-1).sum().item()
         z_norm_sum += z_valid.norm(dim=-1).sum().item()
-        hard_win = distances.argmin(dim=-1)
-        win_counts += torch.bincount(hard_win, minlength=prediction_count).cpu()
+        hindsight_counts += torch.bincount(
+            hindsight_index, minlength=prediction_count
+        ).cpu()
         log_pi = F.log_softmax(futures.pi[valid].float(), dim=-1)
-        pi_nll_sum += -log_pi.gather(-1, hard_win[:, None]).sum().item()
-        correct += (log_pi.argmax(dim=-1) == hard_win).sum().item()
+        pi_nll_sum += -log_pi.gather(-1, hindsight_index[:, None]).sum().item()
+        correct += (log_pi.argmax(dim=-1) == hindsight_index).sum().item()
         mu = futures.mu[valid].float()
         mu_norm_sum += mu.norm(dim=-1).sum().item()
-        mu_dir_sum += _cosine_distance(mu, future_valid).sum().item()
+        mu_distance_sum += distance(mu, future_valid).sum().item()
     if count == 0:
         raise ValueError("no valid prediction positions in the query batches")
-    shares = win_counts.float() / win_counts.sum().clamp_min(1)
+    shares = hindsight_counts.float() / hindsight_counts.sum().clamp_min(1)
     entropy = float(-(shares * shares.clamp_min(1e-12).log()).sum())
-    pi_nll, mu_norm, mu_dir = pi_nll_sum / count, mu_norm_sum / count, mu_dir_sum / count
+    pi_nll = pi_nll_sum / count
+    mu_norm = mu_norm_sum / count
+    mu_distance = mu_distance_sum / count
+    # If μ is calibrated, E[d(μ̂, ŷ)] = 2 - 2|μ| (μ is a mean of unit futures,
+    # not renormalized).
+    mu_distance_predicted = 2.0 - 2.0 * mu_norm
     return {
-        "best_d": best_sum / count,
         "candidate_pair_cos": pair_sim_sum / pair_count if pair_count else 1.0,
         "delta_ratio": (delta_sum / (count * prediction_count)) / max(z_norm_sum / count, 1e-12),
-        "win_shares": [float(x) for x in shares.tolist()],
+        "hindsight_shares": [float(x) for x in shares.tolist()],
         "live_slots": int((shares > 1.0 / (4 * prediction_count)).sum()),
         "effective_slots": math.exp(entropy),
         "pi_nll": pi_nll,
@@ -249,9 +258,9 @@ def _heads_section(model, batches, latents) -> dict:
         "pi_accuracy": correct / count,
         "majority_accuracy": float(shares.max()),
         "mu_norm": mu_norm,
-        "mu_dir_distance_measured": mu_dir,
-        "mu_dir_distance_predicted": 2.0 - 2.0 * mu_norm,
-        "mu_calibration_error": mu_dir - (2.0 - 2.0 * mu_norm),
+        "mu_distance_measured": mu_distance,
+        "mu_distance_predicted": mu_distance_predicted,
+        "mu_calibration_error": mu_distance - mu_distance_predicted,
     }
 
 def _policies_section(model, batches, latents, *, seed: int) -> dict:
@@ -261,8 +270,8 @@ def _policies_section(model, batches, latents, *, seed: int) -> dict:
     prediction_count = model.config.predictor.prediction_count
     generator, count = _generator(latents[0].device, seed + 1), 0
     sums = dict.fromkeys(
-        ("copy", "hindsight", "pi_argmax", "pi_sample",
-         "mu_safe", "mu_direction"), 0.0
+        ("copy", "hindsight", "pi_argmax", "pi_sample", "mu_safe", "mu"),
+        0.0,
     )
     slot_sums = torch.zeros(prediction_count, dtype=torch.float64)
     for z_t, future, valid in _walk(latents, masks, horizon):
@@ -272,17 +281,20 @@ def _policies_section(model, batches, latents, *, seed: int) -> dict:
         distances = futures.distances(future)[valid]
         future_valid, z_valid = future[valid].float(), z_t[valid].float()
         count += distances.shape[0]
-        sums["copy"] += _cosine_distance(z_valid, future_valid).sum().item()
-        sums["hindsight"] += distances.min(dim=-1).values.sum().item()
+        sums["copy"] += distance(z_valid, future_valid).sum().item()
+        sums["hindsight"] += _commit_distance(
+            distances, futures, Hindsight(), valid, target=future
+        ).sum().item()
         for name, rule in (
-            ("pi_argmax", PiArgmax()), ("pi_sample", PiSample(generator=generator)),
+            ("pi_argmax", PiArgmax()),
+            ("pi_sample", PiSample(generator=generator)),
             ("mu_safe", MuSafe()),
         ):
-            sums[name] += _picked_distance(distances, futures, rule, valid).sum().item()
-        sums["mu_direction"] += _cosine_distance(
-            futures.mu[valid].float(), future_valid
-        ).sum().item()
-        slot_sums += distances.sum(dim=0).double().cpu()
+            sums[name] += _commit_distance(
+                distances, futures, rule, valid
+            ).sum().item()
+        sums["mu"] += distance(futures.mu[valid].float(), future_valid).sum().item()
+        slot_sums += distances.double().cpu().sum(dim=-2)
     if count == 0:
         raise ValueError("no valid prediction positions in the query batches")
     fixed_index = int(slot_sums.argmin())
@@ -290,8 +302,8 @@ def _policies_section(model, batches, latents, *, seed: int) -> dict:
     return {
         **{name: value / count for name, value in sums.items()},
         "fixed_slot": {"index": fixed_index, "distance": slot_sums[fixed_index].item() / count},
-        "oracle_gain_over_mu_direction": sums["mu_direction"] / count - hindsight,
-        "selection_headroom": pi_argmax - hindsight,
+        "hindsight_gain_over_mu": sums["mu"] / count - hindsight,
+        "commit_headroom": pi_argmax - hindsight,
     }
 
 def _rollout_starts(batches, stride, steps, limit, generator):
@@ -307,8 +319,8 @@ def _rollout_starts(batches, stride, steps, limit, generator):
             "the query sequences are too short"
         )
     if len(candidates) > limit:
-        picked = torch.randperm(len(candidates), generator=generator)[:limit]
-        candidates = [candidates[i] for i in picked.tolist()]
+        sampled = torch.randperm(len(candidates), generator=generator)[:limit]
+        candidates = [candidates[i] for i in sampled.tolist()]
     groups = {}
     for index, row, t in candidates:
         groups.setdefault(index, []).append((row, t))
@@ -349,7 +361,7 @@ def _rollouts_section(
         }
         for name, path in paths.items():
             for depth in range(depths):
-                error_sums[name][depth] += _cosine_distance(
+                error_sums[name][depth] += distance(
                     path[:, depth], targets[:, depth]
                 ).sum().item()
                 manifold_sums[name][depth] += _manifold_scores(
@@ -429,7 +441,7 @@ def _decoder_section(model, batches, latents, *, seed, loss_chunk_size) -> dict:
         "ce": ce,
         "tokens": token_count,
         "hint_use": ce["shuffled"] - ce["pi_argmax"],
-        "selection_headroom": ce["pi_argmax"] - ce["hindsight"],
+        "commit_headroom": ce["pi_argmax"] - ce["hindsight"],
         "specificity": {
             "shuffled_minus_hindsight": ce["shuffled"] - ce["hindsight"],
             "pi_argmax_minus_hindsight": ce["pi_argmax"] - ce["hindsight"],
@@ -451,8 +463,8 @@ def _verdicts(metrics) -> list[dict]:
     verdicts = [
         _verdict("pi_uses_z_t", "heads.pi_gain", heads["pi_gain"], 0.0, ">"),
         _verdict(
-            "candidates_beat_mean", "policies.oracle_gain_over_mu_direction",
-            policies["oracle_gain_over_mu_direction"], 0.01, ">",
+            "candidates_beat_mean", "policies.hindsight_gain_over_mu",
+            policies["hindsight_gain_over_mu"], 0.01, ">",
         ),
         _verdict(
             "decoder_uses_commitment", "decoder.hint_use", decoder["hint_use"], 0.05, ">"
@@ -582,30 +594,29 @@ def print_report(metrics: dict) -> None:
 
     h = metrics["heads"]
     _pairs("heads", [
-        ("best_d", _fmt(h["best_d"])),
         ("candidate pair cos", _fmt(h["candidate_pair_cos"])),
         ("|delta| / |z|", _fmt(h["delta_ratio"])),
-        ("win shares (hindsight)", " ".join(_fmt(x) for x in h["win_shares"])),
-        ("live slots", f"{h['live_slots']} / {len(h['win_shares'])}  "
+        ("hindsight shares", " ".join(_fmt(x) for x in h["hindsight_shares"])),
+        ("live slots", f"{h['live_slots']} / {len(h['hindsight_shares'])}  "
                        f"(effective {_fmt(h['effective_slots'])})"),
         ("pi NLL", f"{_fmt(h['pi_nll'])}  vs constant {_fmt(h['constant_nll'])}  "
                    f"(gain {_fmt(h['pi_gain'])} nats)"),
         ("pi accuracy", f"{_fmt(h['pi_accuracy'])}  vs majority "
                         f"{_fmt(h['majority_accuracy'])}"),
         ("|mu|", _fmt(h["mu_norm"])),
-        ("mu direction distance", f"{_fmt(h['mu_dir_distance_measured'])} measured vs "
-                                  f"{_fmt(h['mu_dir_distance_predicted'])} predicted "
-                                  "(2 - 2|mu|)"),
+        ("mu distance", f"{_fmt(h['mu_distance_measured'])} measured vs "
+                       f"{_fmt(h['mu_distance_predicted'])} predicted "
+                       "(2 - 2|mu|)"),
     ])
 
     p = metrics["policies"]
     print("\n--- policies (depth 1, distance to the real z_t+k) ---")
     _table([(n, _fmt(p[n])) for n in ("copy", "hindsight", "pi_argmax",
-                                      "pi_sample", "mu_safe", "mu_direction")]
+                                      "pi_sample", "mu_safe", "mu")]
            + [(f"fixed slot {p['fixed_slot']['index']}", _fmt(p["fixed_slot"]["distance"]))],
-           ("policy", "distance"))
-    print(f"oracle gain over mu direction: {_fmt(p['oracle_gain_over_mu_direction'])}")
-    print(f"selection headroom (pi-argmax - hindsight): {_fmt(p['selection_headroom'])}")
+           ("commit rule", "distance"))
+    print(f"hindsight gain over mu: {_fmt(p['hindsight_gain_over_mu'])}")
+    print(f"commit headroom (pi-argmax - hindsight): {_fmt(p['commit_headroom'])}")
 
     ro = metrics["rollouts"]
     print(f"\n--- rollouts ({ro['positions']} starts, k={ro['stride']}) ---")
@@ -621,7 +632,7 @@ def print_report(metrics: dict) -> None:
     print(f"\n--- decoder (token-weighted CE over {dec['tokens']:,} tokens) ---")
     _table([(n, _fmt(v)) for n, v in dec["ce"].items()], ("hint", "CE"))
     print(f"hint use (shuffled - pi-argmax):       {_fmt(dec['hint_use'])}")
-    print(f"selection headroom (pi-argmax - hindsight): {_fmt(dec['selection_headroom'])}")
+    print(f"commit headroom (pi-argmax - hindsight): {_fmt(dec['commit_headroom'])}")
     print(f"specificity: shuffled-hindsight "
           f"{_fmt(dec['specificity']['shuffled_minus_hindsight'])}  vs "
           f"pi-argmax-hindsight {_fmt(dec['specificity']['pi_argmax_minus_hindsight'])}")
@@ -638,8 +649,8 @@ def print_report(metrics: dict) -> None:
         "loss:           total is the weighted sum of the terms; H(r) is fixed",
         "                by the targets, so only KL(r||pi) can improve.",
         "heads:          pi gain > 0 = pi predicts the closest candidate from z_t.",
-        "policies:       hindsight is the oracle; oracle gain over mu direction is",
-        "                what candidates buy, selection headroom is the rest.",
+        "policies:       hindsight needs the real future; hindsight gain over mu",
+        "                is what candidates buy, commit headroom is the rest.",
         "rollouts:       error is distance to the real z at t+i*k; manifold is",
         "                distance to the nearest real latent. The claim: at",
         "                depths >= 2, pi-sample stays closer to the manifold than",

@@ -128,9 +128,9 @@ class PredictorModel(PreTrainedModel):
     * win-probability logits ``pi``: which candidate is likely the closest to
       the real future.  Commitment samples or takes the argmax of these.
 
-    Separately, the mean head maps ``z_t`` to ``mu ≈ E[ŷ | z_t]``, the mean
+    Separately, the μ head maps ``z_t`` to ``mu ≈ E[ŷ | z_t]``, the mean
     normalized future.  It is an auxiliary instrument (uncertainty, a
-    single-head baseline, a future head-growth signal), not the selector.
+    single-head baseline, a future head-growth signal), not a commit rule.
     Its input is detached, so it never changes the encoder or candidates.
 
     Configured by :class:`jepa.config.PredictorConfig` and usable on its own::
@@ -162,14 +162,14 @@ class PredictorModel(PreTrainedModel):
         )
 
         # Win-probability logit of each candidate (pi).
-        self.score_head = PerDimLinear(
+        self.pi_head = PerDimLinear(
             dims=config.prediction_count,
             in_size=config.hidden_size,
             out_size=1
         )
 
         # mu: predicted mean of the normalized future latent, from z_t.
-        self.mean_head = nn.Sequential(
+        self.mu_head = nn.Sequential(
             nn.Linear(config.target_dim, config.hidden_size),
             nn.SiLU(),
             nn.Linear(config.hidden_size, config.target_dim),
@@ -179,8 +179,8 @@ class PredictorModel(PreTrainedModel):
 
         # Start mu at 0 ("no knowledge", norm 0) instead of a random vector.
         # After post_init, which would otherwise re-initialize the Linear.
-        nn.init.zeros_(self.mean_head[-1].weight)
-        nn.init.zeros_(self.mean_head[-1].bias)
+        nn.init.zeros_(self.mu_head[-1].weight)
+        nn.init.zeros_(self.mu_head[-1].bias)
 
     def forward(self, input: torch.Tensor) -> Futures:
         """Predict the future latent(s) from one latent per input position.
@@ -209,14 +209,14 @@ class PredictorModel(PreTrainedModel):
         hidden_states = self.transformer(hidden_states)
 
         pred_deltas = self.delta_head(hidden_states)  # (N, prediction_count, target_dim)
-        pi = self.score_head(hidden_states).squeeze(-1)  # (N, prediction_count)
+        pi = self.pi_head(hidden_states).squeeze(-1)  # (N, prediction_count)
         # Detached: mu is a measuring instrument and must not shape z_t.
-        mu = self.mean_head(z_t.detach())  # (N, target_dim)
+        mu = self.mu_head(z_t.detach())  # (N, target_dim)
 
         candidates = z_t.unsqueeze(1) + pred_deltas  # (N, prediction_count, target_dim)
 
         # Fix every candidate to the encoder-latent scale (per-dim RMS 1, i.e.
-        # norm ~sqrt(target_dim)).  The loss compares directions only, so
+        # norm ~sqrt(target_dim)).  The loss compares normalized latents, so
         # without this a candidate's norm is free; unused slots drifted to norms
         # ~50x z_t, where the gradient through the loss's normalization
         # (~1/norm) vanishes and they could never recover.  No learnable gain:

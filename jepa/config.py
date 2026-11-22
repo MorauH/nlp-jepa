@@ -148,7 +148,7 @@ class PredictorConfig(TransformerConfig):
     ``pad_token_id``, and it applies no RoPE.
 
     Every candidate is RMS-normalized to the encoder latent scale.  The
-    multi-hypothesis loss compares directions only, so the candidate norm is
+    multi-hypothesis loss compares normalized latents, so the candidate norm is
     otherwise unconstrained, and slots that drift to large norms stop receiving
     gradient.
     """
@@ -210,9 +210,9 @@ class DecoderConfig(TransformerConfig):
     (``tie_word_embeddings``), and the latent hint is re-injected into the
     residual stream before every transformer layer.
 
-    ``train_policy`` selects the policy that commits the future the decoder is
-    trained against: ``"hindsight"`` uses the candidate closest to the real
-    future, ``"pi_argmax"`` the most likely candidate under pi (the inference
+    ``train_policy`` is the policy the decoder's hint commits by:
+    ``"hindsight"`` uses the candidate closest to the real future,
+    ``"pi_argmax"`` the most likely candidate under pi (the inference
     condition).  Evaluation always uses ``"pi_argmax"``.  The names are
     registered in :data:`jepa.models.commitment.POLICIES`.
 
@@ -349,7 +349,7 @@ class CommitmentLossConfig(PretrainedConfig):
         # Weight of the pi (win probability) cross-entropy.
         self.pi_w = pi_w
         # Weight of the mu (mean future) regression.  mu's input is detached,
-        # so this only scales the mean head's own learning rate.
+        # so this only scales the mu head's own learning rate.
         self.mu_w = mu_w
         # Weight of the pairwise candidate-diversity penalty.
         self.diversity_w = diversity_w

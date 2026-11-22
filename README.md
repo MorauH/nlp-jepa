@@ -68,14 +68,18 @@ python -m jepa train --stage decoder --resume --epochs 2
 ```
 
 Each stage writes the full checkpoint and its own `history_<stage>.json` to
-`runs/jepa`. The decoder stage keeps the frozen encoder and predictor and
-replaces only the decoder.
+its output dir (`runs/jepa`, or the sibling `runs/jepa-decoder` for the decoder
+stage). The decoder stage keeps the frozen encoder and predictor and replaces
+only the decoder.
 
 ## Generation
 
 ```bash
 python -m jepa generate --prompt "When in Rome, " --steps 3 --temperature 0.8
 ```
+
+`--temperature` / `--top-k` control token sampling; `--commit-temperature` /
+`--commit-top-k` control the commit from π.
 
 ## Measurement
 

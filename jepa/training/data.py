@@ -1,15 +1,39 @@
-"""Dataset collation and length-bucketed batching."""
+"""Dataset loading, collation and length-bucketed batching."""
 
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
+from datasets import load_from_disk
 from torch.utils.data import Sampler
 
 # Number of batches' worth of examples to sort together when bucketing by
 # length. Larger windows pad less but correlate batch content more.
 LENGTH_BUCKET_WINDOW = 100
+
+# --subset loads this many examples for a smoke run.
+SUBSET_TRAIN = 4
+SUBSET_VAL = 2
+
+
+def load_datasets(fineweb_dir: Path, subset: bool = False):
+    """Load the prepared train/validation chunks (a tiny slice for --subset)."""
+    if not fineweb_dir.is_dir():
+        raise FileNotFoundError(
+            f"{fineweb_dir} not found. "
+            "Run `python -m jepa prepare-data` first."
+        )
+    dataset = load_from_disk(str(fineweb_dir))
+    train_dataset = dataset["train"]
+    val_dataset = dataset["validation"]
+    if subset:
+        train_dataset = train_dataset.select(
+            range(min(SUBSET_TRAIN, len(train_dataset)))
+        )
+        val_dataset = val_dataset.select(range(min(SUBSET_VAL, len(val_dataset))))
+    return train_dataset, val_dataset
 
 
 def example_lengths(dataset) -> list[int]:

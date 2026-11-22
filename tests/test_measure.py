@@ -147,10 +147,9 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
 
     heads = metrics["heads"]
     assert {
-        "best_d",
         "candidate_pair_cos",
         "delta_ratio",
-        "win_shares",
+        "hindsight_shares",
         "live_slots",
         "effective_slots",
         "pi_nll",
@@ -159,11 +158,11 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
         "pi_accuracy",
         "majority_accuracy",
         "mu_norm",
-        "mu_dir_distance_measured",
-        "mu_dir_distance_predicted",
+        "mu_distance_measured",
+        "mu_distance_predicted",
         "mu_calibration_error",
     } <= set(heads)
-    assert len(heads["win_shares"]) == 4
+    assert len(heads["hindsight_shares"]) == 4
 
     policies = metrics["policies"]
     assert {
@@ -172,10 +171,10 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
         "pi_argmax",
         "pi_sample",
         "mu_safe",
-        "mu_direction",
+        "mu",
         "fixed_slot",
-        "oracle_gain_over_mu_direction",
-        "selection_headroom",
+        "hindsight_gain_over_mu",
+        "commit_headroom",
     } <= set(policies)
     assert set(policies["fixed_slot"]) == {"index", "distance"}
 
@@ -212,7 +211,7 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
     # future) is excluded, so 10 per row over 4 examples.
     assert decoder["tokens"] == 40
     assert metrics["context"]["tokens"] == 48
-    assert "hint_use" in decoder and "selection_headroom" in decoder
+    assert "hint_use" in decoder and "commit_headroom" in decoder
     assert set(decoder["specificity"]) == {
         "shuffled_minus_hindsight",
         "pi_argmax_minus_hindsight",

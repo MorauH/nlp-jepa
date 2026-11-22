@@ -9,6 +9,7 @@ from transformers import PreTrainedModel
 
 from ..config import DecoderConfig
 from .blocks import DecoderLayer, RMSNorm, RotaryEmbedding
+from .sampling import top_k_mask
 
 
 def build_sliding_window_bias(seq_len: int, window: int, device, dtype):
@@ -131,8 +132,8 @@ class DecoderModel(PreTrainedModel):
         """Summed next-token cross-entropy and token count for one hint.
 
         This is the single implementation of the decoder's token-level loss.
-        :meth:`forward` and :meth:`JepaModel.decoder_loss` both go through it,
-        and measurement calls it once per hint condition.
+        :meth:`JepaModel.decoder_loss`, measurement, and the tests of the
+        decoder all go through it.
 
         Args:
             z_t: (B, S, H) latent at the start of each token's block.
@@ -186,9 +187,8 @@ class DecoderModel(PreTrainedModel):
         z_t,
         committed,
         labels,
-        training: bool = True,
-        loss_chunk_size: int | None = None,
         attention_mask=None,
+        loss_chunk_size: int | None = None,
     ):
         """Teacher-forced next-token loss.
 
@@ -197,13 +197,9 @@ class DecoderModel(PreTrainedModel):
             committed: (B, S, H) committed future at the end of each token's
                 block.
             labels: (B, S) token ids.
-            training: must be True; use :meth:`generate` for inference.
             loss_chunk_size: optional number of positions per ``lm_head`` chunk.
             attention_mask: optional (B, S) padding mask.
         """
-        if not training:
-            raise ValueError("DecoderModel.forward is training-only; use generate()")
-
         total, count = self.token_loss(
             z_t,
             committed,
@@ -249,10 +245,7 @@ class DecoderModel(PreTrainedModel):
                 next_ids = logits.argmax(dim=-1)
             else:
                 logits = logits / temperature
-                if top_k is not None and top_k > 0:
-                    kk = min(top_k, logits.shape[-1])
-                    kth = torch.topk(logits, kk, dim=-1).values[..., -1, None]
-                    logits = logits.masked_fill(logits < kth, float("-inf"))
+                logits = top_k_mask(logits, top_k)
                 probabilities = torch.softmax(logits, dim=-1)
                 next_ids = torch.multinomial(
                     probabilities, num_samples=1

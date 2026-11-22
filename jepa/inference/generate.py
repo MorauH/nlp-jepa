@@ -37,8 +37,8 @@ def generate(
     *,
     temperature: float = 0.8,
     top_k: int | None = 50,
-    direction_temperature: float = 1.0,
-    direction_top_k: int | None = 0,
+    commit_temperature: float = 1.0,
+    commit_top_k: int | None = 0,
     device: torch.device,
 ) -> tuple[str, list[int]]:
     """Generate ``steps * k`` tokens from ``prompt``.
@@ -75,7 +75,7 @@ def generate(
         # The predictor reads only the last latent (z_t).
         futures = model.predictor(z_t)
         committed = futures.commit(
-            PiSample(temperature=direction_temperature, top_k=direction_top_k)
+            PiSample(temperature=commit_temperature, top_k=commit_top_k)
         ).future
 
         new_ids = model.decoder.generate(
@@ -124,14 +124,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Top-k sampling cutoff; 0 disables it.",
     )
     parser.add_argument(
-        "--direction-temperature",
+        "--commit-temperature",
         type=float,
         default=1.0,
         help="Temperature for sampling a committed future from the "
-        "win-probability head (pi); 0 picks the most likely one.",
+        "win-probability distribution (pi); 0 commits by π-argmax.",
     )
     parser.add_argument(
-        "--direction-top-k",
+        "--commit-top-k",
         type=int,
         default=0,
         help="Top-k cutoff for committed-future sampling; 0 disables it.",
@@ -177,8 +177,8 @@ def main(argv: list[str] | None = None) -> None:
         steps,
         temperature=args.temperature,
         top_k=args.top_k,
-        direction_temperature=args.direction_temperature,
-        direction_top_k=args.direction_top_k,
+        commit_temperature=args.commit_temperature,
+        commit_top_k=args.commit_top_k,
         device=device,
     )
 

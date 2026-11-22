@@ -11,11 +11,12 @@ module is a copy of one row of :attr:`Futures.candidates`, namely the row at
 ``Commit.index``.  Whether the committed future stays a clear single future is
 the research question; averaging candidates is never the answer the code gives.
 
-This module is the single home of the candidate-target distance
-``d = 2 - 2 cos(candidate, target)``.  It is always computed in fp32 with
-autocast disabled, from normalized vectors and their dot product.  The VISReg
-loss, training-time hindsight, inference, sampling and measurement all call
-:meth:`Futures.distances`, so they agree on which candidate is closest.
+This module is the single home of the cosine distance
+``d = 2 - 2 cos(a, b)``: :func:`distance` for paired vectors,
+:func:`pairwise_distance` for every row against every row, and
+:meth:`Futures.distances` for candidates against a target.  All are fp32 with
+autocast disabled, so the loss, hindsight commits and measurement agree on
+which candidate is closest.
 """
 
 from __future__ import annotations
@@ -26,11 +27,44 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .sampling import top_k_mask
+
 
 def _no_autocast(tensor: Tensor):
     """Autocast-off context for fp32 distance arithmetic on ``tensor``."""
     device_type = "cuda" if tensor.is_cuda else "cpu"
     return torch.autocast(device_type=device_type, enabled=False)
+
+
+def _unit(x: Tensor) -> Tensor:
+    return F.normalize(x.float(), dim=-1)
+
+
+def _from_cosine(cos: Tensor) -> Tensor:
+    # Clamped at 0 to hide fp32 rounding when the vectors coincide.
+    return (2.0 - 2.0 * cos).clamp_min(0.0)
+
+
+def distance(a: Tensor, b: Tensor) -> Tensor:
+    """Cosine distance ``2 - 2 cos(a, b)`` between paired vectors, fp32.
+
+    ``a`` and ``b`` are ``(..., D)`` with broadcastable leading dims; the
+    result is ``(...)``.  For every row against every row, use
+    :func:`pairwise_distance`.
+    """
+    with _no_autocast(a):
+        return _from_cosine((_unit(a) * _unit(b)).sum(dim=-1))
+
+
+def pairwise_distance(a: Tensor, b: Tensor) -> Tensor:
+    """Cosine distance between every row of ``a`` and every row of ``b``, fp32.
+
+    ``a`` is ``(..., N, D)`` and ``b`` is ``(..., M, D)`` with broadcastable
+    leading dims; the result is ``(..., N, M)``.  Computed with a matmul, so
+    no ``(..., N, M, D)`` tensor is built.
+    """
+    with _no_autocast(a):
+        return _from_cosine(_unit(a) @ _unit(b).transpose(-1, -2))
 
 
 class Futures(NamedTuple):
@@ -53,17 +87,16 @@ class Futures(NamedTuple):
     def distances(self, target: Tensor) -> Tensor:
         """Candidate-target distances, ``(..., P)`` fp32.
 
-        ``d = 2 - 2 cos(candidate, target)``, clamped at 0 to hide the fp32
-        rounding when the vectors coincide.  Both sides are normalized and the
-        distance is computed from the dot product, so no ``(..., P, D)``
-        difference is materialized.  This is the only candidate-target
-        distance in the codebase.
+        ``target`` is ``(..., D)``.  A matmul against the target, so no
+        ``(..., P, D)`` product is built.
         """
+        return pairwise_distance(self.candidates, target.unsqueeze(-2)).squeeze(-1)
+
+    def candidate_similarity(self) -> Tensor:
+        """Cosine similarity between every pair of candidates, ``(..., P, P)`` fp32."""
         with _no_autocast(self.candidates):
-            cand = F.normalize(self.candidates.float(), dim=-1)
-            tgt = F.normalize(target.float(), dim=-1)
-            dot = torch.einsum("...pd,...d->...p", cand, tgt)
-            return (2.0 - 2.0 * dot).clamp_min(0.0)
+            unit = _unit(self.candidates)
+            return unit @ unit.transpose(-1, -2)
 
     def expected_distances(self) -> Tensor:
         """Expected candidate-target distances under μ, ``(..., P)`` fp32.
@@ -74,9 +107,9 @@ class Futures(NamedTuple):
         the predictability signal.
         """
         with _no_autocast(self.candidates):
-            cand = F.normalize(self.candidates.float(), dim=-1)
-            dot = torch.einsum("...pd,...d->...p", cand, self.mu.float())
-            return 2.0 - 2.0 * dot
+            cos = (_unit(self.candidates) @ self.mu.float().unsqueeze(-1)).squeeze(-1)
+            # Not clamped: |μ| < 1, so this is an expectation, not a distance.
+            return 2.0 - 2.0 * cos
 
     def commit(self, policy: "Policy", target: Tensor | None = None) -> "Commit":
         """Score the candidates with ``policy`` and take the highest score.
@@ -234,11 +267,7 @@ class PiSample:
         if self.temperature <= 0:
             return logits
 
-        if self.top_k is not None and self.top_k > 0:
-            k = min(int(self.top_k), logits.shape[-1])
-            kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
-            logits = logits.masked_fill(logits < kth, float("-inf"))
-
+        logits = top_k_mask(logits, self.top_k)
         logits = logits / self.temperature
         # Draw the noise in fp32 so the two logarithms have full exponent
         # range even when pi is bf16/fp16 under autocast.

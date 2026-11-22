@@ -142,31 +142,31 @@ class JepaModel(PreTrainedModel):
             :class:`~jepa.models.losses.LossOutput` whose total is
             VISReg + commitment loss and whose terms/diagnostics merge both.
         """
-        enc_hidden = self.encode(labels, attention_mask)
+        latents = self.encode(labels, attention_mask)
 
         k = self.pred_horizon
-        seq_len = enc_hidden.shape[1]
+        seq_len = latents.shape[1]
         if seq_len <= k:
             raise ValueError(
                 f"sequence length ({seq_len}) must exceed pred_horizon ({k})"
             )
 
-        X = enc_hidden[:, :-k, :]
-        Y = enc_hidden[:, k:, :].detach()
+        X = latents[:, :-k, :]
+        Y = latents[:, k:, :].detach()
 
         if attention_mask is not None:
             valid = attention_mask[:, :-k].bool() & attention_mask[:, k:].bool()
         else:
             valid = None
 
-        # From each hidden[i, t, :] predict hidden[i, t+k, :]
+        # From each latent[i, t, :] predict latent[i, t+k, :]
         futures = self.predictor(X)
 
         # VISReg acts on the online encoder latents, not on the predictor
         # output.  Applying it to the committed future would let the predictor
         # cancel the encoder's mean in its own output without fixing the
         # encoder.
-        visreg_out = self.visreg(enc_hidden, mask=attention_mask)
+        visreg_out = self.visreg(latents, mask=attention_mask)
         commitment_out = self.commitment_loss(
             futures, Y, mask=valid, progress=progress
         )
@@ -204,9 +204,10 @@ class JepaModel(PreTrainedModel):
 
         Returns:
             :class:`~jepa.models.losses.LossOutput` with the unweighted
-            ``token`` term and ``perplexity`` / ``tokens`` diagnostics.  The
-            last block of a sequence runs past the end, so its target
-            positions are masked out of the loss.
+            ``token`` term and a ``tokens`` diagnostic (the counted target
+            tokens, for token-weighted averaging).  The last block of a
+            sequence runs past the end, so its target positions are masked out
+            of the loss.
         """
         k = self.pred_horizon
         seq_len = labels.shape[1]
@@ -226,7 +227,7 @@ class JepaModel(PreTrainedModel):
             target = latents[:, k:, :] if rule.needs_target else None
             committed = futures.commit(rule, target).future
             z_t, committed, valid = build_block_hints(
-                latents, k, committed=committed.detach()
+                latents, k, committed=committed
             )
 
         # A block start past ``seq - k - 1`` has no committed future, so those
@@ -240,8 +241,8 @@ class JepaModel(PreTrainedModel):
             )
 
         token_sum, token_count = self.decoder.token_loss(
-            z_t.detach(),
-            committed.detach(),
+            z_t,
+            committed,
             labels,
             attention_mask=attention_mask,
             chunk_size=self.config.decoder.loss_chunk_size,
@@ -251,8 +252,5 @@ class JepaModel(PreTrainedModel):
         return LossOutput(
             loss=token_loss,
             terms={"token": token_loss},
-            diagnostics={
-                "perplexity": torch.exp(token_loss.detach().clamp_max(20.0)),
-                "tokens": token_count.detach(),
-            },
+            diagnostics={"tokens": token_count.detach()},
         )

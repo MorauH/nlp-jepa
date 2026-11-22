@@ -11,6 +11,9 @@ Run from the repository root::
     python -m jepa train --resume                # continue it
     python -m jepa train --stage decoder         # decoder stage on runs/jepa
     python -m jepa train --stage decoder --resume --epochs 2
+
+This module is CLI parsing, per-stage defaults, model building/loading and
+paths.  Engineering settings live in :mod:`jepa.training.trainer`.
 """
 
 from __future__ import annotations
@@ -19,22 +22,14 @@ import argparse
 import json
 from pathlib import Path
 
-from datasets import load_from_disk
 from transformers import set_seed
 
 from ..config import EncoderConfig, JepaConfig
 from ..data.tokenizer import load_tokenizer
 from ..models.jepa import JepaModel
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
-from .trainer import JepaTrainer, TrainConfig
-
-# --subset trains on this many examples (smoke test).
-SUBSET_TRAIN = 4
-SUBSET_VAL = 2
-
-SEED = 42
-WEIGHT_DECAY = 0.01
-MAX_GRAD_NORM = 1.0
+from .data import load_datasets
+from .trainer import SEED, JepaTrainer, TrainConfig
 
 # ---------------------------------------------------------------------------
 # Per-stage defaults
@@ -49,33 +44,6 @@ STAGE_DEFAULTS = {
     # size is safe; one epoch is usually enough to adapt a fresh decoder.
     "decoder": {"batch_size": 24, "epochs": 1, "learning_rate": 6e-4},
 }
-
-# Save a checkpoint (full model + history_<stage>.json + trainer_state_<stage>.pt,
-# overwriting the output dir) every N optimizer steps, in addition to the end of
-# each epoch.  A crash or SLURM timeout then loses at most N steps, `measure` can
-# be run on the partially trained model, and `--resume` continues from the last
-# save.  None disables mid-epoch saves.
-SAVE_EVERY_STEPS = 2000
-
-# ---------------------------------------------------------------------------
-# Performance
-# ---------------------------------------------------------------------------
-# bf16 autocast on CUDA (L4/L40S); disabled on CPU.
-USE_AMP = True
-
-# torch.compile with dynamic shapes. Compilation adds startup time but is
-# amortized quickly on a full run; it is caught and disabled if the backend
-# cannot compile the loss.
-COMPILE_MODEL = True
-COMPILE_MODE = "default"
-
-# Pad every batch to a multiple of this many tokens. Keeps tensor-core tiles
-# aligned and limits the number of distinct compiled shapes.
-PAD_TO_MULTIPLE_OF = 64
-
-# Steps between tqdm updates. Each update synchronizes the GPU, so batching
-# them avoids a per-step stall.
-LOG_EVERY = 10
 
 
 def add_dataset_args(
@@ -123,24 +91,6 @@ def load_training_tokenizer(tokenizer_dir: Path):
     )
     tokenizer("test")  # warm any encoding cache
     return tokenizer
-
-
-def load_datasets(fineweb_dir: Path, subset: bool = False):
-    """Load the prepared train/validation chunks (a tiny slice for --subset)."""
-    if not fineweb_dir.is_dir():
-        raise FileNotFoundError(
-            f"{fineweb_dir} not found. "
-            "Run `python -m jepa prepare-data` first."
-        )
-    dataset = load_from_disk(str(fineweb_dir))
-    train_dataset = dataset["train"]
-    val_dataset = dataset["validation"]
-    if subset:
-        train_dataset = train_dataset.select(
-            range(min(SUBSET_TRAIN, len(train_dataset)))
-        )
-        val_dataset = val_dataset.select(range(min(SUBSET_VAL, len(val_dataset))))
-    return train_dataset, val_dataset
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -216,16 +166,11 @@ def build_model(tokenizer) -> JepaModel:
         vocab_size=len(tokenizer),
         pad_token_id=tokenizer.pad_token_id,
     )
-    tokenizer.model_max_length = min(
-        tokenizer.model_max_length or encoder_config.max_position_embeddings,
-        encoder_config.max_position_embeddings,
-    )
     return JepaModel(JepaConfig.from_encoder(encoder_config))
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    set_seed(SEED)
     stage = args.stage
     output_dir = args.output_dir
     if args.resume and not (output_dir / "config.json").exists():
@@ -249,6 +194,9 @@ def main(argv: list[str] | None = None) -> None:
         with open(history_path) as handle:
             history = json.load(handle)
 
+    # Seed before building the model so fresh weights are reproducible.  The
+    # trainer re-seeds its own stream when training starts.
+    set_seed(SEED)
     if stage == "jepa":
         if args.resume:
             model = JepaModel.from_pretrained(str(output_dir))
@@ -298,22 +246,13 @@ def main(argv: list[str] | None = None) -> None:
             learning_rate=args.lr,
             batch_size=args.batch_size,
             epochs=args.epochs,
-            weight_decay=WEIGHT_DECAY,
-            seed=SEED,
             device=args.device,
             resume=args.resume,
         ),
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         tokenizer=tokenizer,
-        max_grad_norm=MAX_GRAD_NORM,
         history=history,
-        use_amp=USE_AMP,
-        compile_model=COMPILE_MODEL,
-        compile_mode=COMPILE_MODE,
-        pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
-        log_every=LOG_EVERY,
-        save_every_steps=SAVE_EVERY_STEPS,
     )
 
     trainer.train()

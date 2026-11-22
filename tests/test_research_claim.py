@@ -6,7 +6,7 @@ future)** baseline blurs the possible futures into their average.
 
 World
 -----
-``N`` states live at the encoder-latent scale (unit-normalised directions
+``N`` states live at the encoder-latent scale (unit-normalised vectors
 scaled to ``sqrt(D)``, so their per-dim RMS is 1).  Each state has exactly two
 distinct successors, chosen once at random.  A transition picks one of the two
 with probability 1/2.  There is no encoder: the state latents are the real
@@ -155,7 +155,7 @@ def test_every_successor_has_a_candidate_next_to_it(trained):
 
 
 def test_mu_is_the_blurry_average_of_the_successors(trained):
-    """μ points at the average of the two unit successor directions, with norm < 1."""
+    """μ points at the average of the two unit successor vectors, with norm < 1."""
     predictor, states, successors = trained
     with torch.no_grad():
         mu = predictor(states).mu
@@ -167,7 +167,7 @@ def test_mu_is_the_blurry_average_of_the_successors(trained):
 
     # Measured: cosine >= 0.978, norm in [0.58, 0.81], mean ~0.69
     # (two near-orthogonal successors would give 1/sqrt(2) ~= 0.707).
-    assert cosine.min() > 0.9, f"μ is not the mean direction: min cos {cosine.min()}"
+    assert cosine.min() > 0.9, f"μ is not the mean vector: min cos {cosine.min()}"
     assert norm.max() < 0.9, f"μ did not blur: max norm {norm.max()}"
     assert norm.min() > 0.5, f"μ collapsed toward zero: min norm {norm.min()}"
 

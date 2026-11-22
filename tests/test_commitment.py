@@ -308,6 +308,37 @@ def test_distances_are_non_negative_for_identical_vectors():
     assert torch.equal(distances.argmin(dim=-1), torch.full((2,), 2))
 
 
+def test_distance_pairs_rows_and_pairwise_distance_crosses_them():
+    from jepa.models import distance, pairwise_distance
+
+    def reference(a, b):
+        cos = (F.normalize(a, dim=-1) * F.normalize(b, dim=-1)).sum(-1)
+        return (2.0 - 2.0 * cos).clamp_min(0.0)
+
+    a, b = torch.randn(4, 3), torch.randn(4, 3)
+    torch.testing.assert_close(distance(a, b), reference(a, b))
+    assert distance(torch.randn(3), torch.randn(3)).shape == ()
+
+    # Same number of rows on both sides must still give every pair, not the
+    # paired distances: this is the manifold-distance case.
+    points, bank = torch.randn(4, 3), torch.randn(4, 3)
+    crossed = pairwise_distance(points, bank)
+    assert crossed.shape == (4, 4)
+    torch.testing.assert_close(
+        crossed, reference(points[:, None, :], bank[None, :, :]), atol=1e-5, rtol=1e-5
+    )
+
+    # Candidates against a target: (..., P) from a matmul.
+    futures = make_futures(2, 5)
+    target = torch.randn(2, 5, futures.candidates.shape[-1])
+    torch.testing.assert_close(
+        futures.distances(target),
+        reference(futures.candidates, target[..., None, :]),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gradients
 # ---------------------------------------------------------------------------
