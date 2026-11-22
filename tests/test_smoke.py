@@ -348,7 +348,7 @@ def test_hint_and_generate_path_agree():
 
 def test_full_stack_forward_with_chunked_decoder_loss():
     model = JepaModel(tiny_config())
-    model.decoder_loss_chunk_size = 4
+    model.config.decoder.loss_chunk_size = 4
     labels = torch.randint(1, 64, (2, 12))
     jepa_out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels))
     decoder_out = model.decoder_loss(

@@ -1,4 +1,4 @@
-"""Training loops, batching, and optimizer helpers."""
+"""Training loops and batching."""
 
 from .trainer import JepaTrainer, TrainConfig
 

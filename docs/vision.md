@@ -1,7 +1,7 @@
 # Predictor vision (long-term, not implemented)
 
-Where the predictor is headed. Like `verification.md`, this is planning, not a
-description of the current code.
+Where the predictor is headed. See `docs/architecture.md` for the current code;
+this file is planning, not a description of implemented behavior.
 
 ## Where we are
 
@@ -23,7 +23,7 @@ description of the current code.
 ## Known open problem: dead slots
 
 Typically only ~2 of 8 slots ever win. Under winner-takes-all, a slot that
-stops winning only gets the tiny `mh_eps / P` pull (toward the conditional
+stops winning only gets the tiny `smoothing / P` pull (toward the conditional
 mean, where the live heads already are) and the diversity push away from
 them. It parks as a "shadow" and does not recover. If new data adds a mode,
 the nearest live head stretches to cover both modes (the k-means
@@ -32,14 +32,15 @@ More data or more slots alone will not create a third useful head.
 
 ## Direction: head revival / growth
 
-1. **Measure first** (`python -m jepa verify`). Oracle gain over μ's
+1. **Measure first** (`python -m jepa measure`). Oracle gain over μ's
    direction, π's likelihood gain over a constant win distribution (is the
    winner predictable from `z_t` at all?), and `|μ|`. If the oracle gain is small, multiple heads
    are not justified at this horizon and target; consider a smoother target
    (block mean of `z_{t+1..t+k}` or a chunk embedding) first.
 2. **Grow by splitting, not by usage.** Start with 2 active slots out of a
-   preallocated `P_max` (active mask in the softmax, `r`, the diversity term
-   and `mh_eps`; no shape changes, so no recompiles or optimizer resizing).
+   preallocated `P_max` (active mask in the softmax, the temperature, the
+   diversity term and the smoothing; no shape changes, so no recompiles or
+   optimizer resizing).
    Track per-head distortion `E[d | win = i]`. Split head `i` when its won
    targets show two-cluster structure (2-means gain or a G-means style
    normality test along the main direction): copy its `MatrixExpansion` /

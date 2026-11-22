@@ -59,21 +59,14 @@ SAVE_EVERY_STEPS = 2000
 # ---------------------------------------------------------------------------
 # Performance
 # ---------------------------------------------------------------------------
-# bf16 autocast on CUDA. "auto" picks bf16 when supported (L4/Ada, Ampere,
-# Blackwell) and falls back to fp16 otherwise.
+# bf16 autocast on CUDA (L4/L40S); disabled on CPU.
 USE_AMP = True
-AMP_DTYPE = "auto"
 
 # torch.compile with dynamic shapes. Compilation adds startup time but is
 # amortized quickly on a full run; it is caught and disabled if the backend
 # cannot compile the loss.
 COMPILE_MODEL = True
 COMPILE_MODE = "default"
-
-# Compute the decoder token loss in position chunks so the full
-# (batch, sequence, vocab) logits tensor is never materialized. None disables
-# chunking.
-DECODER_LOSS_CHUNK_SIZE = 256
 
 # Pad every batch to a multiple of this many tokens. Keeps tensor-core tiles
 # aligned and limits the number of distinct compiled shapes.
@@ -246,7 +239,6 @@ def main(argv: list[str] | None = None) -> None:
                 encoder=base.encoder,
                 predictor=base.predictor,
             )
-        model.decoder_loss_chunk_size = DECODER_LOSS_CHUNK_SIZE
 
     expected_vocab = model.config.encoder.vocab_size
     if expected_vocab != len(tokenizer):
@@ -288,7 +280,6 @@ def main(argv: list[str] | None = None) -> None:
         max_grad_norm=MAX_GRAD_NORM,
         history=history,
         use_amp=USE_AMP,
-        amp_dtype=AMP_DTYPE,
         compile_model=COMPILE_MODEL,
         compile_mode=COMPILE_MODE,
         pad_to_multiple_of=PAD_TO_MULTIPLE_OF,

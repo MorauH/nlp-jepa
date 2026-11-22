@@ -8,6 +8,12 @@
 #SBATCH --gres=gpu:L40s:1
 #SBATCH --output=%x-%j.log
 
+# Usage:
+#   scripts/slurm_train.sh                                  # JEPA stage
+#   scripts/slurm_train.sh --stage decoder --from runs/jepa # decoder stage
+#
+# Args are forwarded to `python -m jepa train`.
+
 set -e
 
 # Move to the repository root so `python -m jepa` resolves the package.

@@ -1,6 +1,8 @@
 # AGENTS.md
 
-JEPA text model (causal encoder → latent predictor → autoregressive decoder). Python 3.12, uv, PyTorch + HF `PretrainedConfig`/`PreTrainedModel`. Details: `README.md`, `docs/architecture.md`.
+JEPA text model: causal encoder → latent predictor → commit → autoregressive
+decoder. Python 3.12, uv, PyTorch + HF `PretrainedConfig`/`PreTrainedModel`.
+Vocabulary: `GLOSSARY.md`. Design: `docs/architecture.md`.
 
 ## Commands
 - Env: `nix develop` (NixOS/WSL2), then `uv sync`. Run one-offs as `nix develop --command <cmd>`.
@@ -8,23 +10,29 @@ JEPA text model (causal encoder → latent predictor → autoregressive decoder)
   - Use `python -m pytest`, not bare `pytest`/`uv run pytest`: `[tool.uv] package = false`, so `jepa` is only importable when the CWD is on `sys.path`. Bare pytest fails with `No module named 'jepa'`.
 - No lint, formatter, typecheck, or CI config exists. Don't invent one.
 - CLI entrypoint: `python -m jepa <train|generate|prepare-data|train-tokenizer|measure>` (`jepa/cli.py`). Each subcommand owns its argparse (`python -m jepa train --help`).
-- Quick end-to-end training check: `python -m jepa train --subset` (needs the prepared data and tokenizer in `data/`).
+- Training: `python -m jepa train` (stage jepa), `python -m jepa train --resume`, `python -m jepa train --stage decoder --from runs/jepa` (fresh decoder on a frozen JEPA), `python -m jepa train --stage decoder --resume --epochs 2`.
+- Quick end-to-end check: `python -m jepa train --subset` (needs the prepared data and tokenizer in `data/`).
+- Measurement: `python -m jepa measure --model runs/jepa --json runs/jepa/metrics.json`.
 
 ## Layout / boundaries
-- `jepa/config.py`: all component configs. `jepa/models/`: encoder, predictor, decoder, `commitment.py` (`Futures`, policies, `commit`), VISReg loss, `JepaModel` (no decoder), `JepaDecodeModel` (full stack).
+- `jepa/config.py`: every component config (`EncoderConfig`, `PredictorConfig`, `DecoderConfig`, `VISRegConfig`, `CommitmentLossConfig`, `JepaConfig`).
+- `jepa/models/`: `encoder.py`, `predictor.py`, `decoder.py`, `commitment.py` (`Futures`, policies, `commit`, `rollout`), `losses.py` (`VISReg`, `CommitmentLoss`), `jepa.py` (`JepaModel`, `build_block_hints`).
+- `jepa/training/`: `data.py` (collation + length bucketing), `trainer.py` (`JepaTrainer`/`TrainConfig`), `train.py` (the single train entry point and the engineering constants).
+- `jepa/evaluation/measure.py`: the paper's numbers. `jepa/inference/generate.py`: sampling.
 - `jepa/paths.py`: `data/` and `runs/` are resolved from the package location, not the CWD.
 - `data/` (tokenizer + prepared chunks) and `runs/` (checkpoints) are gitignored generated artifacts. Don't hand-edit them. Regenerating them streams FineWeb-Edu from the network and takes a long time.
-- `docs/verification.md` contains temporary planning notes, `docs/vision.md` the long-term predictor direction (head revival/growth), and `docs/tickets/` open work items. None of them describes implemented behavior.
+- `docs/architecture.md` describes the implemented model; `docs/vision.md` is planning, not implemented behavior; `docs/adr/` records decisions.
 
 ## Gotchas
-- Training hyperparameters (model size, AMP, `torch.compile`, decoder window, loss weights) are **module-level constants** in `jepa/training/train.py`, not CLI flags. Only data paths, batch size, epochs, `--resume`, `--jepa-only`, and `--subset` are flags; `train-decoder` adds `--model-dir`, `--output-dir`, `--lr`, `--device`, and its own `--resume`.
-- Both entry points share one trainer (`JepaTrainer`/`TrainConfig`) and the constants in `train.py`; `jepa/training/train_decoder.py` only defines its decoder-only CLI defaults (`DECODER_BATCH_SIZE`, `DECODER_LEARNING_RATE`, `DECODER_EPOCHS`).
-- `JepaDecodeModel.freeze_jepa()` (used by `train-decoder`) freezes the encoder/predictor and makes `forward` skip the JEPA loss (they run under `torch.no_grad()`); its `train()` re-asserts eval mode for them. The frozen path commits by hindsight with the same fp32 `Futures.distances` the VISReg loss uses, so both paths pick the same candidate under bf16 autocast. The mirror image, `skip_decoder()` (`train --jepa-only`), makes `forward` return `decoder_out=None`; the trainer drops whichever loss term is missing.
-- `MODEL_MAX_LENGTH` in `train.py` must match `prepare-data --max-length` (default 1024).
-- The encoder owns `hidden_size`, `vocab_size`, and `pad_token_id`. Build the other configs with `PredictorConfig.from_encoder` / `DecoderConfig.from_encoder` / `JepaConfig.from_encoder`. If you pass conflicting explicit values, construction raises `ValueError`.
-- The checkpoint `config.json` nests the component configs (`encoder`/`predictor`/`decoder`/`visreg`) with no top-level duplicates. Keep it that way when adding config fields.
-- `RIGHT_PADDED=True` assumes a right-padding tokenizer. Under that assumption, causal attention skips the padding mask so the code can use fused SDPA. Changing the padding side breaks this.
-- The decoder gets **detached** latent hints, so the decoder loss must not update the encoder or predictor.
+- Config defaults are the experiment. Don't override model size, window, candidate count, loss weights or annealing in the scripts. Checkpoint `config.json` nests `encoder`/`predictor`/`decoder`/`visreg`/`commitment` with no top-level duplicates.
+- Engineering constants (AMP, `torch.compile`, padding, logging, save interval, LR schedule) are module-level in `jepa/training/train.py` / `trainer.py`, not CLI flags. Flags: data paths, `--tokenizer`, `--batch-size`, `--epochs`, `--stage`, `--from`, `--output-dir`, `--resume`, `--lr`, `--device`, `--subset`.
+- The encoder owns `hidden_size`, `vocab_size`, and `pad_token_id`. Build the other configs with `PredictorConfig.from_encoder` / `DecoderConfig.from_encoder` / `JepaConfig.from_encoder`. Conflicting explicit values raise `ValueError`.
+- The encoder is causal and batches are **right-padded**, so attention skips the padding mask and uses fused SDPA. Changing the padding side breaks this.
+- Two stages share one trainer. The JEPA stage (`stage="jepa"`) never runs the decoder and logs `jepa_*` keys; the checkpoint keeps a loadable decoder. The decoder stage (`stage="decoder"`) freezes encoder/predictor, runs them under `torch.no_grad()`, trains only the decoder, and logs `decoder_*` + perplexity. `decoder_loss` commits by `DecoderConfig.train_policy` in train mode and π-argmax in eval; hints are detached.
+- Each stage writes `history_<stage>.json`; `history_jepa.json` is the one `--resume` reads in the JEPA stage.
 - Checkpoints are saved from the uncompiled module so state dicts don't get `_orig_mod.` prefixes. Keep this when touching saving code.
+- `--max-length` in `prepare-data` must match `EncoderConfig.max_position_embeddings` (default 1024).
+- `DecoderConfig.loss_chunk_size` bounds the decoder logits tensor; measurement's `--loss-chunk-size` overrides it for one run.
 - On NixOS, `torch.compile` needs the dev shell (`openssl` on PATH, `TRITON_LIBCUDA_PATH`). Outside it, `torch.compile` quietly falls back to eager mode with only a warning.
+- `tests/test_research_claim.py` is the main test of the idea (candidates on modes, μ blur, committed rollout on the manifold, hindsight rollout error). `tests/test_measure.py` covers the measurement dict. Keep both green.
 - `scripts/slurm_train.sh` is the cluster launcher (L40S). It forwards its args to `python -m jepa train`.

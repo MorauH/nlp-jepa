@@ -29,9 +29,8 @@ from tqdm.auto import tqdm
 from transformers import set_seed
 
 from ..models.jepa import JepaModel
-from ..runtime import available_cpu_count, resolve_amp_dtype, select_device
+from ..runtime import select_device
 from .data import LengthBucketBatchSampler, example_lengths, tokenize_batch
-from .optim import parameter_groups
 
 STAGES = ("jepa", "decoder")
 
@@ -40,8 +39,8 @@ STAGES = ("jepa", "decoder")
 class TrainConfig:
     """The few training knobs the loop reads.
 
-    Everything else (optimizer, AMP, compile, LR schedule) is fixed by the
-    module-level constants in ``jepa/training/train.py``.
+    Everything else (optimizer, AMP, compile, LR schedule, data padding) is
+    fixed by the module-level constants in ``jepa/training/train.py``.
     """
 
     output_dir: str | Path
@@ -52,9 +51,38 @@ class TrainConfig:
     weight_decay: float = 0.01
     seed: int = 42
     device: str | None = None
-    # DataLoader workers.  Tests use 0; the default mirrors the historical
-    # hard-coded value.
     num_workers: int | None = None
+
+
+def _cpu_count() -> int:
+    """Number of CPUs this process may use."""
+    if hasattr(os, "process_cpu_count"):  # Python >= 3.13
+        count = os.process_cpu_count()
+    elif hasattr(os, "sched_getaffinity"):
+        count = len(os.sched_getaffinity(0))
+    else:
+        count = os.cpu_count()
+    return max(1, count or 1)
+
+
+def _parameter_groups(model, weight_decay: float):
+    """Split trainable parameters into decayed and non-decayed groups.
+
+    Weight decay must not touch biases or normalization scales: decaying an
+    RMSNorm weight collapses the residual stream.
+    """
+    decay, no_decay = [], []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.ndim < 2 or name.endswith(".bias") or "norm" in name.lower():
+            no_decay.append(parameter)
+        else:
+            decay.append(parameter)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
 
 
 class JepaTrainer:
@@ -77,7 +105,6 @@ class JepaTrainer:
         max_grad_norm: float | None = 1.0,
         history: dict | None = None,
         use_amp: bool = True,
-        amp_dtype: str = "auto",
         compile_model: bool = False,
         compile_mode: str = "default",
         pad_to_multiple_of: int = 64,
@@ -89,44 +116,33 @@ class JepaTrainer:
                 f"stage must be one of {STAGES}; got {config.stage!r}"
             )
 
-        # Keep an uncompiled reference: checkpoints are always written from the
-        # original model.
         self.model = model
-        self._raw_model = model
         self.config = config
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
 
         self.max_grad_norm = max_grad_norm
-
         self.use_amp = use_amp
-        self.amp_dtype = amp_dtype
         self.compile_model = compile_model
         self.compile_mode = compile_mode
         self.pad_to_multiple_of = pad_to_multiple_of
         self.log_every = max(1, int(log_every))
         self.num_workers = (
-            min(8, available_cpu_count())
+            min(8, _cpu_count())
             if config.num_workers is None
             else max(0, int(config.num_workers))
         )
-        # Also checkpoint every N optimizer steps (not only at epoch end), so
-        # a crash/timeout loses at most N steps and `measure` can be run on a
-        # partially trained model.  None or 0 disables mid-epoch saves.
+        # Checkpoint every N optimizer steps as well as at epoch end, so a
+        # crash loses at most N steps.  None or 0 disables mid-epoch saves.
         self.save_every_steps = (
             int(save_every_steps) if save_every_steps else None
         )
 
         self.history_file = f"history_{config.stage}.json"
-
         self._amp_dtype: torch.dtype | None = None
-        self._scaler: torch.amp.GradScaler | None = None
         # Replaced by the compiled stage loss when compilation succeeds.
         self._loss_fn = self._raw_loss
-
-        # Fresh training starts empty; every key is created on first use, so a
-        # stage never gets the other stage's fake entries.
         self.history = history if history is not None else {}
 
     # ------------------------------------------------------------------
@@ -136,19 +152,19 @@ class JepaTrainer:
         """Return ``(trainable, frozen)`` module lists for this stage."""
         if self.config.stage == "jepa":
             return (
-                [self._raw_model.encoder, self._raw_model.predictor],
-                [self._raw_model.decoder],
+                [self.model.encoder, self.model.predictor],
+                [self.model.decoder],
             )
         return (
-            [self._raw_model.decoder],
-            [self._raw_model.encoder, self._raw_model.predictor],
+            [self.model.decoder],
+            [self.model.encoder, self.model.predictor],
         )
 
     def _apply_stage(self, training: bool) -> None:
         """Set requires_grad and train/eval modes owned by the stage."""
-        # Set the top-level flag too: JepaModel.decoder_loss reads
-        # ``self.training`` to pick the commit policy.
-        self._raw_model.train(training)
+        # The top-level flag matters: decoder_loss reads ``self.training`` to
+        # pick the commit policy.
+        self.model.train(training)
         trainable, frozen = self._stage_modules()
         for module in trainable:
             module.requires_grad_(True)
@@ -162,41 +178,28 @@ class JepaTrainer:
     # ------------------------------------------------------------------
     def _raw_loss(self, labels, attention_mask=None, progress=None):
         if self.config.stage == "jepa":
-            return self._raw_model.jepa_loss(
+            return self.model.jepa_loss(
                 labels, attention_mask=attention_mask, progress=progress
             )
-        return self._raw_model.decoder_loss(
-            labels, attention_mask=attention_mask
-        )
+        return self.model.decoder_loss(labels, attention_mask=attention_mask)
 
-    def _losses(
-        self, labels, attention_mask, progress=None
-    ) -> dict[str, torch.Tensor]:
+    def _losses(self, labels, attention_mask, progress=None) -> dict[str, torch.Tensor]:
         """Forward one batch; return the total and its components.
 
         The JEPA stage prefixes every term and diagnostic with ``jepa_``.  The
-        decoder stage logs the unweighted token loss and nothing JEPA-related.
+        decoder stage logs only the unweighted token loss.
         """
         out = self._loss_fn(labels, attention_mask, progress)
         if self.config.stage == "jepa":
             values = {"jepa_loss": out.loss}
-            for name, value in out.terms.items():
-                values[f"jepa_{name}"] = value
-            for name, value in out.diagnostics.items():
+            for name, value in (*out.terms.items(), *out.diagnostics.items()):
                 values[f"jepa_{name}"] = value
         else:
             values = {"decoder_token": out.terms["token"]}
         values["loss"] = out.loss
         return values
 
-    def _resolve_amp_dtype(self, device: torch.device) -> torch.dtype | None:
-        """Pick the autocast dtype, or None when AMP is off."""
-        if not self.use_amp:
-            return None
-        return resolve_amp_dtype(device, self.amp_dtype)
-
     def _autocast(self, device: torch.device):
-        """Return the autocast context (a no-op when AMP is disabled)."""
         if self._amp_dtype is None:
             return nullcontext()
         return torch.autocast(device_type=device.type, dtype=self._amp_dtype)
@@ -206,22 +209,19 @@ class JepaTrainer:
         """Enable the fast math paths that are safe for this workload."""
         if device.type != "cuda":
             return
-        # TF32 for any remaining fp32 matmuls (the VISReg loss, for example).
+        # TF32 for the remaining fp32 matmuls (the VISReg loss, for example).
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    def _make_loader(
-        self, dataset, shuffle: bool, device, collate_fn
-    ) -> DataLoader:
-        num_workers = self.num_workers
+    def _make_loader(self, dataset, shuffle: bool, device, collate_fn) -> DataLoader:
         kwargs = dict(
-            num_workers=num_workers,
-            persistent_workers=num_workers > 0,
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
             pin_memory=device.type == "cuda",
             collate_fn=collate_fn,
         )
-        if num_workers > 0:
+        if self.num_workers > 0:
             kwargs["prefetch_factor"] = 4
 
         if shuffle:
@@ -235,7 +235,6 @@ class JepaTrainer:
                 ),
                 **kwargs,
             )
-
         return DataLoader(
             dataset,
             batch_size=self.config.batch_size,
@@ -260,8 +259,7 @@ class JepaTrainer:
         for name, value in values.items():
             if name not in totals:
                 totals[name] = torch.zeros((), device=value.device)
-            # Accumulate on the GPU and only synchronize when logging; calling
-            # .item() every step stalls the pipeline.
+            # Accumulate on the GPU and synchronize only when logging.
             totals[name] += value.detach()
         return totals
 
@@ -276,19 +274,13 @@ class JepaTrainer:
         for labels, attention_mask in val_loader:
             labels = labels.to(device, non_blocking=True)
             attention_mask = attention_mask.to(device, non_blocking=True)
-
-            # Both stages need at least k + 1 tokens.
             if labels.shape[1] <= horizon:
                 continue
-
             with self._autocast(device):
-                self._accumulate(
-                    totals, self._losses(labels, attention_mask)
-                )
+                self._accumulate(totals, self._losses(labels, attention_mask))
             n_batches += 1
 
         self._apply_stage(training=True)
-
         if n_batches == 0:
             return {"loss": float("nan")}
 
@@ -298,6 +290,15 @@ class JepaTrainer:
                 min(averages["decoder_token"], 20.0)
             )
         return averages
+
+    def _save(self, output_dir: str | Path) -> None:
+        """Save the full model checkpoint and this stage's history."""
+        os.makedirs(output_dir, exist_ok=True)
+        # Save the original module, not a compiled wrapper (whose state dict
+        # would be prefixed with ``_orig_mod.``).
+        self.model.save_pretrained(output_dir)
+        with open(os.path.join(output_dir, self.history_file), "w") as handle:
+            json.dump(self.history, handle, indent=4)
 
     def train(self) -> dict:
         """Train the model and return the loss history."""
@@ -313,27 +314,19 @@ class JepaTrainer:
         # parameters never enter a group.
         self._apply_stage(training=True)
 
-        self._amp_dtype = self._resolve_amp_dtype(device)
-        self._scaler = torch.amp.GradScaler(
-            "cuda",
-            enabled=(self._amp_dtype == torch.float16),
-        )
-        amp_label = str(self._amp_dtype).replace("torch.", "") if self._amp_dtype else "off"
+        # bf16 autocast on CUDA; the CPU path runs in fp32.
+        self._amp_dtype = torch.bfloat16 if self.use_amp and device.type == "cuda" else None
+        amp_label = "bf16" if self._amp_dtype else "off"
         print(
             f"stage: {stage} | AMP: {amp_label} | compile: {self.compile_model} "
-            f"(mode={self.compile_mode}) | "
-            f"pad multiple: {self.pad_to_multiple_of}"
+            f"(mode={self.compile_mode}) | pad multiple: {self.pad_to_multiple_of}"
         )
 
         if self.compile_model:
             # ``dynamic=True`` keeps the varying sequence lengths and the
-            # variable number of valid tokens in the VISReg loss from
-            # triggering a recompile for every batch shape.  ``suppress_errors``
-            # makes a backend failure fall back to eager execution instead of
-            # killing a long training run.
-            # Variable sequence lengths create a few shape variants.  The
-            # default limit of 8 makes Dynamo fall back to eager halfway
-            # through an epoch; 64 covers every 64-token bucket.
+            # variable number of valid tokens from triggering a recompile for
+            # every batch shape; ``suppress_errors`` falls back to eager
+            # instead of killing a long run.  64 covers every 64-token bucket.
             torch._dynamo.config.recompile_limit = 64
             torch._dynamo.config.cache_size_limit = 64
             torch._dynamo.config.suppress_errors = True
@@ -341,9 +334,7 @@ class JepaTrainer:
                 # Compile only the stage's loss: the other stage's modules are
                 # frozen and must stay out of the graph.
                 self._loss_fn = torch.compile(
-                    self._raw_loss,
-                    mode=self.compile_mode,
-                    dynamic=True,
+                    self._raw_loss, mode=self.compile_mode, dynamic=True
                 )
                 print(f"torch.compile: enabled for {stage} loss")
             except Exception as exc:  # pragma: no cover - depends on the backend
@@ -357,21 +348,15 @@ class JepaTrainer:
         if device.type == "cuda":
             # Fused AdamW keeps the whole update in one CUDA kernel.
             optimizer_kwargs["fused"] = True
-        # ``parameter_groups`` skips frozen parameters, so only the stage's
-        # modules are optimized.
-        param_groups = parameter_groups(self._raw_model, config.weight_decay)
+        groups = _parameter_groups(self.model, config.weight_decay)
         try:
             optimizer = torch.optim.AdamW(
-                param_groups,
-                lr=config.learning_rate,
-                **optimizer_kwargs,
+                groups, lr=config.learning_rate, **optimizer_kwargs
             )
         except (TypeError, RuntimeError):
             optimizer_kwargs.pop("fused", None)
             optimizer = torch.optim.AdamW(
-                param_groups,
-                lr=config.learning_rate,
-                **optimizer_kwargs,
+                groups, lr=config.learning_rate, **optimizer_kwargs
             )
         if optimizer_kwargs:
             print("Optimizer: AdamW (fused)")
@@ -399,16 +384,13 @@ class JepaTrainer:
         def lr_lambda(step):
             if step < warmup_steps:
                 return (step + 1) / warmup_steps
-            progress = (step - warmup_steps) / max(
-                1, total_steps - warmup_steps
-            )
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
             return eta_min_ratio + (1 - eta_min_ratio) * 0.5 * (
                 1 + math.cos(math.pi * progress)
             )
 
         with warnings.catch_warnings():
-            # _LRScheduler steps once during construction, before the first
-            # optimizer step; the warning is harmless.
+            # LambdaLR steps once during construction; the warning is harmless.
             warnings.filterwarnings(
                 "ignore", message="Detected call of `lr_scheduler.step"
             )
@@ -422,21 +404,16 @@ class JepaTrainer:
                 batch_sampler.set_epoch(epoch)
             totals: dict[str, torch.Tensor] = {}
             n_batches = 0
-            pbar = tqdm(
-                train_loader,
-                desc=f"epoch {epoch + 1}/{num_epochs}",
-            )
+            pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{num_epochs}")
 
             for labels, attention_mask in pbar:
                 labels = labels.to(device, non_blocking=True)
                 attention_mask = attention_mask.to(device, non_blocking=True)
-
                 if labels.shape[1] <= horizon:
                     continue
 
-                # Annealed winner-takes-all temperature.  A 0-dim tensor, so
-                # torch.compile treats it as a graph input instead of a Python
-                # value to guard on.  Only the JEPA stage reads it.
+                # 0-dim tensor, so torch.compile treats the annealing progress
+                # as a graph input instead of a Python value to guard on.
                 progress = None
                 if stage == "jepa":
                     progress = torch.tensor(
@@ -448,16 +425,12 @@ class JepaTrainer:
                     loss = values["loss"]
 
                 optimizer.zero_grad(set_to_none=True)
-                self._scaler.scale(loss).backward()
-
+                loss.backward()
                 if self.max_grad_norm is not None:
-                    self._scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
-                        self._raw_model.parameters(), self.max_grad_norm
+                        self.model.parameters(), self.max_grad_norm
                     )
-
-                self._scaler.step(optimizer)
-                self._scaler.update()
+                optimizer.step()
                 scheduler.step()
 
                 self._accumulate(totals, values)
@@ -525,12 +498,10 @@ class JepaTrainer:
             )
             if "perplexity" in val_means:
                 summary += f" | val_ppl {val_means['perplexity']:.2f}"
-            train_terms = describe_terms(train_means)
-            if train_terms:
-                summary += f"\n  train terms: {train_terms}"
-            val_terms = describe_terms(val_means)
-            if val_terms:
-                summary += f"\n  val terms:   {val_terms}"
+            if terms := describe_terms(train_means):
+                summary += f"\n  train terms: {terms}"
+            if terms := describe_terms(val_means):
+                summary += f"\n  val terms:   {terms}"
             print(summary)
 
             if device.type == "cuda":
@@ -550,14 +521,3 @@ class JepaTrainer:
             }
             self._save(config.output_dir)
         return self.history
-
-    def _save(self, output_dir: str | Path) -> None:
-        """Save the full model checkpoint and this stage's history."""
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Save the original module, not a compiled wrapper (whose state dict
-        # would be prefixed with ``_orig_mod.``).
-        self._raw_model.save_pretrained(output_dir)
-
-        with open(os.path.join(output_dir, self.history_file), "w") as handle:
-            json.dump(self.history, handle, indent=4)

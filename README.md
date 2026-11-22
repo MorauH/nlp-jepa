@@ -1,64 +1,23 @@
 # JEPA language model
 
 A joint-embedding predictive architecture (JEPA) for text. A causal encoder
-maps token sequences to latents, a predictor proposes future latents, and an
-autoregressive decoder turns latent waypoints into tokens. Training combines
-the VISReg JEPA objective with a token-level decoder loss.
-
-## Layout
-
-```
-data/                         generated datasets and tokenizer
-docs/
-  architecture.md             model, data, training, and generation details
-  verification.md             collapse / latent-usage test notes
-  vision.md                   long-term predictor direction (not implemented)
-jepa/
-  __main__.py                 `python -m jepa <command>`
-  cli.py                      command dispatcher
-  config.py                   component configs
-  paths.py                    project paths
-  runtime.py                  device and AMP helpers
-  models/
-    blocks.py                 shared Transformer blocks
-    encoder.py                causal token encoder
-    predictor.py              latent predictor
-    decoder.py                autoregressive token decoder
-    losses.py                 VISReg objective
-    jepa.py                   JepaModel (encoder + predictor)
-    stack.py                  JepaDecodeModel (full stack)
-  data/
-    tokenizer.py              tokenizer loading
-    prepare.py                FineWeb-Edu -> token chunks
-    train_tokenizer.py        byte-level BPE
-  training/
-    data.py                   collation and length bucketing
-    optim.py                  parameter groups
-    trainer.py                JepaTrainer
-    train.py                  end-to-end training
-    train_decoder.py          decoder-only fine-tuning
-  inference/
-    generate.py               sample text from a checkpoint
-  evaluation/
-    measure.py                the paper's numbers: representation, commit,
-                              rollout and decoder measurements
-runs/                         checkpoints (ignored)
-scripts/
-  slurm_train.sh              SLURM launcher
-```
+maps token sequences to latents, a predictor proposes candidate future latents,
+and the model commits to exactly one of them. An autoregressive decoder turns
+the committed future into tokens. The paper asks whether committing keeps each
+latent, and every chained rollout, a clear single future instead of a blurry
+average. Terms are defined in [GLOSSARY.md](GLOSSARY.md).
 
 ## Environment
 
-The project uses [uv](https://docs.astral.sh/uv/). On NixOS/WSL2, enter the dev
-shell:
+The project uses [uv](https://docs.astral.sh/uv/). On NixOS/WSL2, enter the
+dev shell:
 
 ```bash
 nix develop
 uv sync
 ```
 
-`flake.nix` provides Python 3.12, uv, and the CUDA/Triton paths needed by
-`torch.compile` on WSL2. You can also run a command directly:
+You can also run a command directly:
 
 ```bash
 nix develop --command python -m jepa train
@@ -66,14 +25,14 @@ nix develop --command python -m jepa train
 
 ## Data
 
-Train the 32k tokenizer once
+Train the 32k tokenizer once:
 
 ```bash
 python -m jepa train-tokenizer
 ```
 
-Then prepare 500M tokens of training chunks. The default streams FineWeb-Edu
-directly:
+Then prepare 500M tokens of 1024-token training chunks. The default streams
+FineWeb-Edu directly:
 
 ```bash
 python -m jepa prepare-data
@@ -89,48 +48,42 @@ python -m jepa train-tokenizer \
 python -m jepa prepare-data --text-file data/fineweb_edu_500m_tokens.txt
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the full data pipeline
-and options.
+See [docs/architecture.md](docs/architecture.md) for the pipeline and options.
 
 ## Training
+
+Training has two stages ([ADR 0001](docs/adr/0001-two-stage-training.md)).
+First train the encoder and predictor:
 
 ```bash
 python -m jepa train                  # prepared FineWeb-Edu chunks
 python -m jepa train --resume         # continue from runs/jepa
 ```
 
-For decoder-only fine-tuning against a frozen encoder and predictor (same
-trainer, AMP, compile and checkpoint machinery as `train`, minus the JEPA loss):
+Then train a decoder against the frozen JEPA:
 
 ```bash
-python -m jepa train-decoder    # reads and writes runs/jepa
+python -m jepa train --stage decoder --from runs/jepa
+python -m jepa train --stage decoder --resume --epochs 2
 ```
 
-Two-stage training (decoder trained only once the hints are stable):
-
-```bash
-python -m jepa train --jepa-only   # encoder + predictor; the decoder is never run
-python -m jepa train-decoder       # fresh decoder on the frozen encoder/predictor
-python -m jepa train-decoder --resume --epochs 2   # keep training that decoder
-```
-
-It replaces the decoder in `runs/jepa` (encoder/predictor stay unchanged) and
-logs to `runs/jepa/history_decoder.json`, leaving the joint `history.json`.
+Each stage writes the full checkpoint and its own `history_<stage>.json` to
+`runs/jepa`. The decoder stage keeps the frozen encoder and predictor and
+replaces only the decoder.
 
 ## Generation
 
 ```bash
-python -m jepa generate
 python -m jepa generate --prompt "When in Rome, " --steps 3 --temperature 0.8
 ```
 
-## Evaluation
+## Measurement
 
 ```bash
 python -m jepa measure --model runs/jepa
 python -m jepa measure --model runs/jepa --json runs/jepa/metrics.json
 ```
 
-Run `python -m jepa --help` for the command list. Detailed configuration,
-training knobs, and the saved checkpoint layout are in
+Run `python -m jepa --help` for the command list. Configuration, checkpoint
+layout and the meaning of each measurement section are in
 [docs/architecture.md](docs/architecture.md).

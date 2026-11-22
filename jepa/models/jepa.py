@@ -89,10 +89,6 @@ class JepaModel(PreTrainedModel):
         self.visreg = VISReg(config.visreg)
         self.commitment_loss = CommitmentLoss(config.commitment)
 
-        # Optional chunk size for the decoder's lm_head; train.py sets it so
-        # the full (batch, sequence, vocab) logits tensor is never held.
-        self.decoder_loss_chunk_size: int | None = None
-
         self.post_init()
 
     @property
@@ -212,7 +208,7 @@ class JepaModel(PreTrainedModel):
             committed.detach(),
             labels,
             attention_mask=attention_mask,
-            chunk_size=self.decoder_loss_chunk_size,
+            chunk_size=self.config.decoder.loss_chunk_size,
         )
         token_loss = token_sum / token_count.clamp_min(1)
         return LossOutput(

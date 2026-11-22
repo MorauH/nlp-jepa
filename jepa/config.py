@@ -215,6 +215,9 @@ class DecoderConfig(TransformerConfig):
     future, ``"pi_argmax"`` the most likely candidate under pi (the inference
     condition).  Evaluation always uses ``"pi_argmax"``.  The names are
     registered in :data:`jepa.models.commitment.POLICIES`.
+
+    ``loss_chunk_size`` bounds the ``(batch, positions, vocab)`` logits tensor
+    held at once by the token loss; ``None`` computes it in one pass.
     """
 
     model_type = "jepa_decoder"
@@ -230,6 +233,7 @@ class DecoderConfig(TransformerConfig):
         sliding_window: int = 32,
         num_hidden_layers: int = 4,
         train_policy: str = "hindsight",
+        loss_chunk_size: int | None = 256,
         **kwargs,
     ):
         kwargs.setdefault("is_causal", True)
@@ -241,6 +245,7 @@ class DecoderConfig(TransformerConfig):
         # Grammar is local; the latent hints carry the longer-range semantics.
         self.sliding_window = sliding_window
         self.train_policy = train_policy
+        self.loss_chunk_size = loss_chunk_size
 
     def validate(self) -> "DecoderConfig":
         super().validate()
@@ -255,6 +260,8 @@ class DecoderConfig(TransformerConfig):
                 f"train_policy must be one of {self.TRAIN_POLICIES}; "
                 f"got {self.train_policy!r}"
             )
+        if self.loss_chunk_size is not None and self.loss_chunk_size < 1:
+            raise ValueError("loss_chunk_size must be None or at least 1")
         return self
 
     @classmethod
@@ -491,7 +498,7 @@ class JepaConfig(PretrainedConfig):
     # Validation
     # ------------------------------------------------------------------
     def link(self) -> "JepaConfig":
-        """Fill in or verify every dimension shared between components."""
+        """Fill in or check every dimension shared between components."""
         self.encoder.validate()
 
         self._set_or_check(
