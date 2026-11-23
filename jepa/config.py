@@ -26,8 +26,8 @@ The encoder owns the embedding width and the vocabulary.  When a
 
 Passing an explicitly conflicting value raises ``ValueError`` instead of
 silently building a model whose pieces do not fit together.  The defaults in
-this module are the actual experiment; the training scripts do not override
-them.
+this module are the main experiment; variants are override files in
+``docs/experiments/``, applied with :func:`apply_overrides`.
 
 Standalone components
 ---------------------
@@ -40,6 +40,8 @@ other default in place::
 """
 
 from __future__ import annotations
+
+import copy
 
 from transformers import PretrainedConfig
 
@@ -549,3 +551,35 @@ class JepaConfig(PretrainedConfig):
                 f"(expected {expected}). Remove the override or make the "
                 "encoder match."
             )
+
+
+COMPONENTS = ("encoder", "predictor", "decoder", "visreg", "commitment")
+
+
+def apply_overrides(config: JepaConfig, overrides: dict) -> JepaConfig:
+    """Return a copy of ``config`` with ``overrides`` set and re-validated.
+
+    ``overrides`` has the nesting of a checkpoint's ``config.json``, e.g.
+    ``{"predictor": {"prediction_count": 1}}``.  ``PretrainedConfig`` accepts
+    any kwarg, so every key must already exist on its target.
+    """
+    config = copy.deepcopy(config)
+    for key, value in overrides.items():
+        if key in COMPONENTS:
+            if not isinstance(value, dict):
+                raise TypeError(f"override {key!r} must be an object; got {value!r}")
+            for name, item in value.items():
+                _set_existing(getattr(config, key), name, item, f"{key}.{name}")
+        else:
+            _set_existing(config, key, value, key)
+    return config.link()
+
+
+def _set_existing(target: PretrainedConfig, name: str, value, path: str) -> None:
+    known = {
+        key for key in vars(target)
+        if not key.startswith("_") and key not in _SERIALIZATION_METADATA
+    }
+    if name not in known:
+        raise KeyError(f"unknown config override {path!r}")
+    setattr(target, name, value)

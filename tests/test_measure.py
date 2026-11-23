@@ -257,6 +257,28 @@ def test_metrics_are_json_serializable(saved):
     assert json.loads(json.dumps(metrics)) == metrics
 
 
+def test_single_candidate_reports_choice_metrics_as_na(saved, tmp_path, capsys):
+    """P = 1 (the baseline): π, live slots and pair cosine are n/a."""
+    from jepa import apply_overrides
+
+    _, data_dir = saved
+    model_dir = tmp_path / "p1"
+    torch.manual_seed(0)
+    config = apply_overrides(tiny_config(), {"predictor": {"prediction_count": 1}})
+    JepaModel(config).save_pretrained(model_dir)
+
+    metrics = collect((model_dir, data_dir))
+    heads = metrics["heads"]
+    assert metrics["context"]["candidates"] == 1
+    for key in ("candidate_pair_cos", "live_slots", "pi_nll", "pi_gain", "pi_accuracy"):
+        assert heads[key] is None, key
+    assert "pi_uses_z_t" not in {verdict["name"] for verdict in metrics["verdicts"]}
+    assert json.loads(json.dumps(metrics)) == metrics
+
+    measure.print_report(metrics)
+    assert "n/a" in capsys.readouterr().out
+
+
 def test_measure_cli_writes_the_same_dict(saved, monkeypatch, tmp_path):
     model_dir, data_dir = saved
     tokenizer = FakeTokenizer()

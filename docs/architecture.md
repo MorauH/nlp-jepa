@@ -107,9 +107,18 @@ number. Validation perplexity is `exp` of the token-weighted mean token loss
 
 ## Configuration
 
-`jepa/config.py` holds the experiment: model sizes, window, candidate count,
-loss weights and annealing. Those defaults are the run; the training scripts
-do not override them. Checkpoint `config.json` nests the component configs:
+`jepa/config.py` holds the main experiment: model sizes, window, candidate
+count, loss weights and annealing. Variants (baselines, ablations) are
+override files in `docs/experiments/`, passed as `train --config PATH`. Each one is a JSON
+object nested like `config.json` that holds only the fields that change, and
+`apply_overrides` rejects unknown keys before anything trains. A fresh JEPA run
+applies them to the defaults, and the decoder stage accepts only `decoder.*`
+keys. With `--resume`, `--config` is an error because the checkpoint's config is the run's. `--seed N`
+(default `SEED`) seeds model construction and the data order. It is saved in
+`history_<stage>.json` and the trainer state, so `--resume` keeps it. On CPU
+a seed reproduces the weights exactly. On CUDA, non-deterministic kernels
+(Flash Attention backward) make same-seed runs differ slightly. Checkpoint
+`config.json` nests the component configs:
 
 ```json
 {
@@ -131,9 +140,9 @@ Engineering choices that are not the experiment live as module-level constants
 in `jepa/training/trainer.py`, the single source: bf16 autocast and
 `torch.compile` (both CUDA-only), fused AdamW, TF32, the warmup+cosine
 schedule (`WARMUP_FRACTION`, `LR_FLOOR_FRACTION`), gradient clipping, weight
-decay, the seed, batch padding, `LOG_EVERY` and `SAVE_EVERY_STEPS`.
+decay, the default seed, batch padding, `LOG_EVERY` and `SAVE_EVERY_STEPS`.
 `TrainConfig` carries only per-run values (stage, output dir, batch size,
-epochs, learning rate, device, resume, workers, save interval); the CLI sets
+epochs, learning rate, device, resume, workers, save interval, seed); the CLI sets
 per-stage defaults and nothing else. Checkpoints are saved from the uncompiled
 module.
 

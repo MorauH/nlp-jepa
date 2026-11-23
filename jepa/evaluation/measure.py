@@ -246,10 +246,8 @@ def _heads_section(model, batches, latents) -> dict:
     # If μ is calibrated, E[d(μ̂, ŷ)] = 2 - 2|μ| (μ is a mean of unit futures,
     # not renormalized).
     mu_distance_predicted = 2.0 - 2.0 * mu_norm
-    return {
-        "candidate_pair_cos": pair_sim_sum / pair_count if pair_count else 1.0,
-        "delta_ratio": (delta_sum / (count * prediction_count)) / max(z_norm_sum / count, 1e-12),
-        "hindsight_shares": [float(x) for x in shares.tolist()],
+    choices = {
+        "candidate_pair_cos": pair_sim_sum / pair_count if pair_count else None,
         "live_slots": int((shares > 1.0 / (4 * prediction_count)).sum()),
         "effective_slots": math.exp(entropy),
         "pi_nll": pi_nll,
@@ -257,6 +255,13 @@ def _heads_section(model, batches, latents) -> dict:
         "pi_gain": entropy - pi_nll,
         "pi_accuracy": correct / count,
         "majority_accuracy": float(shares.max()),
+    }
+    if prediction_count == 1:  # nothing to choose between: n/a, not a number
+        choices = dict.fromkeys(choices)
+    return {
+        **choices,
+        "delta_ratio": (delta_sum / (count * prediction_count)) / max(z_norm_sum / count, 1e-12),
+        "hindsight_shares": [float(x) for x in shares.tolist()],
         "mu_norm": mu_norm,
         "mu_distance_measured": mu_distance,
         "mu_distance_predicted": mu_distance_predicted,
@@ -460,8 +465,10 @@ def _verdicts(metrics) -> list[dict]:
     decoder, representation, rollouts = (
         metrics["decoder"], metrics["representation"], metrics["rollouts"]
     )
-    verdicts = [
+    verdicts = [] if heads["pi_gain"] is None else [
         _verdict("pi_uses_z_t", "heads.pi_gain", heads["pi_gain"], 0.0, ">"),
+    ]
+    verdicts += [
         _verdict(
             "candidates_beat_mean", "policies.hindsight_gain_over_mu",
             policies["hindsight_gain_over_mu"], 0.01, ">",
@@ -550,7 +557,7 @@ def collect_metrics(
     return metrics
 
 def _fmt(value) -> str:
-    return f"{float(value):.4f}"
+    return "n/a" if value is None else f"{float(value):.4f}"
 
 def _table(rows, headers) -> None:
     widths = [max([len(str(h))] + [len(str(r[i])) for r in rows]) for i, h in enumerate(headers)]
@@ -597,7 +604,7 @@ def print_report(metrics: dict) -> None:
         ("candidate pair cos", _fmt(h["candidate_pair_cos"])),
         ("|delta| / |z|", _fmt(h["delta_ratio"])),
         ("hindsight shares", " ".join(_fmt(x) for x in h["hindsight_shares"])),
-        ("live slots", f"{h['live_slots']} / {len(h['hindsight_shares'])}  "
+        ("live slots", f"{'n/a' if h['live_slots'] is None else h['live_slots']} / {len(h['hindsight_shares'])}  "
                        f"(effective {_fmt(h['effective_slots'])})"),
         ("pi NLL", f"{_fmt(h['pi_nll'])}  vs constant {_fmt(h['constant_nll'])}  "
                    f"(gain {_fmt(h['pi_gain'])} nats)"),

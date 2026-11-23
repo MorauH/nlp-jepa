@@ -1,6 +1,6 @@
 # 002: Run baselines, ablations and seeds without editing code
 
-Status: open
+Status: done
 
 ## Why
 

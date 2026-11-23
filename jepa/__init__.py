@@ -26,6 +26,7 @@ from .config import (
     PredictorConfig,
     TransformerConfig,
     VISRegConfig,
+    apply_overrides,
 )
 from .models.decoder import DecoderModel
 from .models.encoder import EncodeTransformer
@@ -42,6 +43,7 @@ __all__ = [
     "VISRegConfig",
     "CommitmentLossConfig",
     "JepaConfig",
+    "apply_overrides",
     # Models
     "EncodeTransformer",
     "PredictorModel",

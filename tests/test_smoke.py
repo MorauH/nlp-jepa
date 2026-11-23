@@ -1144,6 +1144,144 @@ def test_decoder_stage_defaults_to_a_sibling_and_refuses_the_source(tmp_path):
         )
 
 
+def test_apply_overrides_sets_known_fields_and_rejects_typos():
+    from jepa import apply_overrides
+
+    base = tiny_config()
+    config = apply_overrides(
+        base, {"predictor": {"prediction_count": 1}, "pred_horizon": 3}
+    )
+    assert config.predictor.prediction_count == 1
+    assert config.pred_horizon == 3
+    assert base.predictor.prediction_count == 4  # the input is not mutated
+
+    with pytest.raises(KeyError, match="predictor.prediction_cout"):
+        apply_overrides(base, {"predictor": {"prediction_cout": 1}})
+    with pytest.raises(KeyError, match="predictr"):
+        apply_overrides(base, {"predictr": {"prediction_count": 1}})
+    with pytest.raises(TypeError):
+        apply_overrides(base, {"predictor": 1})
+    with pytest.raises(ValueError):  # link() still validates the result
+        apply_overrides(base, {"decoder": {"train_policy": "pi_sample"}})
+
+
+def test_train_cli_config_and_seed(tmp_path, monkeypatch):
+    """--config lands in config.json; --seed makes runs differ or repeat."""
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from datasets import Dataset, DatasetDict
+    from jepa.training import train
+
+    class FakeTokenizer(SimpleNamespace):
+        model_max_length = 32
+
+        def __len__(self):
+            return 64
+
+    monkeypatch.setattr(
+        train, "load_training_tokenizer", lambda path: FakeTokenizer(pad_token_id=0)
+    )
+    torch.manual_seed(0)
+    rows = [torch.randint(1, 64, (24,)).tolist() for _ in range(4)]
+    data_dir = tmp_path / "data"
+    DatasetDict(
+        {
+            "train": Dataset.from_dict({"input_ids": rows}),
+            "validation": Dataset.from_dict({"input_ids": rows[:2]}),
+        }
+    ).save_to_disk(str(data_dir))
+    preset = Path(__file__).parents[1] / "docs/experiments/p1-baseline.json"
+
+    def run(name, *extra):
+        out = tmp_path / name
+        train.main(
+            [
+                "--fineweb-dir", str(data_dir),
+                "--tokenizer", str(tmp_path / "unused-tokenizer"),
+                "--batch-size", "2",
+                "--epochs", "1",
+                "--device", "cpu",
+                "--output-dir", str(out),
+                *extra,
+            ]
+        )
+        return out
+
+    first = run("a", "--config", str(preset), "--seed", "1")
+    again = run("b", "--config", str(preset), "--seed", "1")
+    other = run("c", "--config", str(preset), "--seed", "2")
+
+    config = json.loads((first / "config.json").read_text())
+    assert config["predictor"]["prediction_count"] == 1
+    assert json.loads((first / "history_jepa.json").read_text())["seed"] == 1
+    state = torch.load(
+        first / "trainer_state_jepa.pt", map_location="cpu", weights_only=True
+    )
+    assert state["seed"] == 1
+
+    weights = {
+        name: JepaModel.from_pretrained(str(path)).state_dict()
+        for name, path in (("first", first), ("again", again), ("other", other))
+    }
+    for key, value in weights["first"].items():
+        assert torch.equal(value, weights["again"][key]), key
+    assert any(
+        not torch.equal(value, weights["other"][key])
+        for key, value in weights["first"].items()
+    )
+
+    # --resume keeps the saved seed (the default would be 42).
+    resumed = train.main(
+        [
+            "--resume",
+            "--fineweb-dir", str(data_dir),
+            "--tokenizer", str(tmp_path / "unused-tokenizer"),
+            "--batch-size", "2",
+            "--epochs", "1",
+            "--device", "cpu",
+            "--output-dir", str(first),
+        ]
+    )
+    assert resumed.seed == 1
+
+    # A typo fails before any data is read (the data dir does not exist).
+    typo = tmp_path / "typo.json"
+    typo.write_text(json.dumps({"predictor": {"prediction_cout": 1}}))
+    with pytest.raises(KeyError, match="prediction_cout"):
+        train.main(
+            [
+                "--config", str(typo),
+                "--fineweb-dir", str(tmp_path / "missing"),
+                "--output-dir", str(tmp_path / "typo"),
+                "--device", "cpu",
+            ]
+        )
+
+
+def test_train_cli_rejects_config_where_it_cannot_apply(tmp_path):
+    import json
+
+    from jepa.training import train
+
+    jepa_only = tmp_path / "jepa-only.json"
+    jepa_only.write_text(json.dumps({"predictor": {"prediction_count": 1}}))
+    decoder_only = tmp_path / "decoder-only.json"
+    decoder_only.write_text(json.dumps({"decoder": {"train_policy": "pi_argmax"}}))
+
+    # The decoder stage accepts decoder.* overrides only.
+    args = train.parse_args(["--stage", "decoder", "--config", str(decoder_only)])
+    assert args.overrides == {"decoder": {"train_policy": "pi_argmax"}}
+    with pytest.raises(SystemExit):
+        train.parse_args(["--stage", "decoder", "--config", str(jepa_only)])
+    # A resumed run's config and seed are the checkpoint's.
+    with pytest.raises(SystemExit):
+        train.parse_args(["--resume", "--config", str(jepa_only)])
+    with pytest.raises(SystemExit):
+        train.parse_args(["--resume", "--seed", "3"])
+
+
 def test_jepa_stage_never_runs_the_decoder(tmp_path):
     """JEPA stage: decoder untouched and never called."""
     from types import SimpleNamespace

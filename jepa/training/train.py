@@ -11,6 +11,7 @@ Run from the repository root::
     python -m jepa train --resume                # continue it
     python -m jepa train --stage decoder         # decoder stage on runs/jepa
     python -m jepa train --stage decoder --resume --epochs 2
+    python -m jepa train --config docs/experiments/p1-baseline.json --seed 1
 
 This module is CLI parsing, per-stage defaults, model building/loading and
 paths.  Engineering settings live in :mod:`jepa.training.trainer`.
@@ -24,7 +25,7 @@ from pathlib import Path
 
 from transformers import set_seed
 
-from ..config import EncoderConfig, JepaConfig
+from ..config import EncoderConfig, JepaConfig, apply_overrides
 from ..data.tokenizer import load_tokenizer
 from ..models.jepa import JepaModel
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
@@ -127,10 +128,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "dir, resuming the LR schedule and the epoch at the saved step. "
         "Missing trainer_state_<stage>.pt is an error.",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="JSON overrides nested like config.json, e.g. "
+        "docs/experiments/p1-baseline.json. The decoder stage accepts only "
+        "decoder.* keys. Not allowed with --resume.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=f"Seed for model init and the data order (default: {SEED}). "
+        "Not allowed with --resume, which keeps the run's seed.",
+    )
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", default=None, help="cpu, cuda, cuda:0, ...")
     add_dataset_args(parser, batch_size=None, epochs=None)
     args = parser.parse_args(argv)
+
+    if args.resume and args.config is not None:
+        parser.error("--config cannot be combined with --resume: the "
+                     "checkpoint's config.json is the run's config.")
+    if args.resume and args.seed is not None:
+        parser.error("--seed cannot be combined with --resume: the run keeps "
+                     "the seed in its trainer state.")
+    args.overrides = {}
+    if args.config is not None:
+        args.overrides = json.loads(args.config.read_text())
+        if not isinstance(args.overrides, dict):
+            parser.error(f"{args.config} must hold a JSON object")
+        if args.stage == "decoder" and set(args.overrides) - {"decoder"}:
+            parser.error(
+                f"{args.config}: the decoder stage only accepts decoder.* "
+                "overrides; the frozen JEPA is defined by --from."
+            )
+    if args.seed is None:
+        args.seed = SEED
 
     defaults = STAGE_DEFAULTS[args.stage]
     if args.batch_size is None:
@@ -160,13 +195,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def build_model(tokenizer) -> JepaModel:
+def build_model(tokenizer, overrides: dict | None = None) -> JepaModel:
     """Build a fresh JEPA + decoder model from the config defaults."""
     encoder_config = EncoderConfig(
         vocab_size=len(tokenizer),
         pad_token_id=tokenizer.pad_token_id,
     )
-    return JepaModel(JepaConfig.from_encoder(encoder_config))
+    config = JepaConfig.from_encoder(encoder_config)
+    return JepaModel(apply_overrides(config, overrides or {}))
+
+
+def load_model(args, tokenizer) -> JepaModel:
+    """The stage's model: resumed, fresh, or a fresh decoder on ``--from``."""
+    if args.resume:
+        # The decoder stage resumes the model in its own output dir, which
+        # holds the frozen JEPA plus the partially trained decoder.
+        return JepaModel.from_pretrained(str(args.output_dir))
+    if args.stage == "jepa":
+        return build_model(tokenizer, args.overrides)
+    base = JepaModel.from_pretrained(str(args.from_dir))
+    # Fresh decoder weights on the frozen JEPA.
+    return JepaModel(
+        apply_overrides(base.config, args.overrides),
+        encoder=base.encoder,
+        predictor=base.predictor,
+    )
 
 
 def main(argv: list[str] | None = None) -> JepaTrainer:
@@ -183,6 +236,13 @@ def main(argv: list[str] | None = None) -> JepaTrainer:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = load_training_tokenizer(args.tokenizer)
+
+    # Seed before building the model so fresh weights are reproducible.  The
+    # trainer re-seeds its own stream when training starts.  The model is
+    # built before the data loads so a bad override fails fast.
+    set_seed(args.seed)
+    model = load_model(args, tokenizer)
+
     train_dataset, val_dataset = load_datasets(args.fineweb_dir, args.subset)
     print(
         f"train examples: {len(train_dataset):,} | "
@@ -194,27 +254,6 @@ def main(argv: list[str] | None = None) -> JepaTrainer:
     if args.resume and history_path.exists():
         with open(history_path) as handle:
             history = json.load(handle)
-
-    # Seed before building the model so fresh weights are reproducible.  The
-    # trainer re-seeds its own stream when training starts.
-    set_seed(SEED)
-    if stage == "jepa":
-        if args.resume:
-            model = JepaModel.from_pretrained(str(output_dir))
-        else:
-            model = build_model(tokenizer)
-    elif args.resume:
-        # The decoder stage resumes the model in its own output dir, which
-        # holds the frozen JEPA plus the partially trained decoder.
-        model = JepaModel.from_pretrained(str(output_dir))
-    else:
-        base = JepaModel.from_pretrained(str(args.from_dir))
-        # Fresh decoder weights, same architecture and frozen JEPA.
-        model = JepaModel(
-            base.config,
-            encoder=base.encoder,
-            predictor=base.predictor,
-        )
 
     expected_vocab = model.config.encoder.vocab_size
     if expected_vocab != len(tokenizer):
@@ -228,6 +267,8 @@ def main(argv: list[str] | None = None) -> JepaTrainer:
     print("Model loaded")
     print(f"Stage: {stage}")
     print(f"Output: {output_dir}")
+    if args.overrides:
+        print(f"Overrides ({args.config}): {json.dumps(args.overrides)}")
     print("Parameters:", f"{sum(p.numel() for p in model.parameters()):,}")
     print("  encoder:  ", f"{sum(p.numel() for p in model.encoder.parameters()):,}")
     print("  predictor:", f"{sum(p.numel() for p in model.predictor.parameters()):,}")
@@ -249,6 +290,7 @@ def main(argv: list[str] | None = None) -> JepaTrainer:
             epochs=args.epochs,
             device=args.device,
             resume=args.resume,
+            seed=args.seed,
         ),
         train_dataset=train_dataset,
         eval_dataset=val_dataset,

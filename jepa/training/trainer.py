@@ -74,6 +74,8 @@ class TrainConfig:
     num_workers: int | None = None
     resume: bool = False
     save_every_steps: int | None = SAVE_EVERY_STEPS
+    # A resumed run uses the seed saved in its trainer state instead.
+    seed: int = SEED
 
 
 def _parameter_groups(model, weight_decay: float):
@@ -146,6 +148,7 @@ class JepaTrainer:
                                  if config.save_every_steps else None)
         self.history_file = f"history_{config.stage}.json"
         self.history = history if history is not None else {}
+        self.seed = config.seed
         self._amp_dtype: torch.dtype | None = None
         self._loss_fn = partial(self.stage.loss, self.model)  # compiled in _prepare
         # Set by train(); _checkpoint writes what --resume needs.
@@ -212,13 +215,13 @@ class JepaTrainer:
             pin_memory=device.type == "cuda",
             collate_fn=collate_fn,
             # A dedicated generator keeps the loader seed off the global RNG.
-            generator=torch.Generator().manual_seed(SEED),
+            generator=torch.Generator().manual_seed(self.seed),
         )
         if self.num_workers > 0:
             kwargs["prefetch_factor"] = 4
         if shuffle:  # bucket by length to avoid padding every batch to 1024
             sampler = LengthBucketBatchSampler(
-                example_lengths(dataset), self.config.batch_size, seed=SEED)
+                example_lengths(dataset), self.config.batch_size, seed=self.seed)
             return DataLoader(dataset, batch_sampler=sampler, **kwargs)
         return DataLoader(dataset, batch_size=self.config.batch_size,
                           shuffle=False, **kwargs)
@@ -289,7 +292,8 @@ class JepaTrainer:
 
     def _trainer_state(self) -> dict:
         """Everything a resumed run needs besides the model weights."""
-        state = {**self._position, "optimizer": self._optimizer.state_dict(),
+        state = {**self._position, "seed": self.seed,
+                 "optimizer": self._optimizer.state_dict(),
                  "scheduler": self._scheduler.state_dict(),
                  "rng": {"cpu": torch.get_rng_state()}}
         if self._device is not None and self._device.type == "cuda":
@@ -346,7 +350,7 @@ class JepaTrainer:
 
     def _prepare(self, device: torch.device) -> None:
         """Seed, backends, stage modes, AMP dtype and the compiled stage loss."""
-        set_seed(SEED)
+        set_seed(self.seed)
         self._device = device
         self._configure_backends(device)
         self.model.to(device)
@@ -398,9 +402,8 @@ class JepaTrainer:
             warnings.filterwarnings("ignore", message="Detected call of `lr_scheduler.step")
             return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    def _restore(self, optimizer, scheduler):
-        """Load the resume state; return ``(global_step, epoch, skipped, totals)``."""
-        state = self._load_trainer_state(self.config.output_dir)
+    def _restore(self, state, optimizer, scheduler):
+        """Apply the resume state; return ``(global_step, epoch, skipped, totals)``."""
         if int(state.get("total_steps", self._total_steps)) != self._total_steps:
             warnings.warn(
                 f"resuming with total_steps={self._total_steps}, but the run "
@@ -512,6 +515,13 @@ class JepaTrainer:
         """Train the model and return the loss history."""
         device = select_device(self.config.device)
         print(f"Device: {device} | dataloader workers: {self.num_workers}")
+        state = None
+        if self.config.resume:
+            state = self._load_trainer_state(self.config.output_dir)
+            # States saved before seeds were configurable used SEED.
+            self.seed = int(state.get("seed", SEED))
+        self.history["seed"] = self.seed
+        print(f"Seed: {self.seed}")
         self._prepare(device)
         optimizer = self._build_optimizer()
         collate = partial(tokenize_batch, tokenizer=self.tokenizer,
@@ -524,9 +534,9 @@ class JepaTrainer:
         self._optimizer, self._scheduler = optimizer, scheduler
         global_step = start_epoch = skip_batches = 0
         resumed_totals = {}
-        if self.config.resume:
+        if state is not None:
             global_step, start_epoch, skip_batches, resumed_totals = self._restore(
-                optimizer, scheduler)
+                state, optimizer, scheduler)
         for epoch in range(start_epoch, self._num_epochs):
             resuming = epoch == start_epoch
             totals, n_batches, global_step = self._train_epoch(
