@@ -1,6 +1,6 @@
 # 001: Initialize the decoder so its first loss is near uniform
 
-Status: open
+Status: done
 
 ## Why
 

@@ -314,6 +314,34 @@ def test_hint_reinjected_before_every_layer():
             projection.weight.zero_()
 
 
+def test_fresh_decoder_loss_is_near_uniform():
+    import math
+
+    from jepa import DecoderModel
+
+    vocab_size = 32000
+    torch.manual_seed(0)
+    encoder = EncoderConfig(
+        vocab_size=vocab_size,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=1,
+        max_position_embeddings=32,
+        pad_token_id=0,
+    )
+    decoder = DecoderModel(
+        DecoderConfig.from_encoder(encoder, sliding_window=8, num_hidden_layers=1)
+    ).eval()
+    assert decoder.lm_head.weight is decoder.embedding.weight
+
+    labels = torch.randint(1, vocab_size, (4, 33))
+    z_t = torch.randn(4, 32, 64)
+    committed = torch.randn(4, 32, 64)
+    with torch.no_grad():
+        total, count = decoder.token_loss(z_t, committed, labels)
+    assert abs((total / count).item() - math.log(vocab_size)) < 1.0
+
+
 def test_hint_and_generate_path_agree():
     from jepa import DecoderModel
 

@@ -32,7 +32,9 @@ latent, a clear single future instead of μ's average of all of them.
 - **Decoder** (`jepa/models/decoder.py`, `DecoderConfig`): an autoregressive
   token Transformer. Each position is conditioned on a **hint**: the latent at
   the block start and the committed future at the block end. The hint is added
-  to the token embeddings and re-injected before every layer.
+  to the token embeddings and re-injected before every layer. The token
+  embedding is tied to the output head and initialized at std 0.02, so a fresh
+  decoder's loss starts near ln(vocab_size).
 - **Losses** (`jepa/models/losses.py`): `VISReg` is the anti-collapse
   regularizer on the online encoder latents (scale, shape, center).
   `CommitmentLoss` trains the proposal: a relaxed winner-takes-all move loss,

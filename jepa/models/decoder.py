@@ -80,6 +80,8 @@ class DecoderModel(PreTrainedModel):
         # ``post_init`` already ties via ``config.tie_word_embeddings``, but
         # assign explicitly so sharing does not depend on HF internals.
         self.lm_head.weight = self.embedding.weight
+        # Small init on the tied head so the first loss is near ln(vocab_size).
+        nn.init.normal_(self.embedding.weight, std=0.02)
 
     def _init_weights(self, module):
         # The decoder has no custom-initialized head that must survive
