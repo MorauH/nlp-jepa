@@ -66,7 +66,7 @@ predictor proposes \(P\) candidate future latents together with a distribution
 prediction step <em>commits</em> to exactly one candidate instead of
 averaging. Training uses a relaxed winner-takes-all objective, and a separate
 detached head estimates the mean future \(\mu\), which serves as an in-model
-single-prediction baseline.
+averaging reference.
 We train the model on FineWeb-Edu with a horizon of \(k = 20\) tokens and
 compare committed rollouts with the \(\mu\) path and with an otherwise
 identical single-candidate model (\(P = 1\)), at depths of up to four steps
@@ -128,14 +128,14 @@ its application to language, the rollout analysis, and the evaluation:
   <li>A finite-hypothesis JEPA for text over token-level latents with a
       \(k\)-token horizon. It has an explicit commitment step, a win-probability
       head \(\pi\), and a detached mean-future head \(\mu\) that provides an
-      in-model single-prediction baseline and a per-context uncertainty
+      in-model averaging reference and a per-context uncertainty
       estimate (\(\lvert\mu\rvert\)) at no cost to the rest of the model.</li>
   <li>An evaluation protocol for multi-step latent rollouts: rollout error,
       manifold distance calibrated against real latents, and best-of-\(K\)
       rollout error. We argue that error against the single realized future is
       the wrong yardstick for committed rollouts (Section&nbsp;4.4).</li>
   <li>Experiments on a synthetic two-successor Markov chain, where valid
-      futures are known, and on FineWeb-Edu, against a single-candidate
+      futures are known, and on FineWeb-Edu, against the \(P = 1\)
       baseline and ablations. <span class="todo">TODO: adjust to what was actually run.</span></li>
   <li>A qualitative comparison of text decoded from committed plans and from
       the mean plan. <span class="todo">TODO: ticket 003</span></li>
@@ -163,7 +163,7 @@ consistency across horizons. Our candidates and \(\pi\) play the same roles
 as their branches and router weights or mixture components. The differences
 are the domain (text, with a token decoder conditioned on the latents), the
 explicit commitment step inside multi-step rollouts, the detached \(\mu\) head
-as an in-model averaging baseline, and an evaluation centred on whether
+as an in-model averaging reference, and an evaluation centred on whether
 chained committed latents stay close to real text latents.
 <span class="todo">TODO: after reading both papers in full, state the overlap and differences precisely; decide whether to add an MDN predictor as a baseline</span>
 </p>
@@ -323,7 +323,7 @@ Each step advances the plan by \(k\) tokens, so depth 4 with \(k = 20\) plans
 used for evaluation only, so the experiments test whether committed latents
 remain usable inputs <em>without</em> being trained for it. The \(\mu\) path,
 \(z^{(i)} = \sqrt{D}\,\mu(z^{(i-1)}) / \lVert\mu(z^{(i-1)})\rVert\), is the
-in-model averaging baseline.
+in-model averaging reference.
 </p>
 
 <h3>3.6&nbsp; Decoder and hints</h3>

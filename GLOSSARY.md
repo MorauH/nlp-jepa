@@ -21,8 +21,8 @@ The predictor's distribution over candidates: how likely each one is to be the c
 _Avoid_: scores, score head, selector
 
 **μ (mean future)**:
-The predictor's estimate of the average normalized future latent. It is the blurry single-prediction baseline that commitment is compared against.
-_Avoid_: mean head output, expected future
+The predictor's estimate of the average normalized future latent. It is the blurry average that commitment is compared against inside the model; feeding it back gives the **μ path**.
+_Avoid_: mean head output, expected future, baseline (the baseline is the P = 1 model)
 
 ## Commitment
 
@@ -73,3 +73,13 @@ _Avoid_: generation (which re-encodes every block), plan (for a single hint)
 **Stage**:
 One of the two training phases: the JEPA stage trains encoder and predictor; the decoder stage trains a decoder against a frozen JEPA.
 _Avoid_: mode, joint training
+
+## Experiments
+
+**Baseline**:
+The P = 1 model: the same JEPA trained with a single candidate (`docs/experiments/p1-baseline.json`), i.e. an ordinary single-prediction JEPA. It is the external comparison the claim is judged against.
+_Avoid_: baseline for μ (μ is the in-model average), single-head baseline
+
+**Variant**:
+A run trained exactly like the main experiment except for the fields in one **preset**, a JSON override file in `docs/experiments/`. The baseline and the ablations are variants.
+_Avoid_: override file, experiment config (say preset)

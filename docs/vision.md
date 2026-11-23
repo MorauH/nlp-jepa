@@ -18,7 +18,7 @@ this file is planning, not a description of implemented behavior.
   through hindsight (decoder training) and through sampling distinct futures.
 - μ, a mean-future head (`E[ŷ | z_t]`, detached input), is kept as an
   instrument: `|μ|` is the per-context uncertainty, μ is the in-model
-  single-head baseline (hindsight gain over μ = what P candidates buy).
+  average to compare against (hindsight gain over μ = what P candidates buy).
 
 ## Known open problem: dead slots
 

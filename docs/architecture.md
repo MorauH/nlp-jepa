@@ -5,7 +5,7 @@
 A causal encoder maps tokens to latents. From the latest latent `z_t` the
 predictor proposes several **candidate** futures for `z_{t+k}`, a **π (win
 probability)** distribution over them, and **μ (mean future)**, the blurry
-single-prediction baseline. A **commit** chooses exactly one candidate and
+average of the possible futures. A **commit** chooses exactly one candidate and
 continues from it. A **rollout** chains commits without going back through
 tokens. The paper asks whether committing keeps each latent, and every chained
 latent, a clear single future instead of μ's average of all of them.
@@ -238,7 +238,7 @@ latent. Each condition is a latent path of `N` latents:
 
 - `pi_argmax`: `rollout(predictor, z_t, PiArgmax(), N)`;
 - `pi_sample`: `--samples` rollouts with π-sample (seeded by `--seed`);
-- `mu`: measurement's μ baseline (`mu_path` in `jepa/evaluation/measure.py`);
+- `mu`: measurement's μ path (`mu_path` in `jepa/evaluation/measure.py`);
 - `baseline`: with `--baseline-model`, that checkpoint's π-argmax rollout
   decoded by its own decoder (meant for the P = 1 baseline).
 

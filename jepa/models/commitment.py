@@ -75,7 +75,7 @@ class Futures(NamedTuple):
                 is the closest one to the real future.  Sample from these to
                 commit without seeing the future.
     mu:         ``(..., D)`` mean normalized future.  It is the blurry
-                single-prediction baseline commitment is compared against, and
+                average commitment is compared against in-model, and
                 its norm measures how spread the real futures are (~1 =
                 predictable, short = divergent).
     """

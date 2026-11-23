@@ -2,7 +2,7 @@
 
 The paper's idea is that committing to one **candidate** keeps each latent, and
 every chained **rollout** latent, a clear single future, while the **μ (mean
-future)** baseline blurs the possible futures into their average.
+future)** path blurs the possible futures into their average.
 
 World
 -----
@@ -122,7 +122,7 @@ def manifold_distance(latents, bank):
 
 
 def mu_rollout(predictor, z, steps: int):
-    """The μ baseline: feed back ``normalize(μ)`` at the latent scale."""
+    """The μ path: feed back ``normalize(μ)`` at the latent scale."""
     latents = []
     for _ in range(steps):
         mu = predictor(z).mu

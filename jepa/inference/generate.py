@@ -8,7 +8,7 @@ grammar comes from the token context and semantics from the committed future.
 **Decoded plans** (``--plan-depth N``): encode the prompt once, plan ``N``
 blocks ahead in latent space, and decode each plan into text without
 re-encoding anything. Conditions: a π-argmax rollout, ``--samples`` π-sample
-rollouts, the μ path (measurement's baseline), and with ``--baseline-model``
+rollouts, the μ path (as in measurement), and with ``--baseline-model``
 the π-argmax rollout of another checkpoint (the P = 1 baseline) decoded by its
 own decoder. Prompts are the first ``--num-prompts`` validation chunks long
 enough for ``--prompt-length + N * k`` tokens, in a seeded random order (the
@@ -187,7 +187,7 @@ def plan_prompt(
     The prompt is encoded once; ``z_t`` is its last latent. Each condition in
     ``conditions`` gives a latent path: ``pi_argmax`` (one rollout),
     ``pi_sample`` (``samples`` rollouts, seeded by ``generator_seed``) and
-    ``mu`` (measurement's μ baseline). Every path is decoded block by block
+    ``mu`` (measurement's μ path). Every path is decoded block by block
     with :func:`decode_plan`, so each record holds ``depth`` blocks of exactly
     ``k`` token ids (an EOS does not stop a plan).
 

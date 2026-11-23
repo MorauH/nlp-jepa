@@ -129,8 +129,8 @@ class PredictorModel(PreTrainedModel):
       the real future.  Commitment samples or takes the argmax of these.
 
     Separately, the μ head maps ``z_t`` to ``mu ≈ E[ŷ | z_t]``, the mean
-    normalized future.  It is an auxiliary instrument (uncertainty, a
-    single-head baseline, a future head-growth signal), not a commit rule.
+    normalized future.  It is an auxiliary instrument (uncertainty, the
+    in-model average commits are compared with, a future head-growth signal), not a commit rule.
     Its input is detached, so it never changes the encoder or candidates.
 
     Configured by :class:`jepa.config.PredictorConfig` and usable on its own::

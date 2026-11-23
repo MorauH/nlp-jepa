@@ -70,7 +70,7 @@ def _commit_distance(distances, futures, policy, valid, target=None):
     return distances.gather(-1, index[:, None]).squeeze(-1)
 
 def mu_path(predictor, z, steps: int):
-    """The μ baseline: feed back ``normalize(μ)`` at the latent scale.
+    """The μ path: feed back ``normalize(μ)`` at the latent scale.
 
     ``z`` is ``(..., D)``; the path is ``(..., steps, D)``.  Shared with the
     decoded plans in :mod:`jepa.inference.generate`.
