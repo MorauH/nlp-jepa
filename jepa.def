@@ -1,0 +1,15 @@
+Bootstrap: docker
+From: python:3.12-slim
+
+%files
+    pyproject.toml /opt/app/pyproject.toml
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends build-essential \
+        && rm -rf /var/lib/apt/lists/*
+    pip install --no-cache-dir uv
+    cd /opt/app
+    uv pip install --system --no-cache -r pyproject.toml
+
+%environment
+    export PYTHONUNBUFFERED=1

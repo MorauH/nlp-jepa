@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa
+#SBATCH --job-name=nlp-main-1
 #SBATCH --partition=long
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
@@ -8,25 +8,18 @@
 #SBATCH --gres=gpu:L40s:1
 #SBATCH --output=%x-%j.log
 
-# Usage:
-#   scripts/slurm_train.sh                                  # JEPA stage
-#   scripts/slurm_train.sh --stage decoder --from runs/jepa # decoder stage
-#
-# Args are forwarded to `python -m jepa train`.
-
 set -e
 
-# Move to the repository root so `python -m jepa` resolves the package.
-cd "$(dirname "$0")/.."
-mkdir -p runs/jepa
-
-VENV=${VENV:-.venv}
-if [ -f "$VENV/bin/activate" ]; then
-    source "$VENV/bin/activate"
-fi
+cd /data/users/$USER/nlp-jepa
 
 # Grow allocator segments instead of fragmenting fixed blocks; avoids
 # near-OOM allocator thrashing with the dynamic-shape batches.
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-python -u -m jepa train "$@"
+SEED=1
+RUN_DIR="runs/main-seed$SEED"
+DEC_DIR="$RUN_DIR-decoder"
+
+singularity exec --nv ./jepa.sif python -u -m jepa train --seed "$SEED" --output-dir "$RUN_DIR"
+singularity exec --nv ./jepa.sif python -u -m jepa train --stage decoder --from "$RUN_DIR" --seed "$SEED" --output-dir "$DEC_DIR"
+singularity exec --nv ./jepa.sif python -u -m jepa measure --model "$DEC_DIR" --json "$DEC_DIR/metrics.json"
