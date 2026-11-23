@@ -13,13 +13,14 @@ Vocabulary: `GLOSSARY.md`. Design: `docs/architecture.md`.
 - Training: `python -m jepa train` (stage jepa), `python -m jepa train --resume`, `python -m jepa train --stage decoder --from runs/jepa` (fresh decoder on a frozen JEPA, writes `runs/jepa-decoder`), `python -m jepa train --stage decoder --resume --epochs 2`, `python -m jepa train --config docs/experiments/p1-baseline.json --seed 1 --output-dir runs/p1-seed1`.
 - Quick end-to-end check: `python -m jepa train --subset` (needs the prepared data and tokenizer in `data/`).
 - Measurement: `python -m jepa measure --model runs/jepa --json runs/jepa/metrics.json`.
+- Decoded plans (qualitative figure): `python -m jepa generate --plan-depth 4 --baseline-model runs/p1 --json runs/jepa/plans.json --html runs/jepa/plans.html`.
 
 ## Layout / boundaries
 - `jepa/config.py`: every component config (`EncoderConfig`, `PredictorConfig`, `DecoderConfig`, `VISRegConfig`, `CommitmentLossConfig`, `JepaConfig`) and `apply_overrides`.
 - `docs/experiments/`: override presets for baselines and ablations, with a README mapping each to its report question.
 - `jepa/models/`: `encoder.py`, `predictor.py`, `decoder.py`, `commitment.py` (`distance` — the only `2 - 2 cos` — `Futures`, policies, `commit`, `rollout`), `sampling.py` (`top_k_mask`), `losses.py` (`VISReg`, `CommitmentLoss`), `jepa.py` (`JepaModel`, `build_block_hints`).
 - `jepa/training/`: `data.py` (dataset loading + collation + length bucketing), `trainer.py` (`JepaTrainer`/`TrainConfig` and every engineering constant), `train.py` (CLI, per-stage defaults, model building/loading, paths).
-- `jepa/evaluation/measure.py`: the paper's numbers. `jepa/inference/generate.py`: sampling.
+- `jepa/evaluation/measure.py`: the paper's numbers. `jepa/inference/generate.py`: sampling and decoded latent plans (`--plan-depth`).
 - `jepa/paths.py`: `data/` and `runs/` are resolved from the package location, not the CWD.
 - `data/` (tokenizer + prepared chunks) and `runs/` (checkpoints) are gitignored generated artifacts. Don't hand-edit them. Regenerating them streams FineWeb-Edu from the network and takes a long time.
 - `docs/architecture.md` describes the implemented model; `docs/vision.md` is planning, not implemented behavior; `docs/adr/` records decisions; `docs/tickets/` holds open work items (not implemented).

@@ -1,6 +1,6 @@
 # 003: Decode rollouts into text (clear vs blurry, side by side)
 
-Status: open
+Status: done
 
 ## Why
 

@@ -69,8 +69,12 @@ def _commit_distance(distances, futures, policy, valid, target=None):
     index = futures.commit(policy, target).index[valid]
     return distances.gather(-1, index[:, None]).squeeze(-1)
 
-def _mu_path(predictor, z, steps: int):
-    """The μ baseline: feed back ``normalize(μ)`` at the latent scale."""
+def mu_path(predictor, z, steps: int):
+    """The μ baseline: feed back ``normalize(μ)`` at the latent scale.
+
+    ``z`` is ``(..., D)``; the path is ``(..., steps, D)``.  Shared with the
+    decoded plans in :mod:`jepa.inference.generate`.
+    """
     path = []
     for _ in range(steps):
         mu = predictor(z).mu
@@ -362,7 +366,7 @@ def _rollouts_section(
             "pi_sample": rollout(
                 model.predictor, z_start, PiSample(generator=sample_generator), depths
             ).future,
-            "mu": _mu_path(model.predictor, z_start, depths),
+            "mu": mu_path(model.predictor, z_start, depths),
         }
         for name, path in paths.items():
             for depth in range(depths):

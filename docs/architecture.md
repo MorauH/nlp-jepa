@@ -222,3 +222,50 @@ python -m jepa generate --prompt "When in Rome, " --steps 3 --temperature 0.8
 
 `--commit-temperature` / `--commit-top-k` control the commit from π;
 `--temperature` / `--top-k` control token sampling.
+
+### Decoded plans
+
+`--plan-depth N` decodes **latent plans** instead: the qualitative figure
+that sets clear committed plans beside the blurry μ path.
+
+```bash
+python -m jepa generate --plan-depth 4 --baseline-model runs/p1 \
+    --json runs/jepa/plans.json --html runs/jepa/plans.html
+```
+
+For each prompt the encoder runs **once**, and `z_t` is the prompt's last
+latent. Each condition is a latent path of `N` latents:
+
+- `pi_argmax`: `rollout(predictor, z_t, PiArgmax(), N)`;
+- `pi_sample`: `--samples` rollouts with π-sample (seeded by `--seed`);
+- `mu`: measurement's μ baseline (`mu_path` in `jepa/evaluation/measure.py`);
+- `baseline`: with `--baseline-model`, that checkpoint's π-argmax rollout
+  decoded by its own decoder (meant for the P = 1 baseline).
+
+Block `i` is decoded with `decoder.generate` and the hint (start = path
+latent `i − 1`, or `z_t` for `i = 1`; committed = path latent `i`). The token
+context is the prompt plus every token decoded so far. Nothing is re-encoded,
+so the text is a decoded plan rather than generation. Each record holds
+exactly `N × k` tokens, and an EOS does not stop a plan.
+
+Prompts are the first `--num-prompts` (default 8) validation chunks with at
+least `--prompt-length + N·k` tokens, taken in a `--seed`-ed random order. The
+`--prompt-length` prefix is the prompt and the next `N·k` tokens are the
+reference continuation. `--prompt` adds free prompts (repeatable) that have no
+reference. The JSON has one record per prompt, condition and sample
+(`prompt_index`, `source`, `prompt`, `reference` per block, `condition`,
+`sample`, `token_ids`, `blocks`). `--html` writes one side-by-side table per
+prompt.
+
+Caveats for the report:
+
+- **The decoder never saw μ hints.** It is trained on committed candidates, so
+  decoding the μ path is out of distribution. That is part of the point (a
+  blurry latent is not a valid plan), but it confounds the comparison. The
+  fair comparison is the `baseline` row: the P = 1 model's own decoder,
+  trained on its own single (blurry) prediction.
+- **Token sampling adds variance.** Plans decode greedily by default
+  (`--temperature` defaults to 0 in this mode), so the differences come from
+  the plan. Show sampled decodes separately.
+- **Pick samples honestly.** Prompts are seeded and fixed. Don't cherry-pick,
+  and if you show a subset, say how it was chosen.
