@@ -45,15 +45,19 @@ def test_path_validity_is_the_fraction_of_rollouts_real_up_to_each_depth():
     torch.testing.assert_close(validity, torch.tensor([0.75, 0.5, 0.25]))
 
 
-def test_branch_entropy_is_the_mean_bits_of_each_states_split():
+def test_branch_entropy_is_the_mean_bits_of_each_states_split_between_successors():
     commits = torch.stack(
         [
-            latents(1, 2, 1, 2),  # an even split: 1 bit
-            latents(2, 2, 2, 2),  # always the same successor: 0 bits
+            latents(1, 2, 1, 2, 3),  # even split; the 3 is no successor of 0
+            latents(2, 2, 2, 2, (2, 3)),  # one successor (and a blur): 0 bits
+            latents(3, 0, 3, 0, 3),  # 3:2 split
+            latents(0, 1, 0, 1, 0),  # 3:2 split
         ]
     )
 
-    assert branch_entropy(commits, STATES) == pytest.approx(0.5)
+    three_two = -(0.6 * math.log2(0.6) + 0.4 * math.log2(0.4))
+    expected = (1.0 + 0.0 + 2 * three_two) / 4
+    assert branch_entropy(commits, WORLD) == pytest.approx(expected)
 
 
 def test_mode_coverage_is_the_worst_successors_distance_to_a_candidate():

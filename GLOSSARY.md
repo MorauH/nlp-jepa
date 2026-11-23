@@ -65,7 +65,7 @@ Synthetic world only: the fraction of rollouts whose steps 1..i all lie on a sta
 _Avoid_: accuracy, correctness
 
 **Branch entropy**:
-Synthetic world only: the entropy, in bits, of which state π-sample commits land on from one state. An even split between two successors is 1 bit.
+Synthetic world only: the entropy, in bits, of how π-sample commits from one state split between its two successors (commits landing elsewhere are left out). An even split is 1 bit.
 _Avoid_: diversity
 
 **Mode coverage**:

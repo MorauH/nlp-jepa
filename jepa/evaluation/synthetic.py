@@ -12,7 +12,8 @@ successor) pairs.
 
 Shared by ``tests/test_research_claim.py`` (the claim as assertions) and
 ``docs/report/synthetic.py`` (the report's numbers over seeds), so both use
-one world, one training loop and one μ path.
+one world and one training loop.  The μ path is
+:func:`jepa.evaluation.measure.mu_path`, the same one the text metrics use.
 """
 
 from __future__ import annotations
@@ -81,8 +82,8 @@ def train_predictor(
 
     for step in range(TRAIN_STEPS):
         state = torch.randint(0, N_STATES, (BATCH_SIZE,), generator=generator)
-        pick = torch.randint(0, 2, (BATCH_SIZE,), generator=generator)
-        target = states[successors[state, pick]]
+        choice = torch.randint(0, 2, (BATCH_SIZE,), generator=generator)
+        target = states[successors[state, choice]]
 
         # CommitmentLoss consumes one extra sequence axis.
         futures = predictor(states[state].unsqueeze(1))
@@ -96,27 +97,14 @@ def train_predictor(
     return predictor.eval()
 
 
-def mu_rollout(predictor, z: Tensor, steps: int) -> Tensor:
-    """The μ path: feed back ``normalize(μ)`` at the latent scale.
-
-    Returns ``(..., steps, D)``.
-    """
-    latents = []
-    for _ in range(steps):
-        mu = predictor(z).mu
-        z = F.normalize(mu, dim=-1) * math.sqrt(z.shape[-1])
-        latents.append(z)
-    return torch.stack(latents, dim=-2)
-
-
 def sample_path_indices(
-    successors: Tensor, batch: int, steps: int, generator
+    successors: Tensor, batch: int, steps: int, generator: torch.Generator
 ) -> Tensor:
     """``(batch, steps + 1)`` state indices of real paths through the chain."""
     indices = [torch.randint(0, successors.shape[0], (batch,), generator=generator)]
     for _ in range(steps):
-        pick = torch.randint(0, 2, (batch,), generator=generator)
-        indices.append(successors[indices[-1], pick])
+        choice = torch.randint(0, 2, (batch,), generator=generator)
+        indices.append(successors[indices[-1], choice])
     return torch.stack(indices, dim=1)
 
 
@@ -149,17 +137,21 @@ def path_validity(latents: Tensor, start: Tensor, world: World) -> Tensor:
     return real.long().cumprod(dim=1).float().mean(dim=0)
 
 
-def branch_entropy(latents: Tensor, states: Tensor) -> float:
-    """**Branch entropy** in bits: how evenly commits split between states.
+def branch_entropy(latents: Tensor, world: World) -> float:
+    """**Branch entropy** in bits: how evenly commits split between successors.
 
-    ``latents`` is ``(N, K, D)``: ``K`` depth-1 commits from each of ``N``
-    start states.  Each commit is assigned to its nearest state; the entropy
-    of that histogram is averaged over the start states.  On the two-successor
-    chain, an even split is 1 bit and always taking one successor is 0.
+    ``latents`` is ``(N, K, D)``: ``K`` depth-1 commits from each state, in
+    state order.  A commit counts for a successor when it lies on it
+    (distance below :data:`ON_STATE_DISTANCE`); commits that land elsewhere
+    are left out (depth-1 :func:`path_validity` reports how many).  The
+    entropy of the split between the two successors is averaged over states:
+    an even split is 1 bit, always taking one successor is 0.
     """
-    index = nearest_state(latents, states)[1]
-    counts = F.one_hot(index, states.shape[0]).sum(dim=1).float()
-    p = counts / counts.sum(dim=-1, keepdim=True)
+    distance, index = nearest_state(latents, world.states)
+    on_state = distance < ON_STATE_DISTANCE
+    hits = (index.unsqueeze(-1) == world.successors.unsqueeze(1)) & on_state.unsqueeze(-1)
+    counts = hits.sum(dim=1).float()  # (N, 2)
+    p = counts / counts.sum(dim=-1, keepdim=True).clamp_min(1.0)
     bits = -(p * p.clamp_min(1e-12).log2()).sum(dim=-1)
     return bits.mean().item()
 

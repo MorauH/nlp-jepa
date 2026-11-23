@@ -20,7 +20,7 @@
     "branch_samples_per_state": 512,
     "on_state_distance": 0.1,
     "std": "sample std over seeds",
-    "note": "P=1 has one candidate, so its hindsight, pi_argmax and pi_sample rollouts are the same rollout."
+    "note": "P=1 has one candidate, so its hindsight, pi_argmax and pi_sample rollouts are the same rollout. branch_entropy counts only depth-1 commits that land on a successor."
   },
   "models": {
     "P=4": {
@@ -587,14 +587,14 @@
         }
       },
       "branch_entropy": {
-        "mean": 1.040513801574707,
-        "std": 0.032756828716166364,
+        "mean": 0.9944650292396545,
+        "std": 0.0024111989936364555,
         "per_seed": [
-          1.0431227684020996,
-          1.0601909160614014,
-          1.0167347192764282,
-          1.0820738077163696,
-          1.0004467964172363
+          0.9949917793273926,
+          0.9979817867279053,
+          0.994800329208374,
+          0.9929505586624146,
+          0.9916006922721863
         ]
       },
       "mode_coverage": {

@@ -12,7 +12,7 @@ stdout, so redirecting stdout would corrupt them.
 
     python docs/report/synthetic.py
 
-CPU only, about a minute.
+CPU only, about 15 seconds.
 """
 
 from __future__ import annotations
@@ -38,17 +38,17 @@ from jepa.evaluation.synthetic import (  # noqa: E402
     build_world,
     manifold_distance,
     mode_coverage,
-    mu_rollout,
     path_validity,
     sample_path_indices,
     train_predictor,
 )
+from jepa.evaluation.measure import mu_path  # noqa: E402
 from jepa.models import Hindsight, PiArgmax, PiSample, distance, rollout  # noqa: E402
 
 SEEDS = [0, 1, 2, 3, 4]
 PREDICTION_COUNTS = [4, 1]
 DEPTH = 4
-PATHS = 1024  # sampled real paths per seed
+PATHS_PER_SEED = 1024  # sampled real paths
 BRANCH_SAMPLES = 512  # depth-1 π-samples per state for branch entropy
 PATHS_MEASURED = ["hindsight", "pi_argmax", "pi_sample", "mu"]
 PER_DEPTH = ["rollout_error", "manifold_distance", "path_validity"]
@@ -67,7 +67,7 @@ def measure(predictor, world: World, seed: int) -> dict:
     """All metrics for one trained predictor on one seed."""
     states = world.states
     generator = torch.Generator().manual_seed(seed + 1000)
-    indices = sample_path_indices(world.successors, PATHS, DEPTH, generator)
+    indices = sample_path_indices(world.successors, PATHS_PER_SEED, DEPTH, generator)
     path = states[indices]  # (B, DEPTH + 1, D)
     start, real = path[:, 0], path[:, 1:]
 
@@ -79,7 +79,7 @@ def measure(predictor, world: World, seed: int) -> dict:
         "pi_sample": rollout(
             predictor, start, PiSample(generator=generator), DEPTH
         ).future,
-        "mu": mu_rollout(predictor, start, DEPTH),
+        "mu": mu_path(predictor, start, DEPTH),
     }
     paths = {
         name: {
@@ -95,7 +95,7 @@ def measure(predictor, world: World, seed: int) -> dict:
     futures = predictor(states)
     return {
         "paths": paths,
-        "branch_entropy": branch_entropy(commits.future, states),
+        "branch_entropy": branch_entropy(commits.future, world),
         "mode_coverage": mode_coverage(futures.candidates, world),
         "mu_norm": futures.mu.norm(dim=-1).mean().item(),
     }
@@ -140,13 +140,14 @@ def run() -> dict:
             "train_steps": TRAIN_STEPS,
             "seeds": SEEDS,
             "depths": list(range(1, DEPTH + 1)),
-            "paths_per_seed": PATHS,
+            "paths_per_seed": PATHS_PER_SEED,
             "branch_samples_per_state": BRANCH_SAMPLES,
             "on_state_distance": ON_STATE_DISTANCE,
             "std": "sample std over seeds",
             "note": (
                 "P=1 has one candidate, so its hindsight, pi_argmax and "
-                "pi_sample rollouts are the same rollout."
+                "pi_sample rollouts are the same rollout. branch_entropy "
+                "counts only depth-1 commits that land on a successor."
             ),
         },
         "models": models,

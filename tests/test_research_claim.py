@@ -4,8 +4,8 @@ The paper's idea is that committing to one **candidate** keeps each latent, and
 every chained **rollout** latent, a clear single future, while the **μ (mean
 future)** path blurs the possible futures into their average.
 
-The world, the training loop and the μ path live in
-:mod:`jepa.evaluation.synthetic`, shared with ``docs/report/synthetic.py``
+The world and the training loop live in :mod:`jepa.evaluation.synthetic`,
+shared with ``docs/report/synthetic.py``
 (which reports the same world's numbers over seeds).  Four claims are
 measured:
 
@@ -29,14 +29,13 @@ from jepa.evaluation.synthetic import (
     BATCH_SIZE,
     DIM,
     N_STATES,
-    World,
     build_world,
     manifold_distance,
     mode_coverage,
-    mu_rollout,
     sample_path_indices,
     train_predictor,
 )
+from jepa.evaluation.measure import mu_path
 from jepa.models import Hindsight, PiSample, distance, rollout
 
 PREDICTION_COUNT = 4
@@ -47,22 +46,21 @@ SEED = 0
 @pytest.fixture(scope="module")
 def trained():
     world = build_world(SEED)
-    predictor = train_predictor(world, PREDICTION_COUNT, SEED)
-    return predictor, world.states, world.successors
+    return train_predictor(world, PREDICTION_COUNT, SEED), world
 
 
 def test_every_successor_has_a_candidate_next_to_it(trained):
     """Candidates land on the modes, not between them."""
-    predictor, states, successors = trained
+    predictor, world = trained
     with torch.no_grad():
-        worst = mode_coverage(predictor(states).candidates, World(states, successors))
+        worst = mode_coverage(predictor(world.states).candidates, world)
     # Measured max over states/modes: ~0.003.
     assert worst < 0.05, f"a successor mode has no candidate nearby (d={worst})"
 
 
 def test_mu_is_the_blurry_average_of_the_successors(trained):
     """μ points at the average of the two unit successor vectors, with norm < 1."""
-    predictor, states, successors = trained
+    predictor, (states, successors) = trained
     with torch.no_grad():
         mu = predictor(states).mu
 
@@ -78,9 +76,9 @@ def test_mu_is_the_blurry_average_of_the_successors(trained):
     assert norm.min() > 0.5, f"μ collapsed toward zero: min norm {norm.min()}"
 
 
-def test_committed_rollout_stays_on_manifold_while_mu_rollout_blurs(trained):
+def test_committed_rollout_stays_on_manifold_while_mu_path_blurs(trained):
     """A **Rollout** of committed futures stays a real latent; μ blurs off."""
-    predictor, states, _ = trained
+    predictor, (states, _) = trained
     generator = torch.Generator().manual_seed(SEED + 123)
 
     with torch.no_grad():
@@ -91,7 +89,7 @@ def test_committed_rollout_stays_on_manifold_while_mu_rollout_blurs(trained):
 
         committed_distance = manifold_distance(committed.future, states).mean(0)
         mu_distance = manifold_distance(
-            mu_rollout(predictor, states, HORIZON), states
+            mu_path(predictor, states, HORIZON), states
         ).mean(0)
 
     # Measured committed: ~[0.002, 0.003, 0.003]; μ: ~[0.52, 0.62, 0.63].
@@ -105,9 +103,9 @@ def test_committed_rollout_stays_on_manifold_while_mu_rollout_blurs(trained):
         )
 
 
-def test_hindsight_rollout_has_low_error_while_mu_rollout_drifts(trained):
+def test_hindsight_rollout_has_low_error_while_mu_path_drifts(trained):
     """**Hindsight** keeps **rollout error** near zero; the μ rollout drifts."""
-    predictor, states, successors = trained
+    predictor, (states, successors) = trained
     generator = torch.Generator().manual_seed(SEED + 321)
     path_indices = sample_path_indices(
         successors, BATCH_SIZE, HORIZON, generator
@@ -124,7 +122,7 @@ def test_hindsight_rollout_has_low_error_while_mu_rollout_drifts(trained):
         )
         error = distance(hindsight.future, path[:, 1:]).mean(0)
         mu_error = distance(
-            mu_rollout(predictor, path[:, 0], HORIZON), path[:, 1:]
+            mu_path(predictor, path[:, 0], HORIZON), path[:, 1:]
         ).mean(0)
 
     # Measured hindsight error: ~[0.0015, 0.0020, 0.0023]; μ error:
