@@ -411,7 +411,9 @@ validation chunk continues a training document.
       its nearest neighbor in a bank of 50k encoder latents from training
       documents (disjoint from the query documents). A <code>real</code> row
       measures the same quantity for the real future latents and calibrates
-      what "on the manifold" means.</li>
+      what "on the manifold" means. It never compares against the realized
+      continuation, so a rollout on another plausible branch is not
+      penalized.</li>
   <li><strong>Path validity</strong> and <strong>branch entropy</strong>
       (synthetic only, where the valid transitions are known).</li>
   <li><strong>Decoder cross-entropy</strong> under different hints:
@@ -431,9 +433,15 @@ asks whether following the real branch stays accurate over several steps.
 </p>
 
 <h3>4.5&nbsp; Hypotheses (fixed before the experiments)</h3>
-<div class="hyp"><strong>H1 (sharpness).</strong> At depths 2–4, committed (\(\pi\)-sample) rollouts have a lower manifold distance than both the \(\mu\) path and the \(P = 1\) model's rollouts, by more than the seed standard deviation, and remain within <span class="todo">TODO: tolerance</span> of the <code>real</code> row.</div>
+<p>
+"\(A\) is lower than \(B\)" means the per-seed difference \(B_s - A_s\) is
+positive for every seed and its mean exceeds its standard deviation. Rollout
+paths from one run are paired directly; \(P = 1\) runs are paired with the
+main run of the same seed.
+</p>
+<div class="hyp"><strong>H1 (sharpness).</strong> At depths 2–4, \(\pi\)-sample rollouts have lower manifold distance than the \(\mu\) path and the \(P = 1\) model, and close at least half the gap to the <code>real</code> row: \((m_{\text{base}} - m_\pi)/(m_{\text{base}} - m_{\text{real}}) \ge 0.5\), with \(m_{\text{base}} = \min(m_\mu, m_{P=1})\).</div>
 <div class="hyp"><strong>H2 (coverage).</strong> At depth 4, best-of-16 \(\pi\)-sample rollout error is lower than the rollout error of the \(\mu\) path and of the \(P = 1\) model.</div>
-<div class="hyp"><strong>H3 (stability).</strong> Hindsight rollout error grows more slowly with depth than \(\mu\)-path error.</div>
+<div class="hyp"><strong>H3 (stability).</strong> Hindsight rollout error grows more slowly with depth than \(\mu\)-path error: its increase from depth 1 to depth 4 is lower.</div>
 <div class="hyp"><strong>H4 (use).</strong> The decoder uses the committed future: shuffled-hint cross-entropy exceeds \(\pi\)-argmax cross-entropy by more than 0.05 nats.</div>
 <p class="muted">If a hypothesis fails, we report it as failed. We do not change the metric after seeing the results.</p>
 
