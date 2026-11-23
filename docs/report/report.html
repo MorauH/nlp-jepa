@@ -46,7 +46,7 @@
 <h1>Commit, Don't Average: Multi-Hypothesis Latent Prediction for Sharp Multi-Step Futures in Text</h1>
 <p class="subtitle">Draft technical report</p>
 <p class="authors"><span class="todo">TODO: author, affiliation, date</span></p>
-<p class="status">Status: draft. Method and setup sections describe the implemented code. All results are placeholders (marked TODO).</p>
+<p class="status">Status: draft. Method and setup sections describe the implemented code. Section 5.1 (synthetic) is filled in; the other results are placeholders (marked TODO).</p>
 
 <!-- ===================================================================== -->
 <section class="abstract">
@@ -444,32 +444,74 @@ asks whether following the real branch stays accurate over several steps.
 <p>
 Eight states at the latent scale (\(D = 32\)), each with two equally likely
 successors. A predictor with \(P = 4\), and one with \(P = 1\), are trained
-with the commitment loss on (state, successor) pairs. Here the valid futures
-are known exactly, so this experiment isolates the mechanism from the
-difficulty of text.
-<span class="todo">TODO: fill from ticket 004</span>
+with the commitment loss on (state, successor) pairs, 400 steps, five seeds
+(each seed draws its own world). Here the valid futures are known exactly, so
+this experiment isolates the mechanism from the difficulty of text. Rollouts
+start from 1,024 sampled real paths per seed; a rollout step is real when it
+lies on a state (distance \(&lt; 0.1\)) that is a successor of the previous
+step's state. The \(P = 1\) model has one candidate, so all its policies give
+the same rollout.
+</p>
+<p>
+<strong>Committed rollouts are real futures; averaged ones are not.</strong>
+\(P = 4\) rollouts stay on the states at every depth: \(\pi\)-argmax and
+hindsight are valid paths in every case, and \(\pi\)-sample in 94.5% of cases
+at depth 4. The \(\mu\) path and the \(P = 1\) model leave the states at
+the first step (manifold distance \(\approx 0.5\)) and never form a valid
+path. The \(P = 4\) model covers both successors of every state (mode
+coverage \(0.005 \pm 0.004\), against \(0.931 \pm 0.104\) for \(P = 1\)),
+and \(\pi\)-sample splits evenly between them (branch entropy
+\(1.04 \pm 0.03\) bits; ideal 1). It exceeds 1 bit because \(\pi\) puts a
+little mass on the two spare candidates, which also accounts for the small
+loss of validity. \(\lvert\mu\rvert = 0.69 \pm 0.03\), close to the
+\(1/\sqrt{2}\) of two near-orthogonal successors.
+</p>
+<p>
+<strong>Rollout error favours the mean, as Section&nbsp;4.4 predicts.</strong>
+Against one sampled real path, the \(\mu\) path and the \(P = 1\) model have
+lower rollout error than committed \(\pi\) rollouts at every depth (e.g.
+\(1.20\) and \(1.32\) against \(1.64\) at depth 4): a committed rollout that
+takes the other branch is counted as wrong. Following the real branch
+(hindsight) keeps the error at \(0.001\) through depth 4, so the committed
+candidates contain the real path at every step (H3 on this world).
 </p>
 <table>
   <thead>
-    <tr><th>Model / path</th><th>Metric</th><th>depth 1</th><th>2</th><th>3</th><th>4</th></tr>
+    <tr><th>Model / path</th><th>depth 1</th><th>2</th><th>3</th><th>4</th></tr>
   </thead>
   <tbody>
-    <tr><td>\(P = 4\), \(\pi\)-sample</td><td>manifold dist.</td><td class="todo-cell" colspan="4">TODO</td></tr>
-    <tr><td>\(P = 4\), \(\pi\)-sample</td><td>path validity</td><td class="todo-cell" colspan="4">TODO</td></tr>
-    <tr><td>\(P = 4\), hindsight</td><td>rollout error</td><td class="todo-cell" colspan="4">TODO</td></tr>
-    <tr><td>\(P = 4\), \(\pi\)-sample</td><td>rollout error</td><td class="todo-cell" colspan="4">TODO</td></tr>
-    <tr><td>\(P = 4\), \(\mu\) path</td><td>manifold dist.</td><td class="todo-cell" colspan="4">TODO</td></tr>
-    <tr><td>\(P = 4\), \(\mu\) path</td><td>rollout error</td><td class="todo-cell" colspan="4">TODO</td></tr>
-    <tr><td>\(P = 1\)</td><td>manifold dist.</td><td class="todo-cell" colspan="4">TODO</td></tr>
-    <tr><td>\(P = 1\)</td><td>rollout error</td><td class="todo-cell" colspan="4">TODO</td></tr>
+    <tr><th colspan="5" style="text-align:left">Manifold distance (lower is closer to a real state)</th></tr>
+    <tr><td>\(P = 4\), \(\pi\)-sample</td><td>0.012 ± 0.004</td><td>0.021 ± 0.005</td><td>0.020 ± 0.006</td><td>0.023 ± 0.003</td></tr>
+    <tr><td>\(P = 4\), \(\pi\)-argmax</td><td>0.001 ± 0.000</td><td>0.001 ± 0.001</td><td>0.001 ± 0.001</td><td>0.002 ± 0.001</td></tr>
+    <tr><td>\(P = 4\), hindsight</td><td>0.001 ± 0.000</td><td>0.001 ± 0.000</td><td>0.001 ± 0.001</td><td>0.001 ± 0.001</td></tr>
+    <tr><td>\(P = 4\), \(\mu\) path</td><td>0.526 ± 0.061</td><td>0.557 ± 0.065</td><td>0.573 ± 0.082</td><td>0.570 ± 0.079</td></tr>
+    <tr><td>\(P = 1\)</td><td>0.535 ± 0.060</td><td>0.585 ± 0.058</td><td>0.632 ± 0.079</td><td>0.654 ± 0.108</td></tr>
+    <tr><th colspan="5" style="text-align:left">Path validity (fraction of rollouts that are real paths)</th></tr>
+    <tr><td>\(P = 4\), \(\pi\)-sample</td><td>0.988 ± 0.005</td><td>0.972 ± 0.011</td><td>0.960 ± 0.016</td><td>0.945 ± 0.019</td></tr>
+    <tr><td>\(P = 4\), \(\pi\)-argmax</td><td>1.000 ± 0.000</td><td>1.000 ± 0.000</td><td>1.000 ± 0.000</td><td>1.000 ± 0.000</td></tr>
+    <tr><td>\(P = 4\), hindsight</td><td>1.000 ± 0.000</td><td>1.000 ± 0.000</td><td>1.000 ± 0.000</td><td>1.000 ± 0.000</td></tr>
+    <tr><td>\(P = 4\), \(\mu\) path</td><td>0.000 ± 0.000</td><td>0.000 ± 0.000</td><td>0.000 ± 0.000</td><td>0.000 ± 0.000</td></tr>
+    <tr><td>\(P = 1\)</td><td>0.000 ± 0.000</td><td>0.000 ± 0.000</td><td>0.000 ± 0.000</td><td>0.000 ± 0.000</td></tr>
+    <tr><th colspan="5" style="text-align:left">Rollout error (distance to the sampled real path)</th></tr>
+    <tr><td>\(P = 4\), \(\pi\)-sample</td><td>1.026 ± 0.091</td><td>1.416 ± 0.047</td><td>1.561 ± 0.122</td><td>1.641 ± 0.083</td></tr>
+    <tr><td>\(P = 4\), \(\pi\)-argmax</td><td>1.019 ± 0.126</td><td>1.350 ± 0.134</td><td>1.532 ± 0.190</td><td>1.586 ± 0.142</td></tr>
+    <tr><td>\(P = 4\), hindsight</td><td>0.001 ± 0.000</td><td>0.001 ± 0.000</td><td>0.001 ± 0.001</td><td>0.001 ± 0.001</td></tr>
+    <tr><td>\(P = 4\), \(\mu\) path</td><td>0.621 ± 0.066</td><td>0.948 ± 0.044</td><td>1.131 ± 0.110</td><td>1.195 ± 0.118</td></tr>
+    <tr><td>\(P = 1\)</td><td>0.620 ± 0.066</td><td>1.026 ± 0.045</td><td>1.278 ± 0.093</td><td>1.324 ± 0.135</td></tr>
   </tbody>
-  <caption>Table 3. Synthetic results, mean ± std over seeds. Also report
-  \(\pi\)-sample branch entropy (ideal: 1 bit), mode coverage and \(\lvert\mu\rvert\).</caption>
+  <caption>Table 3. Synthetic results, mean ± sample std over 5 seeds. Distances
+  are \(2 - 2\cos\). Depth-1 \(\pi\)-sample branch entropy: \(1.041 \pm 0.033\)
+  bits (\(P = 1\): 0). Mode coverage (worst successor's distance to its nearest
+  candidate): \(0.005 \pm 0.004\) for \(P = 4\), \(0.931 \pm 0.104\) for
+  \(P = 1\). \(\lvert\mu\rvert\): \(0.694 \pm 0.032\) (\(P = 4\)),
+  \(0.695 \pm 0.034\) (\(P = 1\)). Generated by
+  <code>python docs/report/synthetic.py</code> into <code>synthetic.json</code>.</caption>
 </table>
 <figure>
-  <div class="placeholder-figure">TODO — Figure 1: manifold distance (left) and rollout error (right) vs depth,
-    for P=4 π-sample, P=4 hindsight, μ path and P=1. Error bars over seeds.</div>
-  <figcaption>Figure 1. Synthetic chain.</figcaption>
+  <img src="synthetic.svg" alt="Manifold distance, rollout error and path validity against depth for P=4 pi-sample, P=4 hindsight, the P=4 mu path and P=1, with error bars over seeds." style="width:100%" />
+  <figcaption>Figure 1. Synthetic chain: manifold distance (left), rollout error
+  (centre) and path validity (right) against depth. Error bars: sample std over
+  5 seeds.</figcaption>
 </figure>
 
 <h3>5.2&nbsp; Representation and predictor health</h3>
@@ -599,8 +641,9 @@ this. <span class="todo">TODO: report live/effective slots; link to the head-gro
 python -m jepa prepare-data
 python -m jepa train                                   # JEPA stage
 python -m jepa train --stage decoder --from runs/jepa  # decoder stage
-python -m jepa measure --model runs/jepa-decoder --json runs/jepa-decoder/metrics.json</code></pre>
-<p class="muted">Variant runs (P = 1, ablations, seeds) need ticket 002, and the synthetic numbers ticket 004.</p>
+python -m jepa measure --model runs/jepa-decoder --json runs/jepa-decoder/metrics.json
+python docs/report/synthetic.py                        # Section 5.1: synthetic.json, synthetic.svg</code></pre>
+<p class="muted">Variant runs (P = 1, ablations, seeds) need ticket 002.</p>
 
 <!-- ===================================================================== -->
 <h2>References</h2>

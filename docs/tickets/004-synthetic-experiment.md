@@ -1,6 +1,6 @@
 # 004: Synthetic experiment script for the report
 
-Status: open
+Status: done
 
 ## Why
 

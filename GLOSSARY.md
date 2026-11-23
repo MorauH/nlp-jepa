@@ -60,6 +60,18 @@ _Avoid_: drift, multi-step loss
 The distance from a latent to its nearest neighbour in a bank of real encoder latents. A clear future is close to some real latent; a blurry average is not.
 _Avoid_: realism, sharpness score
 
+**Path validity**:
+Synthetic world only: the fraction of rollouts whose steps 1..i all lie on a state that is a successor of the previous step's state.
+_Avoid_: accuracy, correctness
+
+**Branch entropy**:
+Synthetic world only: the entropy, in bits, of which state π-sample commits land on from one state. An even split between two successors is 1 bit.
+_Avoid_: diversity
+
+**Mode coverage**:
+Synthetic world only: the worst-case distance from a real successor to its nearest candidate. Small means every mode has a candidate.
+_Avoid_: recall
+
 ## Decoding
 
 **Hint**:
