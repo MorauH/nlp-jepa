@@ -201,7 +201,14 @@ latents. The JSON has one dict per section:
 - `rollouts`: **rollout error** and **manifold distance** per depth for
   hindsight, π-argmax, π-sample and μ, with the `real` row as calibration. The
   claim is the depth ≥ 2 manifold row: committed rollouts stay closer to real
-  latents than μ.
+  latents than μ. `best_of_k[K][depth]` (minADE_K) exists because rollout
+  error against the one realized continuation penalizes commitment by
+  construction: μ minimizes the expected distance to whichever branch happens.
+  Keeping the best of K π-sample rollouts, each scored as a whole rollout by
+  its mean error over depths 1..i, asks instead whether the committed futures
+  *include* the real one, so it should fall below μ as K grows (verdict:
+  best-of-16 < μ at the deepest depth, with μ's error also averaged over
+  depths 1..i).
 - `decoder`: token-weighted cross-entropy per hint condition (committed
   futures, real latent, shuffled, null), hint use and specificity. All rows use
   the same mask (the tail block with no committed future is excluded). The

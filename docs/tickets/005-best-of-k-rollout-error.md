@@ -1,6 +1,6 @@
 # 005: Best-of-K rollout error in `measure`
 
-Status: open
+Status: done
 
 ## Why
 

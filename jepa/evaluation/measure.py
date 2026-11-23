@@ -39,6 +39,7 @@ DEFAULT_BATCH_SIZE = 4
 DEFAULT_BANK_SIZE = 50_000
 DEFAULT_ROLLOUT_POSITIONS = 2_048
 DEFAULT_DEPTHS = 4
+DEFAULT_BEST_OF = (1, 4, 16)
 DEFAULT_LOSS_CHUNK_SIZE = None
 REPRESENTATION_LATENTS = 20_000  # effective rank is sample-size sensitive
 ROLLOUT_PATHS = ("hindsight", "pi_argmax", "pi_sample", "mu")
@@ -335,16 +336,41 @@ def _rollout_starts(batches, stride, steps, limit, generator):
         groups.setdefault(index, []).append((row, t))
     return len(candidates), groups
 
+def _mean_rollout_error(errors):
+    """Mean error over depths 1..i at each depth i, ``(..., depths)``."""
+    depth = torch.arange(1, errors.shape[-1] + 1, device=errors.device)
+    return errors.cumsum(dim=-1) / depth
+
+def _best_of_k(predictor, z_start, targets, best_of, generator):
+    """Best-of-K rollout error per start, ``{K: (N, depths)}``.
+
+    Draws ``max(best_of)`` independent π-sample rollouts in one batch;
+    best-of-K keeps the first K, so the draws are nested and the result is
+    non-increasing in K.  At depth i each rollout is scored by its mean error
+    over depths 1..i, so the minimum is one whole rollout, never a mix of
+    rollouts picked per depth.
+    """
+    draws = max(best_of)
+    starts = z_start.unsqueeze(0).expand(draws, *z_start.shape)
+    paths = rollout(
+        predictor, starts, PiSample(generator=generator), targets.shape[-2]
+    ).future
+    scores = _mean_rollout_error(distance(paths, targets.unsqueeze(0)))  # (K, N, depths)
+    return {k: scores[:k].min(dim=0).values for k in best_of}
+
 def _rollouts_section(
-    model, batches, latents, bank, *, depths, positions, seed, bank_chunk_size
+    model, batches, latents, bank, *, depths, positions, seed, bank_chunk_size,
+    best_of,
 ) -> dict:
-    """Section 5: rollout error and manifold distance per depth."""
+    """Section 5: rollout error, best-of-K error and manifold distance per depth."""
     stride = model.pred_horizon
     device = latents[0].device
     sampled, groups = _rollout_starts(
         batches, stride, depths, positions, _generator(torch.device("cpu"), seed)
     )
     sample_generator = _generator(device, seed + 2)
+    best_generator = _generator(device, seed + 5)
+    best_sums = {k: torch.zeros(depths, dtype=torch.float64) for k in best_of}
     error_sums = {name: [0.0] * depths for name in ROLLOUT_PATHS}
     manifold_sums = {name: [0.0] * depths for name in (*ROLLOUT_PATHS, "real")}
     counts = [0] * depths
@@ -380,6 +406,16 @@ def _rollouts_section(
             manifold_sums["real"][depth] += _manifold_scores(
                 targets[:, depth], bank, bank_chunk_size
             ).sum().item()
+        # Same memory bound as the single rollouts: at most one group of
+        # starts per predictor call, counting the K draws.
+        chunk = max(1, z_start.shape[0] // max(best_of))
+        for i in range(0, z_start.shape[0], chunk):
+            best = _best_of_k(
+                model.predictor, z_start[i : i + chunk], targets[i : i + chunk],
+                best_of, best_generator,
+            )
+            for k, scores in best.items():
+                best_sums[k] += scores.double().sum(dim=0).cpu()
 
     def means(sums):
         return [sums[depth] / max(1, counts[depth]) for depth in range(depths)]
@@ -389,6 +425,7 @@ def _rollouts_section(
         "depths": depths,
         "stride": stride,
         "error": {name: means(error_sums[name]) for name in ROLLOUT_PATHS},
+        "best_of_k": {str(k): means(best_sums[k].tolist()) for k in best_of},
         "manifold": {name: means(manifold_sums[name]) for name in (*ROLLOUT_PATHS, "real")},
     }
 
@@ -504,20 +541,46 @@ def _verdicts(metrics) -> list[dict]:
                 0.0, "<",
             )
         )
+    # Best-of-K scores whole rollouts (mean error over depths 1..i), so
+    # compare it with the μ path scored the same way.
+    k = max(rollouts["best_of_k"], key=int)
+    depth = rollouts["depths"]
+    mu = _mean_error_rows(rollouts)["mu"][depth - 1]
+    verdicts.append(
+        _verdict(
+            f"best_of_{k}_beats_mu",
+            f"rollouts.best_of_k[{k}][depth={depth}] - "
+            f"mean(rollouts.error.mu[depth=1..{depth}])",
+            rollouts["best_of_k"][k][depth - 1] - mu,
+            0.0, "<",
+        )
+    )
     return verdicts
+
+def _mean_error_rows(rollouts) -> dict:
+    """The μ path and hindsight error rows as mean error over depths 1..i."""
+    return {
+        name: _mean_rollout_error(torch.tensor(rollouts["error"][name])).tolist()
+        for name in ("mu", "hindsight")
+    }
 
 @torch.no_grad()
 def collect_metrics(
     model, batches, bank, *, depths=DEFAULT_DEPTHS,
     rollout_positions=DEFAULT_ROLLOUT_POSITIONS, seed=0,
     loss_chunk_size: int | None = DEFAULT_LOSS_CHUNK_SIZE, bank_chunk_size=None,
+    best_of=DEFAULT_BEST_OF,
 ) -> dict:
     """Measure ``model`` on ``batches`` against a bank of real latents.
 
     ``loss_chunk_size=None`` uses the checkpoint's ``DecoderConfig``.
+    ``best_of`` lists the K values of the best-of-K rollout error.
     """
     if depths < 1 or rollout_positions < 1:
         raise ValueError("depths and rollout_positions must be at least 1")
+    requested, best_of = best_of, tuple(sorted({int(k) for k in best_of}))
+    if not best_of or best_of[0] < 1:
+        raise ValueError(f"best_of must be positive K values; got {requested!r}")
     model.eval()
     batches = list(batches)
     if not batches:
@@ -540,7 +603,7 @@ def collect_metrics(
         "policies": _policies_section(model, batches, latents, seed=seed),
         "rollouts": _rollouts_section(
             model, batches, latents, bank, depths=depths, positions=rollout_positions,
-            seed=seed, bank_chunk_size=bank_chunk_size,
+            seed=seed, bank_chunk_size=bank_chunk_size, best_of=best_of,
         ),
         "decoder": _decoder_section(model, batches, latents, seed=seed,
                                     loss_chunk_size=loss_chunk_size),
@@ -553,6 +616,7 @@ def collect_metrics(
         "pred_horizon": int(horizon),
         "candidates": int(model.config.predictor.prediction_count),
         "depths": int(depths),
+        "best_of": list(best_of),
         "rollout_positions": int(sections["rollouts"]["positions"]),
         "bank_size": int(bank.shape[0]), "latent_dim": int(bank.shape[1]),
         "seed": int(seed),
@@ -634,6 +698,12 @@ def print_report(metrics: dict) -> None:
     print("rollout error (distance to the real latent):")
     _table([(d, *(_fmt(ro["error"][n][d - 1]) for n in ROLLOUT_PATHS))
             for d in range(1, ro["depths"] + 1)], ("depth", *ROLLOUT_PATHS))
+    print("best-of-K pi-sample rollouts (mean error over depths 1..i, best of K):")
+    mean_rows = _mean_error_rows(ro)
+    depth_headers = [f"d={d}" for d in range(1, ro["depths"] + 1)]
+    _table([(f"K={k}", *map(_fmt, row)) for k, row in ro["best_of_k"].items()]
+           + [(name, *map(_fmt, row)) for name, row in mean_rows.items()],
+           ("path", *depth_headers))
     print("manifold distance (nearest real latent in the bank):")
     _table([(d, *(_fmt(ro["manifold"][n][d - 1]) for n in (*ROLLOUT_PATHS, "real")))
             for d in range(1, ro["depths"] + 1)],
@@ -666,6 +736,8 @@ def print_report(metrics: dict) -> None:
         "                distance to the nearest real latent. The claim: at",
         "                depths >= 2, pi-sample stays closer to the manifold than",
         "                the mu path (compare with the real row).",
+        "                best-of-K should fall from near mu toward hindsight as",
+        "                K grows if the committed futures cover the real one.",
         "decoder:        hint use > 0 means the decoder uses the committed future.",
         "verdicts:       PASS/FAIL on the checks above, each naming its metric.",
     ):
@@ -691,6 +763,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Sampled start positions for the rollout table.",
     )
     parser.add_argument("--depths", type=int, default=DEFAULT_DEPTHS)
+    parser.add_argument(
+        "--best-of", type=int, nargs="+", default=list(DEFAULT_BEST_OF),
+        help="K values for the best-of-K pi-sample rollout error.",
+    )
     parser.add_argument(
         "--loss-chunk-size", type=int, default=DEFAULT_LOSS_CHUNK_SIZE,
         help="Decoder positions per lm_head chunk (default: checkpoint config).",
@@ -724,7 +800,7 @@ def main(argv: list[str] | None = None) -> None:
     metrics = collect_metrics(
         model, batches, bank, depths=args.depths,
         rollout_positions=args.rollout_positions, seed=args.seed,
-        loss_chunk_size=args.loss_chunk_size,
+        loss_chunk_size=args.loss_chunk_size, best_of=args.best_of,
     )
     metrics["context"]["checkpoint"] = str(args.model)
     metrics["context"]["device"] = str(device)

@@ -195,6 +195,9 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
     }
     for row in (*rollouts["error"].values(), *rollouts["manifold"].values()):
         assert len(row) == 2
+    assert set(rollouts["best_of_k"]) == {"1", "4", "16"}
+    for row in rollouts["best_of_k"].values():
+        assert len(row) == 2
 
     decoder = metrics["decoder"]
     assert set(decoder["ce"]) == {
@@ -232,7 +235,40 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
         "encoder_center",
         "encoder_effective_rank",
         "committed_on_manifold_depth_2",
+        "best_of_16_beats_mu",
     } <= names
+
+
+def test_best_of_k_is_non_increasing_in_k(saved):
+    """Nested draws: best-of-K takes the first K of the same 16 rollouts."""
+    best = collect(saved, depths=3)["rollouts"]["best_of_k"]
+
+    for depth in range(3):
+        values = [best[k][depth] for k in ("1", "4", "16")]
+        assert values[0] >= values[1] >= values[2], (depth, values)
+
+
+def test_best_of_accepts_a_single_k(saved):
+    """K = 1 alone: one π-sample rollout scored by its mean error over 1..i."""
+    metrics = collect(saved, depths=3, best_of=(1,))
+    rollouts = metrics["rollouts"]
+    assert set(rollouts["best_of_k"]) == {"1"}
+    assert "best_of_1_beats_mu" in {v["name"] for v in metrics["verdicts"]}
+    for value in rollouts["best_of_k"]["1"]:
+        assert 0.0 <= value <= 4.0
+
+
+def test_best_of_rejects_non_positive_k(saved):
+    with pytest.raises(ValueError, match="best_of"):
+        collect(saved, best_of=(0, 4))
+
+
+def test_report_prints_best_of_k_table(saved, capsys):
+    measure.print_report(collect(saved))
+    out = capsys.readouterr().out
+    table = out.split("best-of-K")[1].split("manifold distance")[0]
+    for row in ("K=1", "K=4", "K=16", "mu", "hindsight"):
+        assert f"\n{row} " in table, row
 
 
 def test_loss_total_is_the_weighted_sum_of_its_terms(saved):
@@ -303,6 +339,9 @@ def test_measure_cli_writes_the_same_dict(saved, monkeypatch, tmp_path):
             "2",
             "--depths",
             "2",
+            "--best-of",
+            "1",
+            "2",
             "--loss-chunk-size",
             "4",
             "--device",
@@ -319,4 +358,5 @@ def test_measure_cli_writes_the_same_dict(saved, monkeypatch, tmp_path):
     assert metrics["context"]["checkpoint"] == str(model_dir)
     assert metrics["context"]["device"] == "cpu"
     assert metrics["rollouts"]["positions"] == 2
+    assert set(metrics["rollouts"]["best_of_k"]) == {"1", "2"}
     assert metrics["context"]["bank_size"] == 8
