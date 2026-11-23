@@ -561,7 +561,9 @@ def apply_overrides(config: JepaConfig, overrides: dict) -> JepaConfig:
 
     ``overrides`` has the nesting of a checkpoint's ``config.json``, e.g.
     ``{"predictor": {"prediction_count": 1}}``.  ``PretrainedConfig`` accepts
-    any kwarg, so every key must already exist on its target.
+    any kwarg, so every key must already exist on its target, and attributes
+    every ``PretrainedConfig`` has (``return_dict``, ``dtype``, ...) are
+    rejected too: they are not experiment settings.
     """
     config = copy.deepcopy(config)
     for key, value in overrides.items():
@@ -575,10 +577,18 @@ def apply_overrides(config: JepaConfig, overrides: dict) -> JepaConfig:
     return config.link()
 
 
+# Attributes every ``PretrainedConfig`` carries (``return_dict``, ``dtype``,
+# ``id2label``, ...) plus JepaConfig's composition flag.  They are HF
+# plumbing, not experiment settings, so overrides may not touch them.
+_NOT_OVERRIDABLE = frozenset(vars(PretrainedConfig())) | {"is_composition"}
+
+
 def _set_existing(target: PretrainedConfig, name: str, value, path: str) -> None:
     known = {
         key for key in vars(target)
-        if not key.startswith("_") and key not in _SERIALIZATION_METADATA
+        if not key.startswith("_")
+        and key not in _SERIALIZATION_METADATA
+        and key not in _NOT_OVERRIDABLE
     }
     if name not in known:
         raise KeyError(f"unknown config override {path!r}")

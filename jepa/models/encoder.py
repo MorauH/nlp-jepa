@@ -17,6 +17,13 @@ from .blocks import (
 class EncodeTransformer(PreTrainedModel):
     """A language model based on the Transformer architecture, without un-embedding.
 
+    Initialization: the encoder does not override ``_init_weights``, so
+    ``post_init`` applies HF's default: normal with std 0.02 (the config has
+    no ``initializer_range``, so HF's library default) for the embedding and
+    linears.  It needs no explicit re-init like the
+    decoder's, which keeps a no-op ``_init_weights`` to protect its
+    zero-initialized hint projections.
+
     Configured by :class:`jepa.config.EncoderConfig` and usable on its own::
 
         encoder = EncodeTransformer(EncoderConfig(vocab_size=len(tokenizer)))

@@ -342,6 +342,24 @@ def test_fresh_decoder_loss_is_near_uniform():
     assert abs((total / count).item() - math.log(vocab_size)) < 1.0
 
 
+def test_fresh_encoder_embedding_is_small():
+    from jepa.models.encoder import EncodeTransformer
+
+    torch.manual_seed(0)
+    encoder = EncodeTransformer(
+        EncoderConfig(
+            vocab_size=32000,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            max_position_embeddings=32,
+            pad_token_id=0,
+        )
+    )
+    # HF's default init (std 0.02), not nn.Embedding's N(0, 1).
+    assert abs(encoder.embedding.weight.std().item() - 0.02) < 0.002
+
+
 def test_hint_and_generate_path_agree():
     from jepa import DecoderModel
 
@@ -1159,10 +1177,36 @@ def test_apply_overrides_sets_known_fields_and_rejects_typos():
         apply_overrides(base, {"predictor": {"prediction_cout": 1}})
     with pytest.raises(KeyError, match="predictr"):
         apply_overrides(base, {"predictr": {"prediction_count": 1}})
+    # Attributes every PretrainedConfig has are not experiment settings.
+    with pytest.raises(KeyError, match="predictor.return_dict"):
+        apply_overrides(base, {"predictor": {"return_dict": False}})
+    with pytest.raises(KeyError, match="dtype"):
+        apply_overrides(base, {"dtype": "float16"})
+    with pytest.raises(KeyError, match="is_composition"):
+        apply_overrides(base, {"is_composition": False})
     with pytest.raises(TypeError):
         apply_overrides(base, {"predictor": 1})
     with pytest.raises(ValueError):  # link() still validates the result
         apply_overrides(base, {"decoder": {"train_policy": "pi_sample"}})
+
+
+def test_presets_apply_and_no_anneal_matches_the_final_temperature():
+    import json
+    from pathlib import Path
+
+    from jepa import CommitmentLossConfig, apply_overrides
+
+    presets = Path(__file__).parents[1] / "docs/experiments"
+    for path in sorted(presets.glob("*.json")):
+        apply_overrides(tiny_config(), json.loads(path.read_text()))
+
+    # "No annealing" means starting at the final temperature; if the default
+    # temperature moves, the preset must move with it.
+    no_anneal = json.loads((presets / "no-anneal.json").read_text())
+    assert (
+        no_anneal["commitment"]["temperature_start"]
+        == CommitmentLossConfig().temperature
+    )
 
 
 def test_train_cli_config_and_seed(tmp_path, monkeypatch):
