@@ -39,6 +39,7 @@ import argparse
 import html
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
@@ -255,15 +256,24 @@ def validation_prompts(
     return prompts
 
 
+class Prompt(NamedTuple):
+    """One prompt for decoded plans; ``reference`` is None for ``--prompt``."""
+
+    source: str
+    text: str
+    ids: list[int]
+    reference: list[int] | None
+
+
 def _blocks(ids: list[int], k: int) -> list[list[int]]:
     return [ids[i : i + k] for i in range(0, len(ids), k)]
 
 
-def plans_html(plans: dict) -> str:
+def plans_html(document: dict) -> str:
     """A small side-by-side page: one table per prompt, one column per block."""
-    context = plans["context"]
+    context = document["context"]
     prompts: dict[int, list[dict]] = {}
-    for record in plans["records"]:
+    for record in document["records"]:
         prompts.setdefault(record["prompt_index"], []).append(record)
     header = "".join(f"<th>block {i}</th>" for i in range(1, context["depth"] + 1))
     parts = [
@@ -315,11 +325,11 @@ def run_plans(args, tokenizer, model, device) -> None:
         baseline = _load_model(args.baseline_model, tokenizer, device)
         if baseline.pred_horizon != k:
             raise ValueError(
-                f"--baseline-model has pred_horizon {baseline.pred_horizon}, "
+                f"--baseline-model has horizon {baseline.pred_horizon}, "
                 f"but {args.model} has {k}; plans would not line up."
             )
 
-    prompts = []  # (source, prompt text, prompt ids, reference ids | None)
+    prompts: list[Prompt] = []
     if args.num_prompts > 0:
         _, validation = load_datasets(args.fineweb_dir)
         for prompt_ids, reference in validation_prompts(
@@ -327,11 +337,11 @@ def run_plans(args, tokenizer, model, device) -> None:
             continuation=depth * k, seed=args.seed,
         ):
             prompts.append(
-                ("validation", tokenizer.decode(prompt_ids), prompt_ids, reference)
+                Prompt("validation", tokenizer.decode(prompt_ids), prompt_ids, reference)
             )
     for text in args.prompt:
         ids = tokenizer([text], return_tensors="pt", padding=False)["input_ids"]
-        prompts.append(("prompt", text, ids[0].tolist(), None))
+        prompts.append(Prompt("prompt", text, ids[0].tolist(), None))
     if not prompts:
         raise ValueError("No prompts: pass --prompt or --num-prompts > 0.")
 
@@ -341,31 +351,31 @@ def run_plans(args, tokenizer, model, device) -> None:
         commit_top_k=args.commit_top_k, generator_seed=args.seed,
     )
     records = []
-    for index, (source, text, prompt_ids, reference) in enumerate(prompts):
-        plans = plan_prompt(model, prompt_ids, samples=args.samples, **options)
+    for index, prompt in enumerate(prompts):
+        plans = plan_prompt(model, prompt.ids, samples=args.samples, **options)
         if baseline is not None:
             plans += [
                 {**plan, "condition": "baseline"}
                 for plan in plan_prompt(
-                    baseline, prompt_ids, samples=0, conditions=("pi_argmax",),
+                    baseline, prompt.ids, samples=0, conditions=("pi_argmax",),
                     **options,
                 )
             ]
         reference_text = (
-            None if reference is None
-            else [tokenizer.decode(block) for block in _blocks(reference, k)]
+            None if prompt.reference is None
+            else [tokenizer.decode(block) for block in _blocks(prompt.reference, k)]
         )
         for plan in plans:
             records.append({
                 "prompt_index": index,
-                "source": source,
-                "prompt": text,
+                "source": prompt.source,
+                "prompt": prompt.text,
                 "reference": reference_text,
                 **plan,
                 "blocks": [tokenizer.decode(block) for block in plan["token_ids"]],
             })
 
-    plans = {
+    document = {
         "context": {
             "model": str(args.model),
             "baseline_model": None if baseline is None else str(args.baseline_model),
@@ -379,8 +389,8 @@ def run_plans(args, tokenizer, model, device) -> None:
         },
         "records": records,
     }
-    for index, (_, text, _, _) in enumerate(prompts):
-        print(f"\n=== prompt {index}: {text!r}")
+    for index, prompt in enumerate(prompts):
+        print(f"\n=== prompt {index}: {prompt.text!r}")
         rows = [r for r in records if r["prompt_index"] == index]
         if rows[0]["reference"] is not None:
             print(f"{'reference':<14}{' | '.join(rows[0]['reference'])!r}")
@@ -388,10 +398,10 @@ def run_plans(args, tokenizer, model, device) -> None:
             label = f"{r['condition']} #{r['sample']}"
             print(f"{label:<14}{' | '.join(r['blocks'])!r}")
     if args.json is not None:
-        args.json.write_text(json.dumps(plans, indent=2) + "\n")
+        args.json.write_text(json.dumps(document, indent=2) + "\n")
         print(f"\nwrote {args.json}")
     if args.html is not None:
-        args.html.write_text(plans_html(plans))
+        args.html.write_text(plans_html(document))
         print(f"wrote {args.html}")
 
 

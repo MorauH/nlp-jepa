@@ -64,7 +64,11 @@ _Avoid_: realism, sharpness score
 
 **Hint**:
 What the decoder is conditioned on for one block: the latent at the block start and the committed future at the block end.
-_Avoid_: waypoint, plan, condition
+_Avoid_: waypoint, plan (a plan is a whole decoded rollout), condition
+
+**Decoded plan**:
+A rollout (or the μ path) decoded into text block by block from a single encoding of the prompt: block i's hint is (path latent i−1, path latent i), and nothing is re-encoded.
+_Avoid_: generation (which re-encodes every block), plan (for a single hint)
 
 **Stage**:
 One of the two training phases: the JEPA stage trains encoder and predictor; the decoder stage trains a decoder against a frozen JEPA.
