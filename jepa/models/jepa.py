@@ -57,11 +57,12 @@ def build_block_hints(latents, horizon: int, committed=None):
 class JepaModel(PreTrainedModel):
     """Full JEPA stack: encoder, predictor and autoregressive decoder.
 
-    Training is split into two stages (see
-    ``docs/adr/0001-two-stage-training.md``):
+    Training has two stages (see ``docs/adr/0002-joint-decoder-gradient.md``):
 
     * :meth:`jepa_loss` trains the encoder and predictor with VISReg plus the
-      commitment loss.
+      commitment loss, and with ``config.decoder_w > 0`` also the decoder
+      through a weighted token term whose gradient reaches the encoder via
+      the hint ``z_t``.
     * :meth:`decoder_loss` trains the decoder against the frozen encoder and
       predictor.
 
@@ -124,23 +125,84 @@ class JepaModel(PreTrainedModel):
             labels, attention_mask=None if skip_mask else attention_mask
         )
 
+    @property
+    def joint_jepa_stage(self) -> bool:
+        """Whether the JEPA stage also trains the decoder (``decoder_w > 0``)."""
+        return self.config.decoder_w > 0
+
+    @property
+    def loss_weights(self) -> dict[str, float]:
+        """Term name -> weight for every term :meth:`jepa_loss` can return."""
+        weights = {**self.visreg.weights, **self.commitment_loss.weights}
+        if self.joint_jepa_stage:
+            weights["token"] = float(self.config.decoder_w)
+        return weights
+
+    def _commit_rule(self, policy: Policy | None) -> Policy:
+        """``policy``, or the decoder's training policy when it is ``None``."""
+        if policy is not None:
+            return policy
+        return policy_from_name(self.config.decoder.train_policy)
+
+    def _block_token_loss(self, labels, attention_mask, latents, committed):
+        """Mean decoder CE on block hints and the number of counted targets.
+
+        Gradients follow whatever ``latents`` and ``committed`` carry: the
+        decoder stage passes both without a graph, the joint JEPA stage passes
+        online latents (so the hint ``z_t`` reaches the encoder) and a
+        detached committed future.
+        """
+        z_t, committed, valid = build_block_hints(
+            latents, self.pred_horizon, committed=committed
+        )
+        # A block start past ``seq - k - 1`` has no committed future, so those
+        # targets are excluded instead of being paired with another block.
+        loss_mask = valid.unsqueeze(0)
+        if attention_mask is not None:
+            loss_mask = (
+                loss_mask
+                & attention_mask[:, :-1].bool()
+                & attention_mask[:, 1:].bool()
+            )
+        token_sum, token_count = self.decoder.token_loss(
+            z_t,
+            committed,
+            labels,
+            attention_mask=attention_mask,
+            chunk_size=self.config.decoder.loss_chunk_size,
+            loss_mask=loss_mask,
+        )
+        return token_sum / token_count.clamp_min(1), token_count.detach()
+
     def jepa_loss(
         self,
         labels,
         attention_mask=None,
         progress=None,
+        policy: Policy | None = None,
     ) -> LossOutput:
         """Run the JEPA stage objective.
+
+        With ``config.decoder_w > 0`` the decoder token loss is added as the
+        ``token`` term (ADR 0002).  Its gradient reaches the encoder through
+        the block-start hint ``z_t`` only: the committed future is detached,
+        so the predictor is trained by the commitment loss alone.  With
+        ``decoder_w == 0`` the decoder never runs.
 
         Args:
             labels: ``(batch, seq)`` token ids.
             attention_mask: optional ``(batch, seq)``, 1 = real token.
             progress: 0-dim tensor with the fraction of training completed, or
                 ``None`` for the final commitment temperature (evaluation).
+            policy: commit rule for the decoder hint; ``None`` uses
+                ``config.decoder.train_policy``.  Ignored when
+                ``decoder_w == 0``.
 
         Returns:
             :class:`~jepa.models.losses.LossOutput` whose total is
-            VISReg + commitment loss and whose terms/diagnostics merge both.
+            ``sum(loss_weights[name] * terms[name])`` and whose
+            terms/diagnostics merge VISReg, the commitment loss and, when
+            joint, the ``token`` term and ``tokens`` diagnostic.
         """
         latents = self.encode(labels, attention_mask)
 
@@ -170,15 +232,24 @@ class JepaModel(PreTrainedModel):
         commitment_out = self.commitment_loss(
             futures, Y, mask=valid, progress=progress
         )
+        loss = visreg_out.loss + commitment_out.loss
+        terms = {**visreg_out.terms, **commitment_out.terms}
+        diagnostics = {**visreg_out.diagnostics, **commitment_out.diagnostics}
 
-        return LossOutput(
-            loss=visreg_out.loss + commitment_out.loss,
-            terms={**visreg_out.terms, **commitment_out.terms},
-            diagnostics={
-                **visreg_out.diagnostics,
-                **commitment_out.diagnostics,
-            },
-        )
+        if self.joint_jepa_stage:
+            rule = self._commit_rule(policy)
+            # Detached: a hindsight choice used the real future, so a gradient
+            # through it would train the JEPA on information that does not
+            # exist at inference.
+            committed = futures.commit(rule, Y if rule.needs_target else None)
+            token, count = self._block_token_loss(
+                labels, attention_mask, latents, committed.future.detach()
+            )
+            loss = loss + self.config.decoder_w * token
+            terms["token"] = token
+            diagnostics["tokens"] = count
+
+        return LossOutput(loss=loss, terms=terms, diagnostics=diagnostics)
 
     def decoder_loss(
         self,
@@ -219,38 +290,15 @@ class JepaModel(PreTrainedModel):
         with torch.no_grad():
             latents = self.encode(labels, attention_mask)
             futures = self.predictor(latents[:, :-k, :])
-            rule = (
-                policy_from_name(self.config.decoder.train_policy)
-                if policy is None
-                else policy
-            )
+            rule = self._commit_rule(policy)
             target = latents[:, k:, :] if rule.needs_target else None
             committed = futures.commit(rule, target).future
-            z_t, committed, valid = build_block_hints(
-                latents, k, committed=committed
-            )
 
-        # A block start past ``seq - k - 1`` has no committed future, so those
-        # targets are excluded instead of being paired with another block.
-        loss_mask = valid.unsqueeze(0)
-        if attention_mask is not None:
-            loss_mask = (
-                loss_mask
-                & attention_mask[:, :-1].bool()
-                & attention_mask[:, 1:].bool()
-            )
-
-        token_sum, token_count = self.decoder.token_loss(
-            z_t,
-            committed,
-            labels,
-            attention_mask=attention_mask,
-            chunk_size=self.config.decoder.loss_chunk_size,
-            loss_mask=loss_mask,
+        token_loss, token_count = self._block_token_loss(
+            labels, attention_mask, latents, committed
         )
-        token_loss = token_sum / token_count.clamp_min(1)
         return LossOutput(
             loss=token_loss,
             terms={"token": token_loss},
-            diagnostics={"tokens": token_count.detach()},
+            diagnostics={"tokens": token_count},
         )

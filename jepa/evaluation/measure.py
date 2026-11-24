@@ -44,8 +44,14 @@ DEFAULT_LOSS_CHUNK_SIZE = None
 REPRESENTATION_LATENTS = 20_000  # effective rank is sample-size sensitive
 ROLLOUT_PATHS = ("hindsight", "pi_argmax", "pi_sample", "mu")
 DECODER_CONDITIONS = (
-    "pi_argmax", "pi_sample", "mu_safe", "hindsight", "real", "shuffled", "null"
+    "pi_argmax", "pi_sample", "mu_safe", "hindsight", "real", "shuffled", "null",
+    "no_hints",
 )
+# Lags beyond the horizon, as multiples of it, for the long end of the profile.
+LONG_LAG_MULTIPLES = (2, 5, 10, 20)
+# A drifting latent has rebound <= 0; the period-10 shortcut of the first
+# two-stage run scored about 1.1.  The margin allows for sampling noise.
+REBOUND_THRESHOLD = 0.05
 
 def _value(value) -> float:
     return float(value.detach().float().item()) if isinstance(
@@ -82,6 +88,92 @@ def mu_path(predictor, z, steps: int):
         z = F.normalize(mu.float(), dim=-1).to(mu.dtype) * math.sqrt(z.shape[-1])
         path.append(z)
     return torch.stack(path, dim=-2)
+
+def lag_profile(latents, masks, lags) -> dict[int, float | None]:
+    """Mean cos(z_t, z_{t+lag}) over every pair of real tokens, per lag.
+
+    ``latents`` and ``masks`` are matching lists of ``(batch, seq, D)`` and
+    ``(batch, seq)``.  A lag with no pair in any sequence maps to ``None``.
+    """
+    profile = {}
+    for lag in lags:
+        lag = int(lag)
+        total, count = 0.0, 0
+        for z, mask in zip(latents, masks):
+            if z.shape[1] <= lag:
+                continue
+            pairs = _prediction_mask(mask, lag)
+            if pairs.any():
+                cos = F.cosine_similarity(
+                    z[:, :-lag][pairs].float(), z[:, lag:][pairs].float(), dim=-1
+                )
+                total += cos.sum().item()
+                count += cos.numel()
+        profile[lag] = total / count if count else None
+    return profile
+
+def periodic_rebound(profile, horizon: int) -> float | None:
+    """cos at lag ``horizon`` minus the lowest cos at lags 1..horizon-1.
+
+    A latent that drifts loses similarity with lag, so its rebound is <= 0.
+    A latent with a period dividing the horizon dips below and returns at the
+    horizon, a shortcut the prediction loss cannot see.  ``None`` when the
+    profile lacks the horizon or every shorter lag.
+    """
+    shorter = [profile.get(lag) for lag in range(1, horizon)]
+    shorter = [value for value in shorter if value is not None]
+    if profile.get(horizon) is None or not shorter:
+        return None
+    return profile[horizon] - min(shorter)
+
+def _centred_kernel(window: int) -> torch.Tensor:
+    """A centred moving average spanning exactly ``window`` steps.
+
+    An even window gets ``window + 1`` taps with half weight at both ends, so
+    it averages exactly one period of length ``window``; an odd window is
+    ``window`` equal taps.  Either way a linear drift passes unchanged.
+    """
+    if window % 2 == 0:
+        taps = torch.ones(window + 1, dtype=torch.float64)
+        taps[0] = taps[-1] = 0.5
+    else:
+        taps = torch.ones(window, dtype=torch.float64)
+    return taps / taps.sum()
+
+def fast_share(latents, masks, window: int) -> float | None:
+    """Share of the within-document energy that varies faster than ``window``.
+
+    Unit latents are split into a centred ``window``-step moving average (the
+    slow part) and the residual (the fast part).  The share is the fast
+    energy over fast + slow, each the mean over documents of the squared norm
+    per position (the slow part around its document mean).  ``None`` when no
+    document is longer than the kernel.  Token-to-token change counts as fast
+    too, so the share has no healthy reference value; it is reported, not
+    judged.
+    """
+    if window < 2:
+        raise ValueError(f"window must be at least 2; got {window}")
+    kernel = _centred_kernel(window)
+    half = kernel.numel() // 2
+    fast_sum = slow_sum = 0.0
+    documents = 0
+    for z, mask in zip(latents, masks):
+        lengths = mask.sum(dim=-1).tolist()
+        for row, length in enumerate(int(n) for n in lengths):
+            if length <= kernel.numel():
+                continue
+            unit = F.normalize(z[row, :length].double(), dim=-1)
+            slow = F.conv1d(
+                unit.T.unsqueeze(1), kernel.to(unit.device).view(1, 1, -1)
+            ).squeeze(1).T  # (length - 2 * half, D)
+            fast = unit[half : length - half] - slow
+            fast_sum += (fast**2).sum(dim=-1).mean().item()
+            slow_sum += ((slow - slow.mean(dim=0)) ** 2).sum(dim=-1).mean().item()
+            documents += 1
+    total = fast_sum + slow_sum
+    if documents == 0 or total == 0:
+        return None
+    return fast_sum / total
 
 def _manifold_scores(points, bank, chunk_size):
     """Nearest-neighbour distance of each row to the bank."""
@@ -139,7 +231,7 @@ def _representation_section(model, batches, latents) -> dict:
     """Section 1: no-collapse checks on the encoder latents."""
     horizon = model.pred_horizon
     pooled, seen = [], 0
-    temporal_sum = temporal_count = token_count = 0
+    token_count = 0
     visreg_sums = {name: 0.0 for name in model.visreg.weights}
     for (_, mask), z in zip(batches, latents):
         valid = mask.bool()
@@ -151,13 +243,9 @@ def _representation_section(model, batches, latents) -> dict:
             seen += take.shape[0]
         for name, value in model.visreg(z, mask=mask).terms.items():
             visreg_sums[name] += _value(value) * tokens
-        pairs = _prediction_mask(mask, horizon)
-        if pairs.any():
-            cos = F.cosine_similarity(
-                z[:, :-horizon][pairs].float(), z[:, horizon:][pairs].float(), -1
-            )
-            temporal_sum += cos.sum().item()
-            temporal_count += cos.numel()
+    masks = [mask for _, mask in batches]
+    lags = (*range(1, horizon + 1), *(m * horizon for m in LONG_LAG_MULTIPLES))
+    profile = lag_profile(latents, masks, lags)
     z_all = torch.cat(pooled)
     mean, centered = z_all.mean(dim=0), z_all - z_all.mean(dim=0)
     covariance = centered.T @ centered / max(1, z_all.shape[0] - 1)
@@ -169,14 +257,18 @@ def _representation_section(model, batches, latents) -> dict:
         "mean_vector_norm": _value(mean.norm()),
         "effective_rank": _value(rank),
         "latents": int(z_all.shape[0]),
-        "temporal_cos": temporal_sum / max(1, temporal_count),
+        "temporal_cos": profile[horizon] if profile[horizon] is not None else 0.0,
+        # String keys: the dict is written to JSON as is.
+        "lag_cos": {str(lag): value for lag, value in profile.items()},
+        "periodic_rebound": periodic_rebound(profile, horizon),
+        "fast_share": fast_share(latents, masks, window=max(2, horizon // 2)),
         "visreg": {name: visreg_sums[name] / max(1, token_count) for name in visreg_sums},
     }
 
 def _loss_section(model, batches) -> dict:
     """Section 2: every JEPA term, its weight, and its contribution."""
     horizon = model.pred_horizon
-    weights = {**model.visreg.weights, **model.commitment_loss.weights}
+    weights = model.loss_weights
     term_sums, diagnostic_sums, count = {}, {}, 0
     for labels, mask in batches:
         valid = int(_prediction_mask(mask, horizon).sum())
@@ -464,6 +556,7 @@ def _decoder_section(model, batches, latents, *, seed, loss_chunk_size) -> dict:
             z, horizon, committed=committed["pi_argmax"][order]
         )[1]
         hints["null"] = torch.zeros_like(z_hint)
+        hints["no_hints"] = hints["null"]
         # Same exclusion as decoder_loss: no committed future for the tail
         # block, so those targets are not counted.
         loss_mask = (
@@ -472,8 +565,11 @@ def _decoder_section(model, batches, latents, *, seed, loss_chunk_size) -> dict:
             & mask[:, 1:].bool()
         )
         for name in DECODER_CONDITIONS:
+            # ``null`` keeps the real z_t and zeroes the future; ``no_hints``
+            # zeroes both, which isolates the z_t channel.
+            start = torch.zeros_like(z_hint) if name == "no_hints" else z_hint
             total, count = model.decoder.token_loss(
-                z_hint.detach(), hints[name].detach(), labels,
+                start.detach(), hints[name].detach(), labels,
                 attention_mask=mask, chunk_size=loss_chunk_size,
                 loss_mask=loss_mask,
             )
@@ -487,6 +583,10 @@ def _decoder_section(model, batches, latents, *, seed, loss_chunk_size) -> dict:
         "ce": ce,
         "tokens": token_count,
         "hint_use": ce["shuffled"] - ce["pi_argmax"],
+        # What each hint channel adds: z_t over nothing, the committed future
+        # over a real z_t alone.
+        "z_t_use": ce["no_hints"] - ce["null"],
+        "future_use": ce["null"] - ce["pi_argmax"],
         "commit_headroom": ce["pi_argmax"] - ce["hindsight"],
         "specificity": {
             "shuffled_minus_hindsight": ce["shuffled"] - ce["hindsight"],
@@ -530,6 +630,13 @@ def _verdicts(metrics) -> list[dict]:
             representation["effective_rank"], 15.0, ">",
         ),
     ]
+    if representation["periodic_rebound"] is not None:
+        verdicts.append(
+            _verdict(
+                "no_periodic_shortcut", "representation.periodic_rebound",
+                representation["periodic_rebound"], REBOUND_THRESHOLD, "<",
+            )
+        )
     for depth in range(2, rollouts["depths"] + 1):
         verdicts.append(
             _verdict(
@@ -655,8 +762,18 @@ def print_report(metrics: dict) -> None:
         ("effective rank", f"{_fmt(r['effective_rank'])} / {c['latent_dim']}  "
                            f"({r['latents']:,} latents)"),
         ("cos(z_t, z_t+k)", _fmt(r["temporal_cos"])),
+        ("periodic rebound", f"{_fmt(r['periodic_rebound'])}  "
+                             "(cos at k minus the lowest cos below k)"),
+        ("fast share", f"{_fmt(r['fast_share'])}  "
+                       "(within-document energy faster than k/2)"),
         ("VISReg", " | ".join(f"{n} {_fmt(v)}" for n, v in r["visreg"].items())),
     ])
+    lags = list(r["lag_cos"].items())
+    print("lag profile, mean cos(z_t, z_t+lag):")
+    for start in range(0, len(lags), 10):
+        row = lags[start : start + 10]
+        print("  lag " + "".join(f"{lag:>8}" for lag, _ in row))
+        print("  cos " + "".join(f"{_fmt(value):>8}" for _, value in row))
 
     loss = metrics["loss"]
     print("\n--- jepa loss ---")
@@ -713,6 +830,8 @@ def print_report(metrics: dict) -> None:
     print(f"\n--- decoder (token-weighted CE over {dec['tokens']:,} tokens) ---")
     _table([(n, _fmt(v)) for n, v in dec["ce"].items()], ("hint", "CE"))
     print(f"hint use (shuffled - pi-argmax):       {_fmt(dec['hint_use'])}")
+    print(f"z_t use (no_hints - null):             {_fmt(dec['z_t_use'])}")
+    print(f"future use (null - pi-argmax):         {_fmt(dec['future_use'])}")
     print(f"commit headroom (pi-argmax - hindsight): {_fmt(dec['commit_headroom'])}")
     print(f"specificity: shuffled-hindsight "
           f"{_fmt(dec['specificity']['shuffled_minus_hindsight'])}  vs "
@@ -727,6 +846,8 @@ def print_report(metrics: dict) -> None:
     for line in (
         "representation: std near 1 and effective rank > 15 = no collapse;",
         "                cos(z_t, z_t+k) 0.5-0.85 healthy, >0.95 too smooth.",
+        "                periodic rebound > 0 = the latent dips and returns by",
+        "                lag k, a periodic code the prediction loss cannot see.",
         "loss:           total is the weighted sum of the terms; H(r) is fixed",
         "                by the targets, so only KL(r||pi) can improve.",
         "heads:          pi gain > 0 = pi predicts the closest candidate from z_t.",
@@ -739,6 +860,8 @@ def print_report(metrics: dict) -> None:
         "                best-of-K should fall from near mu toward hindsight as",
         "                K grows if the committed futures cover the real one.",
         "decoder:        hint use > 0 means the decoder uses the committed future.",
+        "                null keeps the real z_t; future use is what the",
+        "                committed future adds beyond it.",
         "verdicts:       PASS/FAIL on the checks above, each naming its metric.",
     ):
         print(line)

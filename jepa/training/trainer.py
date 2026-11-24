@@ -1,7 +1,9 @@
 """Training loop for :class:`jepa.models.jepa.JepaModel`.
 
-One loop serves both stages (``docs/adr/0001-two-stage-training.md``):
-``stage="jepa"`` trains encoder+predictor and never runs the decoder;
+One loop serves both stages (``docs/adr/0002-joint-decoder-gradient.md``):
+``stage="jepa"`` trains encoder+predictor, plus the decoder when
+``config.decoder_w > 0`` (its gradient reaches the encoder through the hint
+``z_t``); with ``decoder_w == 0`` it never runs the decoder.
 ``stage="decoder"`` trains the decoder against the frozen JEPA.
 
 Engineering settings are the module constants here; :class:`TrainConfig` holds
@@ -16,7 +18,7 @@ import math
 import os
 import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Callable
@@ -103,7 +105,8 @@ def _lr_factor(step: int, *, warmup_steps: int, total_steps: int) -> float:
 
 
 def _jepa_loss(model, labels, attention_mask, progress, policy):
-    return model.jepa_loss(labels, attention_mask=attention_mask, progress=progress)
+    return model.jepa_loss(labels, attention_mask=attention_mask,
+                           progress=progress, policy=policy)
 
 
 def _decoder_loss(model, labels, attention_mask, progress, policy):
@@ -139,6 +142,11 @@ class JepaTrainer:
         self.model = model
         self.config = config
         self.stage = _STAGES[config.stage]
+        if config.stage == "jepa" and model.joint_jepa_stage:
+            # Joint JEPA stage: the decoder trains too, and validation uses
+            # the inference hint, like the decoder stage.
+            self.stage = replace(self.stage, modules=(*self.stage.modules, "decoder"),
+                                 validation_policy=_EVAL_POLICY)
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
@@ -247,7 +255,8 @@ class JepaTrainer:
     def evaluate(self, val_loader: DataLoader, device: torch.device) -> dict[str, float]:
         """Return the average validation losses (and perplexity if weighted)."""
         self._apply_stage(training=False)
-        tokens_key = f"{self.stage.prefix}tokens"
+        token_count_key = f"{self.stage.prefix}tokens"
+        token_term_key = f"{self.stage.prefix}token"
         totals: dict[str, torch.Tensor] = {}
         n_batches = 0
         # 0-dim tensor: the same graph input as training; 1.0 = final temperature.
@@ -262,11 +271,12 @@ class JepaTrainer:
             with self._autocast(device):
                 values = self._losses(labels, attention_mask, progress, policy)
                 self._accumulate(totals, values)
-            # A ``tokens`` diagnostic means the loss is a per-token mean:
-            # weight it by its token count for an exact perplexity.
-            if tokens_key in values:
-                count = values[tokens_key]
-                contribution = values["loss"] * count
+            # A ``tokens`` diagnostic means the ``token`` term is a per-token
+            # mean: weight it by its token count for an exact perplexity.  In
+            # the joint JEPA stage the total also holds the JEPA terms.
+            if token_count_key in values:
+                count = values[token_count_key]
+                contribution = values[token_term_key] * count
                 token_sum = contribution if token_sum is None else token_sum + contribution
                 token_count = count if token_count is None else token_count + count
             n_batches += 1

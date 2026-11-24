@@ -83,8 +83,12 @@ A rollout (or the μ path) decoded into text block by block from a single encodi
 _Avoid_: generation (which re-encodes every block), plan (for a single hint)
 
 **Stage**:
-One of the two training phases: the JEPA stage trains encoder and predictor; the decoder stage trains a decoder against a frozen JEPA.
-_Avoid_: mode, joint training
+One of the two training phases: the JEPA stage trains encoder and predictor (and the decoder too when it is joint); the decoder stage trains a decoder against a frozen JEPA.
+_Avoid_: mode
+
+**Joint JEPA stage**:
+The JEPA stage with `decoder_w > 0` (ADR 0002): the decoder trains alongside the encoder and predictor, and its loss reaches the encoder only through the hint's block-start latent. The committed future is detached, so the predictor gets no decoder gradient. `decoder_w = 0` is the **two-stage** recipe.
+_Avoid_: end-to-end (the predictor and the committed future are cut off), joint model (the model is the same; only the stage's objective changes)
 
 ## Experiments
 

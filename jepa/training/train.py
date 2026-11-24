@@ -1,9 +1,10 @@
 """Train one stage of the JEPA stack.
 
 ``--stage jepa`` (the default) trains the encoder and predictor with the JEPA
-objective.  ``--stage decoder`` trains a decoder against a frozen JEPA loaded
-from ``--from``, writing to ``<from>-decoder`` by default.  The two stages are
-described in ``docs/adr/0001-two-stage-training.md``.
+objective, and the decoder with them when ``decoder_w > 0`` (e.g.
+``--config docs/experiments/joint-decoder.json``).  ``--stage decoder`` trains
+a decoder against a frozen JEPA loaded from ``--from``, writing to
+``<from>-decoder`` by default.  See ``docs/adr/0002-joint-decoder-gradient.md``.
 
 Run from the repository root::
 
@@ -273,6 +274,12 @@ def main(argv: list[str] | None = None) -> JepaTrainer:
     print("  encoder:  ", f"{sum(p.numel() for p in model.encoder.parameters()):,}")
     print("  predictor:", f"{sum(p.numel() for p in model.predictor.parameters()):,}")
     print("  decoder:  ", f"{sum(p.numel() for p in model.decoder.parameters()):,}")
+    if stage == "jepa" and model.joint_jepa_stage:
+        print(
+            f"Joint JEPA stage: decoder_w {model.config.decoder_w} | "
+            f"window {model.decoder.sliding_window} | "
+            f"train policy: {model.config.decoder.train_policy}"
+        )
     if stage == "decoder":
         print(
             f"Decoder window: {model.decoder.sliding_window} | "

@@ -49,17 +49,37 @@ latent, a clear single future instead of μ's average of all of them.
 
 ## Two stages
 
-The JEPA is trained first, then a decoder is trained against the frozen JEPA.
-The reasons are in [ADR 0001](adr/0001-two-stage-training.md).
+Two stages share one trainer. The JEPA stage trains the encoder and predictor,
+and with `JepaConfig.decoder_w > 0` the decoder too. The decoder stage trains a
+decoder against a frozen JEPA. The reasons are in
+[ADR 0002](adr/0002-joint-decoder-gradient.md), which supersedes the strictly
+two-stage [ADR 0001](adr/0001-two-stage-training.md).
 
 ```bash
 python -m jepa train                          # stage jepa -> runs/jepa
+python -m jepa train --config docs/experiments/joint-decoder.json   # joint
 python -m jepa train --resume                 # continue it
 python -m jepa train --stage decoder --from runs/jepa   # -> runs/jepa-decoder
 python -m jepa train --stage decoder --resume --epochs 2
 ```
 
-`--stage jepa` optimizes the encoder and predictor; the decoder is never run.
+`--stage jepa` optimizes the encoder and predictor. With `decoder_w = 0` (the
+default until the `decoder_w` sweep of ticket 006 picks a weight) the decoder
+is never run. With `decoder_w > 0` the loss gains a `token` term,
+`decoder_w × decoder CE` on block hints, and the decoder trains along with
+the JEPA. The gradient paths are fixed:
+
+- the hint `z_t` (the latent at the block start) keeps its graph, so the
+  decoder loss trains the encoder: z_t is rewarded for what the decoder's
+  window lacks and the next block needs;
+- the committed future is committed on the JEPA loss's own `Futures` (no
+  second predictor pass) and detached, so the predictor is trained only by
+  the commitment loss and a hindsight choice, made with the real future, never
+  becomes a gradient.
+
+Training uses `DecoderConfig.train_policy` hints; validation uses π-argmax
+hints, and validation perplexity comes from the `token` term, not the total.
+
 `--stage decoder` loads a checkpoint from `--from`, freezes its encoder and
 predictor (they run under `torch.no_grad()`), attaches a fresh decoder, and
 trains only the decoder on committed futures. The decoder stage writes to
@@ -86,7 +106,8 @@ trainer warns).
 
 ### Decoder hints
 
-`decoder_loss` takes an explicit commit `policy`: `None` uses
+`decoder_loss` (and `jepa_loss`, for its `token` term) takes an explicit
+commit `policy`: `None` uses
 `DecoderConfig.train_policy` (the training condition); validation passes
 `PiArgmax()` (the inference condition). The model's `train`/`eval` flag is not
 involved.
@@ -124,6 +145,7 @@ a seed reproduces the weights exactly. On CUDA, non-deterministic kernels
 {
   "model_type": "jepa",
   "pred_horizon": 20,
+  "decoder_w": 0.0,
   "encoder":    {"model_type": "jepa_encoder",    "...": "..."},
   "predictor":  {"model_type": "jepa_predictor",  "...": "..."},
   "decoder":    {"model_type": "jepa_decoder",    "...": "..."},
@@ -187,8 +209,16 @@ latents. The JSON has one dict per section:
 
 - `context`: checkpoint, device, example/token counts, horizon, candidates.
 - `representation`: per-dim std, mean norm, effective rank, temporal cosine,
-  and VISReg terms — the no-collapse checks.
-- `loss`: every JEPA term with its weight and weighted contribution, plus the
+  and VISReg terms — the no-collapse checks. Also the **lag profile**
+  (`lag_cos`, mean cos(z_t, z_t+lag) for lags 1..k and 2k, 5k, 10k, 20k), the
+  **periodic rebound** (cos at k minus the lowest cos below k) and the
+  **fast share** (within-document energy left after a centred k/2-step moving
+  average). The rebound exists because the two-stage JEPA learned a latent
+  with a period dividing k: cos at k alone looked smooth (0.96) while cos at
+  k/4 was −0.15. Verdict `no_periodic_shortcut`: rebound < 0.05. The fast
+  share has no verdict, since token-to-token change is legitimately fast.
+- `loss`: every JEPA term (including `token` for a joint checkpoint) with its
+  weight and weighted contribution, plus the
   π floor (`H(r)` and `KL(r||π)`).
 - `heads`: candidate separation, hindsight shares and live slots, π's NLL
   gain over a constant distribution and its accuracy, μ's norm and distance
@@ -210,7 +240,11 @@ latents. The JSON has one dict per section:
   best-of-16 < μ at the deepest depth, with μ's error also averaged over
   depths 1..i).
 - `decoder`: token-weighted cross-entropy per hint condition (committed
-  futures, real latent, shuffled, null), hint use and specificity. All rows use
+  futures, real latent, shuffled, null, no_hints), hint use and specificity.
+  `null` keeps the real z_t and zeroes the future; `no_hints` zeroes both.
+  `z_t_use` (`no_hints − null`) and `future_use` (`null − pi_argmax`) split the
+  two hint channels: with a jointly trained z_t, only `future_use` shows what
+  the commitment adds. All rows use
   the same mask (the tail block with no committed future is excluded). The
   π-argmax row is the inference hint; the hindsight row is teacher-forced and
   its hint carries up to `log2(P)` bits about the target future, so read it as

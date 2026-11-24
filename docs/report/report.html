@@ -346,11 +346,27 @@ future, so it carries up to \(\log_2 P = 3\) bits about it. Hints chosen by
 latent \(k\) tokens ahead and is excluded from the decoder loss.
 </p>
 
-<h3>3.7&nbsp; Two-stage training</h3>
+<h3>3.7&nbsp; Training: a decoder gradient into the encoder</h3>
 <p>
-The encoder and predictor are trained first (the JEPA stage). The decoder is
-then trained against the frozen JEPA (the decoder stage), so its hints are
-stable from the first step and the decoder loss cannot change the latents.
+The encoder, predictor and decoder are trained together. The objective is the
+JEPA loss plus \(w_{\text{dec}}\) times the decoder cross-entropy. The decoder
+gradient reaches the encoder only through the block-start latent \(z_t\) in
+the hint, which rewards \(z_t\) for carrying what the decoder's 32-token
+window lacks and the next block needs. The committed future in the hint is
+detached: a hindsight choice was made with the real future, and a gradient
+through it would train the model on information that does not exist at
+inference. The predictor is therefore trained by the commitment loss alone.
+</p>
+<p>
+We first trained the JEPA alone and the decoder afterwards against the frozen
+JEPA (\(w_{\text{dec}} = 0\)). That encoder found a shortcut. Its latent
+oscillates with a period of 10 tokens, which divides \(k = 20\): the mean
+cosine between latents is \(-0.15\) at a lag of 5 tokens and \(0.96\) at a
+lag of 20. 93% of the variance within a document is this oscillation. VISReg
+asks for spread, and the prediction loss cannot see a component whose period
+divides \(k\), so nothing in the JEPA loss alone rewards content. The two-stage
+recipe is kept as an ablation (Table 2).
+<span class="todo">TODO: \(w_{\text{dec}}\) from the sweep; confirm the shortcut is gone (lag profile, periodic rebound)</span>
 </p>
 
 <!-- ===================================================================== -->
@@ -376,8 +392,8 @@ validation chunk continues a training document.
     <tr><td>Horizon</td><td>\(k = 20\) tokens</td></tr>
     <tr><td>Commitment loss</td><td>\(s\): 1.0 → 0.1 over 30%, \(\varepsilon = 0.05\), diversity 0.5 (margin 0.5)</td></tr>
     <tr><td>VISReg</td><td>scale, shape, center weights 1; 256 slices</td></tr>
-    <tr><td>JEPA stage</td><td>AdamW, lr \(4\cdot10^{-4}\), batch 24, 3 epochs, wd 0.01</td></tr>
-    <tr><td>Decoder stage</td><td>AdamW, lr \(6\cdot10^{-4}\), batch 24, 1 epoch, hindsight hints</td></tr>
+    <tr><td>Optimizer</td><td>AdamW, lr \(4\cdot10^{-4}\), batch 24, 3 epochs, wd 0.01</td></tr>
+    <tr><td>Decoder loss</td><td>trained jointly, weight \(w_{\text{dec}}\) = <span class="todo">TODO: sweep</span>, hindsight hints, gradient to the encoder through \(z_t\) only</td></tr>
     <tr><td>Schedule</td><td>1% linear warmup, cosine to 10% of peak; bf16; grad-norm clip 1.0</td></tr>
   </tbody>
   <caption>Table 1. Main configuration (the defaults in <code>jepa/config.py</code>).
@@ -393,6 +409,7 @@ validation chunk continues a training document.
     <tr><td>\(P = 4\)</td><td>four candidates</td><td>Sensitivity to \(P\)</td></tr>
     <tr><td>No annealing</td><td>\(s\) fixed at 0.1</td><td>Does annealing prevent dead candidates?</td></tr>
     <tr><td>No diversity</td><td>diversity weight 0</td><td>Is the diversity term needed?</td></tr>
+    <tr><td>Two-stage</td><td>\(w_{\text{dec}} = 0\); decoder trained afterwards on the frozen JEPA</td><td>Does the decoder gradient remove the periodic shortcut and make the latent carry content?</td></tr>
     <tr><td>Decoder: \(\pi\)-argmax hints</td><td>decoder trained on \(\pi\)-argmax hints</td><td>Cost and benefit of hindsight teacher forcing</td></tr>
     <tr><td>MDN predictor <span class="muted">(optional)</span></td><td>mixture density predictor, as in MDN-VJEPA</td><td>Finite candidates vs a mixture likelihood <span class="todo">TODO: decide; needs code</span></td></tr>
   </tbody>
@@ -649,9 +666,8 @@ this. <span class="todo">TODO: report live/effective slots; link to the head-gro
 <p>Code: <span class="todo">TODO: repository URL and commit</span>. Commands:</p>
 <pre><code>python -m jepa train-tokenizer
 python -m jepa prepare-data
-python -m jepa train                                   # JEPA stage
-python -m jepa train --stage decoder --from runs/jepa  # decoder stage
-python -m jepa measure --model runs/jepa-decoder --json runs/jepa-decoder/metrics.json
+python -m jepa train --config docs/experiments/joint-decoder.json  # joint training
+python -m jepa measure --model runs/jepa --json runs/jepa/metrics.json
 python docs/report/synthetic.py                        # Section 5.1: synthetic.json, synthetic.svg</code></pre>
 <p class="muted">Variant runs (P = 1, ablations, seeds) need ticket 002.</p>
 

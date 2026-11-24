@@ -208,6 +208,7 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
         "real",
         "shuffled",
         "null",
+        "no_hints",
     }
     # Every hint condition counts the same targets: 12-token rows with k=2 have
     # 11 candidate positions, of which the last partial block (no committed
@@ -360,3 +361,89 @@ def test_measure_cli_writes_the_same_dict(saved, monkeypatch, tmp_path):
     assert metrics["rollouts"]["positions"] == 2
     assert set(metrics["rollouts"]["best_of_k"]) == {"1", "2"}
     assert metrics["context"]["bank_size"] == 8
+
+
+def _circle(angles):
+    """Unit latents ``(1, T, 2)`` at the given angles, with a full mask."""
+    z = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)[None]
+    return [z], [torch.ones(1, z.shape[1], dtype=torch.long)]
+
+
+def test_periodic_latent_rebounds_at_the_horizon():
+    """Period 10 with k = 20: cos dips to -1 at lag 5 and returns to 1 at lag 20."""
+    t = torch.arange(200, dtype=torch.float64)
+    latents, masks = _circle(2 * torch.pi * t / 10)
+
+    profile = measure.lag_profile(latents, masks, range(1, 21))
+
+    assert profile[5] == pytest.approx(-1.0, abs=1e-6)
+    assert profile[10] == pytest.approx(1.0, abs=1e-6)
+    assert measure.periodic_rebound(profile, horizon=20) == pytest.approx(2.0, abs=1e-6)
+
+
+def test_drifting_latent_does_not_rebound():
+    t = torch.arange(200, dtype=torch.float64)
+    latents, masks = _circle(0.01 * t)
+
+    profile = measure.lag_profile(latents, masks, range(1, 21))
+
+    assert profile[1] > profile[10] > profile[20]
+    assert measure.periodic_rebound(profile, horizon=20) < 0
+
+
+def test_fast_share_is_one_for_an_oscillation_and_zero_for_drift():
+    """A centred window of one period removes the oscillation and keeps drift."""
+    t = torch.arange(200, dtype=torch.float64)
+
+    oscillating = measure.fast_share(*_circle(2 * torch.pi * t / 10), window=10)
+    drifting = measure.fast_share(*_circle(0.01 * t), window=10)
+
+    assert oscillating == pytest.approx(1.0, abs=1e-6)
+    assert drifting == pytest.approx(0.0, abs=1e-3)
+
+
+def test_collect_metrics_reports_the_lag_profile_and_hint_channels(saved):
+    metrics = collect(saved)
+    representation, decoder = metrics["representation"], metrics["decoder"]
+
+    # k = 2: every lag 1..k, then 2k, 5k, 10k, 20k (none of the last three fit
+    # in 12-token rows).
+    assert list(representation["lag_cos"]) == ["1", "2", "4", "10", "20", "40"]
+    assert representation["lag_cos"]["2"] == pytest.approx(representation["temporal_cos"])
+    assert representation["lag_cos"]["40"] is None
+    assert representation["periodic_rebound"] == pytest.approx(
+        representation["lag_cos"]["2"] - representation["lag_cos"]["1"]
+    )
+    assert 0.0 <= representation["fast_share"] <= 1.0
+
+    ce = decoder["ce"]
+    assert "no_hints" in ce
+    assert decoder["z_t_use"] == pytest.approx(ce["no_hints"] - ce["null"])
+    assert decoder["future_use"] == pytest.approx(ce["null"] - ce["pi_argmax"])
+
+    verdict = next(v for v in metrics["verdicts"] if v["name"] == "no_periodic_shortcut")
+    assert verdict["threshold"] == 0.05 and verdict["comparison"] == "<"
+    assert verdict["value"] == pytest.approx(representation["periodic_rebound"])
+
+
+def test_joint_checkpoint_reports_the_weighted_token_term(saved):
+    from jepa import apply_overrides
+
+    model_dir, _ = saved
+    model = JepaModel.from_pretrained(str(model_dir))
+    model.config = apply_overrides(model.config, {"decoder_w": 0.25})
+    model.save_pretrained(model_dir)
+
+    terms = collect(saved)["loss"]["terms"]
+
+    assert terms["token"]["weight"] == 0.25
+    assert terms["token"]["weighted"] == pytest.approx(0.25 * terms["token"]["value"])
+
+
+def test_report_prints_the_lag_profile_and_hint_channels(saved, capsys):
+    measure.print_report(collect(saved))
+    out = capsys.readouterr().out
+
+    assert "lag profile" in out and "periodic rebound" in out and "fast share" in out
+    assert "z_t use (no_hints - null)" in out
+    assert "future use (null - pi-argmax)" in out

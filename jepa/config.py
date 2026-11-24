@@ -406,6 +406,7 @@ class JepaConfig(PretrainedConfig):
         visreg: VISRegConfig | dict | None = None,
         commitment: CommitmentLossConfig | dict | None = None,
         pred_horizon: int = 20,
+        decoder_w: float = 0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -426,6 +427,11 @@ class JepaConfig(PretrainedConfig):
         if self.commitment is None:
             self.commitment = CommitmentLossConfig()
         self.pred_horizon = pred_horizon
+        # Weight of the decoder token loss in the JEPA stage (ADR 0002).  Its
+        # gradient reaches the encoder through the block-start hint z_t only.
+        # 0 trains encoder and predictor alone and never runs the decoder (the
+        # two-stage recipe of ADR 0001).
+        self.decoder_w = decoder_w
 
         # Fill in derived component configs before validating them.
         if self.predictor is None:
@@ -475,6 +481,7 @@ class JepaConfig(PretrainedConfig):
         pred_horizon: int = 20,
         visreg: VISRegConfig | None = None,
         commitment: CommitmentLossConfig | None = None,
+        decoder_w: float = 0.0,
         **kwargs,
     ) -> "JepaConfig":
         """Derive a full JEPA config from an encoder config.
@@ -493,6 +500,7 @@ class JepaConfig(PretrainedConfig):
             visreg=visreg,
             commitment=commitment,
             pred_horizon=pred_horizon,
+            decoder_w=decoder_w,
             **kwargs,
         )
 
@@ -535,6 +543,8 @@ class JepaConfig(PretrainedConfig):
             raise ValueError(
                 f"pred_horizon must be a positive integer; got {self.pred_horizon!r}"
             )
+        if self.decoder_w is None or self.decoder_w < 0:
+            raise ValueError(f"decoder_w must be non-negative; got {self.decoder_w!r}")
 
         self.visreg.validate()
         self.commitment.validate()
