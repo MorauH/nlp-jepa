@@ -6,7 +6,7 @@ import torch
 from jepa import JepaModel
 from jepa.config import apply_overrides
 
-from test_smoke import expected_decoder_loss, tiny_config
+from test_smoke import K, expected_decoder_loss, tiny_config
 
 
 def joint_model(decoder_w: float = 0.5) -> JepaModel:
@@ -19,7 +19,7 @@ def test_joint_loss_adds_the_weighted_decoder_token_term():
     labels = torch.randint(1, 64, (2, 12))
     mask = torch.ones_like(labels)
 
-    out = model.jepa_loss(labels, attention_mask=mask)
+    out = model.jepa_loss(labels, attention_mask=mask, horizon=K)
 
     # The token term is the decoder loss on hindsight hints (the train policy).
     expected, _ = expected_decoder_loss(model, labels, mask, "hindsight")
@@ -34,7 +34,7 @@ def test_token_term_trains_the_encoder_but_not_the_predictor():
     model = joint_model(0.5)
     labels = torch.randint(1, 64, (2, 12))
 
-    out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels))
+    out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels), horizon=K)
     out.terms["token"].backward()
 
     assert model.encoder.embedding.weight.grad.abs().sum() > 0
@@ -49,18 +49,17 @@ def test_hint_z_t_does_not_see_its_block():
     from jepa import build_block_hints
 
     model = joint_model(0.5).eval()
-    k = model.pred_horizon
     labels = torch.randint(1, 64, (1, 12))
     changed = labels.clone()
     block_start = 4
     changed[:, block_start + 1 :] = torch.randint(1, 64, (1, 12 - block_start - 1))
 
-    hints = [build_block_hints(model.encode(x), k)[0] for x in (labels, changed)]
+    hints = [build_block_hints(model.encode(x), K)[0] for x in (labels, changed)]
 
     # Positions block_start..block_start+k-1 predict tokens inside the block.
-    block = slice(block_start, block_start + k)
+    block = slice(block_start, block_start + K)
     torch.testing.assert_close(hints[0][:, block], hints[1][:, block])
-    assert not torch.allclose(hints[0][:, block_start + k], hints[1][:, block_start + k])
+    assert not torch.allclose(hints[0][:, block_start + K], hints[1][:, block_start + K])
 
 
 def test_joint_jepa_stage_trains_every_module_and_reports_token_perplexity(tmp_path):
@@ -109,7 +108,7 @@ def test_zero_decoder_weight_has_no_token_term():
     model = joint_model(0.0)
     labels = torch.randint(1, 64, (2, 12))
 
-    out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels))
+    out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels), horizon=K)
 
     assert "token" not in out.terms and "tokens" not in out.diagnostics
     assert "token" not in model.loss_weights

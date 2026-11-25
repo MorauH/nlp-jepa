@@ -16,6 +16,10 @@ from jepa import (
 )
 
 
+# tiny_config's fixed horizon.
+K = 2
+
+
 def tiny_config() -> JepaConfig:
     encoder = EncoderConfig(
         vocab_size=64,
@@ -39,16 +43,15 @@ def tiny_config() -> JepaConfig:
         encoder,
         predictor=predictor,
         decoder=decoder,
-        pred_horizon=2,
+        horizon_range=[K, K],
         visreg=VISRegConfig(num_slices=16),
     )
 
 
-def expected_decoder_loss(model, labels, attention_mask, policy_name):
+def expected_decoder_loss(model, labels, attention_mask, policy_name, k=K):
     """Reference decoder loss built from the submodules directly."""
     from jepa.models.commitment import Hindsight, PiArgmax
 
-    k = model.pred_horizon
     with torch.no_grad():
         latents = model.encode(labels, attention_mask)
         futures = model.predictor(latents[:, :-k, :])
@@ -79,8 +82,8 @@ def test_full_stack_forward():
     labels = torch.randint(1, 64, (2, 12))
     attention_mask = torch.ones_like(labels)
 
-    jepa_out = model.jepa_loss(labels, attention_mask=attention_mask)
-    decoder_out = model.decoder_loss(labels, attention_mask=attention_mask)
+    jepa_out = model.jepa_loss(labels, attention_mask=attention_mask, horizon=K)
+    decoder_out = model.decoder_loss(labels, attention_mask=attention_mask, horizon=K)
 
     assert jepa_out.loss.ndim == 0
     assert decoder_out.loss.ndim == 0
@@ -409,9 +412,9 @@ def test_full_stack_forward_with_chunked_decoder_loss():
     model = JepaModel(tiny_config())
     model.config.decoder.loss_chunk_size = 4
     labels = torch.randint(1, 64, (2, 12))
-    jepa_out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels))
+    jepa_out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels), horizon=K)
     decoder_out = model.decoder_loss(
-        labels, attention_mask=torch.ones_like(labels)
+        labels, attention_mask=torch.ones_like(labels), horizon=K
     )
     assert torch.isfinite(jepa_out.loss) and torch.isfinite(decoder_out.loss)
 
@@ -437,7 +440,7 @@ def test_decoder_loss_does_not_update_encoder_or_predictor():
     model = JepaModel(tiny_config())
     labels = torch.randint(1, 64, (2, 12))
     decoder_out = model.decoder_loss(
-        labels, attention_mask=torch.ones_like(labels)
+        labels, attention_mask=torch.ones_like(labels), horizon=K
     )
     decoder_out.loss.backward()
 
@@ -494,7 +497,7 @@ def test_decoder_loss_masks_the_last_partial_block():
     # 10 of the 11 targets count.
     with torch.no_grad():
         for policy in (None, PiArgmax(), Hindsight()):
-            out = model.decoder_loss(labels, attention_mask=mask, policy=policy)
+            out = model.decoder_loss(labels, attention_mask=mask, policy=policy, horizon=K)
             assert int(out.diagnostics["tokens"]) == 2 * 10
 
         # The last token is only predicted by the excluded position and only
@@ -503,10 +506,10 @@ def test_decoder_loss_masks_the_last_partial_block():
         changed[:, -1] = (changed[:, -1] % 63) + 1
         for policy in (PiArgmax(), Hindsight()):
             before = model.decoder_loss(
-                labels, attention_mask=mask, policy=policy
+                labels, attention_mask=mask, policy=policy, horizon=K
             ).loss
             after = model.decoder_loss(
-                changed, attention_mask=mask, policy=policy
+                changed, attention_mask=mask, policy=policy, horizon=K
             ).loss
             torch.testing.assert_close(before, after)
 
@@ -755,20 +758,20 @@ def test_decoder_loss_policy_is_an_argument_not_the_module_mode():
         # Module mode is irrelevant: the default is the training condition.
         for mode in (model.train, model.eval):
             mode()
-            actual = model.decoder_loss(labels, attention_mask=mask).loss
+            actual = model.decoder_loss(labels, attention_mask=mask, horizon=K).loss
             expected, _ = expected_decoder_loss(model, labels, mask, "hindsight")
             torch.testing.assert_close(actual, expected)
 
             # Explicit π-argmax is the inference condition, in either mode.
             actual = model.decoder_loss(
-                labels, attention_mask=mask, policy=PiArgmax()
+                labels, attention_mask=mask, policy=PiArgmax(), horizon=K
             ).loss
             expected, _ = expected_decoder_loss(model, labels, mask, "pi_argmax")
             torch.testing.assert_close(actual, expected)
 
         # train_policy="pi_argmax" changes only the default.
         model.config.decoder.train_policy = "pi_argmax"
-        actual = model.decoder_loss(labels, attention_mask=mask).loss
+        actual = model.decoder_loss(labels, attention_mask=mask, horizon=K).loss
         expected, _ = expected_decoder_loss(model, labels, mask, "pi_argmax")
         torch.testing.assert_close(actual, expected)
 
@@ -1167,10 +1170,10 @@ def test_apply_overrides_sets_known_fields_and_rejects_typos():
 
     base = tiny_config()
     config = apply_overrides(
-        base, {"predictor": {"prediction_count": 1}, "pred_horizon": 3}
+        base, {"predictor": {"prediction_count": 1}, "horizon_range": [3, 5]}
     )
     assert config.predictor.prediction_count == 1
-    assert config.pred_horizon == 3
+    assert config.horizon_range == [3, 5]
     assert base.predictor.prediction_count == 4  # the input is not mutated
 
     with pytest.raises(KeyError, match="predictor.prediction_cout"):
@@ -1343,7 +1346,7 @@ def test_jepa_stage_never_runs_the_decoder(tmp_path):
     model.decoder.register_forward_hook(lambda *args: decoder_calls.append(1))
 
     labels = torch.randint(1, 64, (2, 12))
-    jepa_out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels))
+    jepa_out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels), horizon=K)
     assert jepa_out.loss.ndim == 0
 
     data = Dataset.from_dict(

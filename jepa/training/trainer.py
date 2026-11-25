@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import set_seed
 
+from ..horizon import cycle_horizon, draw_horizon
 from ..models.commitment import PiArgmax, Policy
 from ..models.jepa import JepaModel
 from ..models.losses import LossOutput
@@ -104,13 +105,14 @@ def _lr_factor(step: int, *, warmup_steps: int, total_steps: int) -> float:
     )
 
 
-def _jepa_loss(model, labels, attention_mask, progress, policy):
-    return model.jepa_loss(labels, attention_mask=attention_mask,
+def _jepa_loss(model, labels, attention_mask, horizon, progress, policy):
+    return model.jepa_loss(labels, attention_mask=attention_mask, horizon=horizon,
                            progress=progress, policy=policy)
 
 
-def _decoder_loss(model, labels, attention_mask, progress, policy):
-    return model.decoder_loss(labels, attention_mask=attention_mask, policy=policy)
+def _decoder_loss(model, labels, attention_mask, horizon, progress, policy):
+    return model.decoder_loss(labels, attention_mask=attention_mask,
+                              horizon=horizon, policy=policy)
 
 
 _EVAL_POLICY = PiArgmax()  # one instance; torch.compile guards on the object
@@ -184,14 +186,14 @@ class JepaTrainer:
             module.requires_grad_(False)
             module.eval()
 
-    def _losses(self, labels, attention_mask, progress=None, policy=None):
+    def _losses(self, labels, attention_mask, horizon, progress=None, policy=None):
         """Forward one batch; return the logged values.
 
         ``loss`` is the weighted total.  Every term and diagnostic is logged
         under the stage prefix; a loss with several terms also logs its total
         as ``<prefix>loss`` (a single term already is the total).
         """
-        out = self._loss_fn(labels, attention_mask, progress, policy)
+        out = self._loss_fn(labels, attention_mask, horizon, progress, policy)
         prefix = self.stage.prefix
         values = {f"{prefix}{name}": value
                   for name, value in (*out.terms.items(), *out.diagnostics.items())}
@@ -238,7 +240,7 @@ class JepaTrainer:
     def _means(totals: dict[str, torch.Tensor], n: int) -> dict[str, float]:
         """Average the per-key totals with a single device synchronization."""
         names = list(totals)
-        if not names:  # every batch was shorter than pred_horizon
+        if not names:  # every batch was too short for the longest horizon
             return {"loss": float("nan")}
         values = torch.stack([totals[name] / max(1, n) for name in names]).tolist()
         return dict(zip(names, values))
@@ -263,13 +265,16 @@ class JepaTrainer:
         progress = torch.ones((), device=device)
         policy = self.stage.validation_policy
         token_sum = token_count = None
-        for labels, attention_mask in val_loader:
+        horizon_range = self.model.config.horizon_range
+        for index, (labels, attention_mask) in enumerate(val_loader):
             labels = labels.to(device, non_blocking=True)
             attention_mask = attention_mask.to(device, non_blocking=True)
-            if labels.shape[1] <= self.model.pred_horizon:
+            if labels.shape[1] <= horizon_range[1]:
                 continue
+            # Cycled, not drawn: every epoch validates on the same k values.
+            horizon = torch.tensor(cycle_horizon(horizon_range, index), device=device)
             with self._autocast(device):
-                values = self._losses(labels, attention_mask, progress, policy)
+                values = self._losses(labels, attention_mask, horizon, progress, policy)
                 self._accumulate(totals, values)
             # A ``tokens`` diagnostic means the ``token`` term is a per-token
             # mean: weight it by its token count for an exact perplexity.  In
@@ -447,6 +452,7 @@ class JepaTrainer:
         batch_sampler = getattr(loader, "batch_sampler", None)
         if isinstance(batch_sampler, LengthBucketBatchSampler):
             batch_sampler.set_epoch(epoch)
+        horizon_range = self.model.config.horizon_range
         totals = dict(totals or {})
         n_batches = to_skip = skip_batches
         skipped = 0
@@ -454,16 +460,18 @@ class JepaTrainer:
         for labels, attention_mask in pbar:
             labels = labels.to(device, non_blocking=True)
             attention_mask = attention_mask.to(device, non_blocking=True)
-            if labels.shape[1] <= self.model.pred_horizon:
+            if labels.shape[1] <= horizon_range[1]:
                 continue
             if skipped < to_skip:
                 skipped += 1
                 continue
-            # 0-dim tensor, so torch.compile treats the annealing progress as
-            # a graph input instead of a Python value to guard on.
+            # 0-dim tensors, so torch.compile treats the annealing progress and
+            # the batch's k as graph inputs instead of Python values to guard on.
+            horizon = torch.tensor(draw_horizon(horizon_range, self.seed, global_step),
+                                   device=device)
             progress = torch.tensor(global_step / self._total_steps, device=device)
             with self._autocast(device):
-                values = self._losses(labels, attention_mask, progress)
+                values = self._losses(labels, attention_mask, horizon, progress)
                 loss = values["loss"]
             optimizer.zero_grad(set_to_none=True)
             loss.backward()

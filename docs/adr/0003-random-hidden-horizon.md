@@ -1,6 +1,6 @@
 # One random horizon per batch, used everywhere and hidden from the predictor
 
-Proposed. Ticket 007 implements it. Builds on ADR 0002, whose gradient paths stay in force.
+Accepted, implemented by ticket 007. The gate runs are pending (`docs/experiments/RUNS.md` §0). Builds on ADR 0002, whose gradient paths stay in force.
 
 ADR 0002 let the decoder gradient reach the encoder to remove a shortcut: a latent whose period divides the horizon k = 20 is free to predict. The first joint run (`runs/joint-seed1`, `decoder_w = 0.3`) weakened the shortcut without removing it. The latent still repeats every 10 tokens (cosine 0.96 at lag 10, 0.65 at lag 5), and the periodic rebound is 0.31 against a limit of 0.05 (1.02 for the two-stage run). From position 80 on, which is 88% of positions, copying z_t is as close to z_{t+20} as the best of the eight candidates chosen in hindsight (0.032 for both), and μ is worse (0.038). The two live candidates are the same vector. At this weight, the decoder gradient does not beat a shortcut that the prediction loss gives away for free.
 

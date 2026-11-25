@@ -5,13 +5,14 @@ configuration runs with **3 seeds (1, 2, 3)**. Every configuration uses the
 same seeds, so the P = 1 runs pair with the main run of the same seed
 (report §4.5).
 
-Totals: **15 JEPA-stage runs** (5 configurations × 3 seeds) and **9
+Totals: **18 JEPA-stage runs** (6 configurations × 3 seeds) and **9
 decoder-stage runs** (main, P = 1 and π-argmax decoder, × 3 seeds).
 
 Conventions:
 
 - Training goes through the cluster launcher: `sbatch scripts/slurm_train.sh <args>`,
-  which forwards `<args>` to `python -m jepa train`.
+  which is meant to forward `<args>` to `python -m jepa train` (it does not yet;
+  see the launcher warning in section 0).
 - A JEPA run writes `runs/<config>-seed<N>`. Its decoder writes
   `runs/<config>-seed<N>-decoder`.
 - A full JEPA stage (3 epochs, ~90k steps) may not fit in one 12 h job. If a
@@ -24,56 +25,103 @@ Conventions:
 
 ---
 
-## 0. First: `decoder_w` sweep and one joint main run (ticket 006)
+## 0. First: the random-horizon gate (ticket 007)
 
-The first two-stage main run learned a periodic shortcut (ticket 006, ADR
-0002). **Sections 1–6 are on hold** until this section passes. They are
-written for the two-stage recipe (`decoder_w = 0`, the current default). Once
-the sweep has picked a weight, it becomes the default in `jepa/config.py`, and
-every section below then trains jointly without changing its commands. The
-separate decoder stages in sections 1 and 2 then drop out: the joint JEPA run
-already trains its decoder.
+Two single-seed runs with a fixed k = 20 learned a periodic shortcut: the
+two-stage run (`runs/main-seed1-decoder`, max rebound 1.03) and the joint run
+(`runs/joint-seed1`, `decoder_w = 0.3`, max rebound 0.31). The horizon is now
+drawn from `[10, 30]` once per batch and hidden from the predictor (ADR 0003).
+That is the config default, **and it is not validated yet**: any plain `train`
+is a random-k run. **Sections 1–7 are on hold** until this section passes.
 
-### Sweep (1 epoch each, seed 1)
+Both old checkpoints still load, and measure as fixed-k models. Loss values are
+not comparable across horizon ranges; compare `measure` numbers only. The new
+runs reuse some old names below, so move the old directories out of the way
+first (e.g. `mv runs/main-seed1 runs/fixed20-two-stage-seed1`).
 
-`--subset` is only 4 examples, too few to judge a representation, so the
-sweep uses 1-epoch runs on the full data. `w = 0` is the control at the same
-length. Write the weights you need as presets outside the repo
-(`joint-decoder.json` is 0.3):
+**Check the launcher first.** `scripts/slurm_train.sh` currently does not forward
+its arguments: it trains the defaults into `runs/main-seed1`, then a decoder
+stage, whatever is passed. Until it forwards `"$@"`, the commands below do not do
+what they say.
+
+### Gate (1 epoch each, seed 1, full data)
+
+| Run | horizon | `decoder_w` | P |
+|---|---|---|---|
+| control | fixed 20 | 0.3 | 8 |
+| A | random | 0.3 | 8 |
+| B | random | 0.3 | 1 |
+| C | random | 0 | 8 |
+
+A is `joint-decoder.json`. Write the other presets outside the repo:
 
 ```sh
-for w in 0 0.1 1.0; do echo "{\"decoder_w\": $w}" > runs/decoder-w$w.json; done
-sbatch scripts/slurm_train.sh --config runs/decoder-w0.json --epochs 1 --seed 1 --output-dir runs/sweep-w0
+echo '{"decoder_w": 0.3, "horizon_range": [20, 20]}' > runs/gate-control.json
+echo '{"decoder_w": 0.3, "predictor": {"prediction_count": 1}}' > runs/gate-b.json
+echo '{"decoder_w": 0}' > runs/gate-c.json
+sbatch scripts/slurm_train.sh --config runs/gate-control.json --epochs 1 --seed 1 --output-dir runs/gate-control
+sbatch scripts/slurm_train.sh --config docs/experiments/joint-decoder.json --epochs 1 --seed 1 --output-dir runs/gate-a
+sbatch scripts/slurm_train.sh --config runs/gate-b.json --epochs 1 --seed 1 --output-dir runs/gate-b
+sbatch scripts/slurm_train.sh --config runs/gate-c.json --epochs 1 --seed 1 --output-dir runs/gate-c
+```
+
+Measure each (C's decoder is untrained; ignore its decoder section):
+
+```sh
+python -m jepa measure --model runs/gate-a --json runs/gate-a/metrics.json   # likewise for control, b, c
+```
+
+B isolates the mechanism: with one candidate nothing can absorb the cycle. A
+against B shows whether winner-takes-all does. C shows what the change does
+without the decoder gradient.
+
+**Go for a full run of A** if, reading the `steady_state` rows (positions 80
+and up) where there are any:
+
+1. `no_periodic_shortcut` passes (max rebound < 0.05);
+2. μ clearly beats copy, averaged over k;
+3. live slots > 2 **and** `slot_horizon_mi` is low (phase copies would make all
+   eight slots live). A low value excludes slots tied to a distance from z_t,
+   not slots tied to an absolute phase (they win by t + k, which averages out
+   over t), so it is necessary but not sufficient;
+4. `document_share` is no higher than the control's;
+5. `future_use` > 0.
+
+If B passes and A fails on 1 or 3, winner-takes-all is absorbing the cycle: open
+a separate ticket to score each candidate against two independently drawn
+horizons and assign on the average distance. If B fails as well, the shortcut
+is not about the fixed k. Stop and revisit.
+
+### Full run (seed 1), then the `decoder_w` sweep
+
+```sh
+sbatch scripts/slurm_train.sh --config docs/experiments/joint-decoder.json --seed 1 --output-dir runs/random-joint-seed1
+python -m jepa measure --model runs/random-joint-seed1 --json runs/random-joint-seed1/metrics.json
+```
+
+Read it with the same five conditions. If 0.3 is in doubt, sweep the weight with
+1-epoch runs under the random horizon (C is already `w = 0` and A is `w = 0.3`):
+
+```sh
+for w in 0.1 1.0; do echo "{\"decoder_w\": $w}" > runs/decoder-w$w.json; done
 sbatch scripts/slurm_train.sh --config runs/decoder-w0.1.json --epochs 1 --seed 1 --output-dir runs/sweep-w0.1
-sbatch scripts/slurm_train.sh --config docs/experiments/joint-decoder.json --epochs 1 --seed 1 --output-dir runs/sweep-w0.3
 sbatch scripts/slurm_train.sh --config runs/decoder-w1.0.json --epochs 1 --seed 1 --output-dir runs/sweep-w1.0
 ```
 
-Measure each (`runs/sweep-w0` measures an untrained decoder; read only its
-representation, loss, heads, policies and rollouts sections):
+Choose the largest weight where, compared with C, the JEPA terms (`move`, `pi`,
+`mu`) still fall, effective rank stays > 15, `no_periodic_shortcut` passes and
+`fast_share` drops clearly.
 
-```sh
-python -m jepa measure --model runs/sweep-w0.3 --json runs/sweep-w0.3/metrics.json   # likewise for each w
-```
+Then make the weight the default in `jepa/config.py` and delete
+`joint-decoder.json`. Every section below then trains jointly without changing
+its commands, and the separate decoder stages in sections 1 and 2 drop out,
+because the joint run already trains its decoder. The two-stage ablation is
+`runs/gate-c.json` (`decoder_w = 0`) with the same random horizon, seeds 1 to 3.
+The two old fixed-k runs stay as the history of the shortcut, not as ablations.
 
-Choose the largest weight where, compared with `w = 0`, the JEPA terms
-(`move`, `pi`, `mu`) still fall, effective rank stays > 15,
-`no_periodic_shortcut` passes and `fast_share` drops clearly.
-
-### Joint main run (seed 1, go/no-go)
-
-Use the chosen weight as `--config`, or `joint-decoder.json` if 0.3 won:
-
-```sh
-sbatch scripts/slurm_train.sh --config docs/experiments/joint-decoder.json --seed 1 --output-dir runs/joint-seed1
-python -m jepa measure --model runs/joint-seed1 --json runs/joint-seed1/metrics.json
-```
-
-Go for the grid if `no_periodic_shortcut` passes, μ clearly beats copy at
-depth 1, live slots > 2 and `decoder.future_use` > 0. Then make the weight
-the default, delete `joint-decoder.json`, and run sections 1–7. Keep
-`runs/main-seed1` (two-stage) as the `decoder_w = 0` ablation, and add seeds
-2 and 3 for it with `--config runs/decoder-w0.json`.
+P = 1 and P = 8 must use the same `horizon_range` and `decoder_w`. Their encoders
+may still differ in periodicity, so report each one's max rebound next to the
+comparison.
 
 ---
 
@@ -281,11 +329,46 @@ python -m jepa measure --model runs/no-diversity-seed3 --json runs/no-diversity-
 
 ---
 
-## 7. Figure 3: decoded plans (no training)
+## 7. Fixed horizon (`fixed-horizon.json`)
+
+The ablation of the random horizon: `horizon_range = [20, 20]`, everything else
+as the main run. Is the shortcut caused by a fixed k? It is measured at k = 20
+only, so compare its representation section (max rebound, fast share, document
+share) with the main run's, not its losses. Its max rebound scans lags up to 20
+and the main run's up to 30, which can only raise the main run's; compare the
+lag profiles too. Its rollout starts need 80 tokens ahead instead of 120, so its
+rollouts use different starts.
+
+### JEPA stage
+
+```sh
+sbatch scripts/slurm_train.sh --config docs/experiments/fixed-horizon.json --seed 1 --output-dir runs/fixed-horizon-seed1
+sbatch scripts/slurm_train.sh --config docs/experiments/fixed-horizon.json --seed 2 --output-dir runs/fixed-horizon-seed2
+sbatch scripts/slurm_train.sh --config docs/experiments/fixed-horizon.json --seed 3 --output-dir runs/fixed-horizon-seed3
+```
+
+Resume:
+
+```sh
+sbatch scripts/slurm_train.sh --resume --output-dir runs/fixed-horizon-seed1
+```
+
+### Measure
+
+```sh
+python -m jepa measure --model runs/fixed-horizon-seed1 --json runs/fixed-horizon-seed1/metrics.json
+python -m jepa measure --model runs/fixed-horizon-seed2 --json runs/fixed-horizon-seed2/metrics.json
+python -m jepa measure --model runs/fixed-horizon-seed3 --json runs/fixed-horizon-seed3/metrics.json
+```
+
+---
+
+## 8. Figure 3: decoded plans (no training)
 
 This needs sections 1 and 2 finished for seed 1. It decodes the main run's
 plans (π-sample ×3, π-argmax, μ) next to the P = 1 model's plan, which the
-P = 1 model's own decoder decodes.
+P = 1 model's own decoder decodes. Each prompt draws one k from the seed, shared
+by every column.
 
 ```sh
 python -m jepa generate --model runs/main-seed1-decoder --baseline-model runs/p1-seed1-decoder --plan-depth 4 --samples 3 --seed 0 --json runs/main-seed1-decoder/plans.json --html runs/main-seed1-decoder/plans.html

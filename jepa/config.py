@@ -394,6 +394,11 @@ class JepaConfig(PretrainedConfig):
 
     The stack always has a decoder.  A missing one is built from the encoder,
     so every checkpoint can be generated from and trained in either stage.
+
+    ``horizon_range`` is the inclusive ``[lo, hi]`` the horizon k is drawn from,
+    once per batch or generated sequence (ADR 0003).  ``[k, k]`` is a fixed
+    horizon.  ``pred_horizon`` is the legacy constructor argument of older
+    checkpoints: it means ``[pred_horizon, pred_horizon]`` and is never stored.
     """
 
     model_type = "jepa"
@@ -405,8 +410,9 @@ class JepaConfig(PretrainedConfig):
         decoder: DecoderConfig | dict | None = None,
         visreg: VISRegConfig | dict | None = None,
         commitment: CommitmentLossConfig | dict | None = None,
-        pred_horizon: int = 20,
+        horizon_range: list[int] | None = None,
         decoder_w: float = 0.0,
+        pred_horizon: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -426,7 +432,14 @@ class JepaConfig(PretrainedConfig):
         self.commitment = self._coerce(CommitmentLossConfig, commitment)
         if self.commitment is None:
             self.commitment = CommitmentLossConfig()
-        self.pred_horizon = pred_horizon
+        if pred_horizon is not None:
+            if horizon_range is not None:
+                raise ValueError(
+                    "pass horizon_range or the legacy pred_horizon, not both; "
+                    f"got {horizon_range!r} and {pred_horizon!r}"
+                )
+            horizon_range = [pred_horizon, pred_horizon]
+        self.horizon_range = [10, 30] if horizon_range is None else horizon_range
         # Weight of the decoder token loss in the JEPA stage (ADR 0002).  Its
         # gradient reaches the encoder through the block-start hint z_t only.
         # 0 trains encoder and predictor alone and never runs the decoder (the
@@ -478,7 +491,7 @@ class JepaConfig(PretrainedConfig):
         *,
         predictor: PredictorConfig | None = None,
         decoder: DecoderConfig | None = None,
-        pred_horizon: int = 20,
+        horizon_range: list[int] | None = None,
         visreg: VISRegConfig | None = None,
         commitment: CommitmentLossConfig | None = None,
         decoder_w: float = 0.0,
@@ -499,7 +512,7 @@ class JepaConfig(PretrainedConfig):
             decoder=decoder,
             visreg=visreg,
             commitment=commitment,
-            pred_horizon=pred_horizon,
+            horizon_range=horizon_range,
             decoder_w=decoder_w,
             **kwargs,
         )
@@ -539,16 +552,29 @@ class JepaConfig(PretrainedConfig):
         )
         self.decoder.validate()
 
-        if not isinstance(self.pred_horizon, int) or self.pred_horizon < 1:
-            raise ValueError(
-                f"pred_horizon must be a positive integer; got {self.pred_horizon!r}"
-            )
+        self._link_horizon_range()
         if self.decoder_w is None or self.decoder_w < 0:
             raise ValueError(f"decoder_w must be non-negative; got {self.decoder_w!r}")
 
         self.visreg.validate()
         self.commitment.validate()
         return self
+
+    def _link_horizon_range(self) -> None:
+        """Check the range and store it as the list ``config.json`` holds."""
+        value = self.horizon_range
+        if (
+            not isinstance(value, (list, tuple))
+            or len(value) != 2
+            # ``type`` rather than ``isinstance``: a bool is not a horizon.
+            or any(type(bound) is not int for bound in value)
+            or not 1 <= value[0] <= value[1]
+        ):
+            raise ValueError(
+                "horizon_range must be two integers [lo, hi] with "
+                f"1 <= lo <= hi; got {value!r}"
+            )
+        self.horizon_range = list(value)
 
     @staticmethod
     def _set_or_check(config, attribute: str, expected, path: str) -> None:

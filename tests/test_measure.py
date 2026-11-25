@@ -51,7 +51,7 @@ def tiny_config() -> JepaConfig:
         encoder,
         predictor=predictor,
         decoder=decoder,
-        pred_horizon=2,
+        horizon_range=[2, 2],
         visreg=VISRegConfig(num_slices=16),
     )
 
@@ -120,7 +120,8 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
     assert set(metrics) == SECTION_KEYS
     assert metrics["context"]["examples"] == 4
     assert metrics["context"]["bank_size"] == 16
-    assert metrics["context"]["pred_horizon"] == 2
+    assert metrics["context"]["horizon_range"] == [2, 2]
+    assert metrics["context"]["horizons"] == [2]
     assert metrics["context"]["candidates"] == 4
 
     representation = metrics["representation"]
@@ -369,26 +370,25 @@ def _circle(angles):
     return [z], [torch.ones(1, z.shape[1], dtype=torch.long)]
 
 
-def test_periodic_latent_rebounds_at_the_horizon():
-    """Period 10 with k = 20: cos dips to -1 at lag 5 and returns to 1 at lag 20."""
+@pytest.mark.parametrize("period", [7, 10])
+def test_max_rebound_detects_a_period_that_need_not_divide_k(period):
+    t = torch.arange(400, dtype=torch.float64)
+    profile = measure.lag_profile(*_circle(2 * torch.pi * t / period), range(1, 31))
+
+    # cos returns to 1 after one period, from -1 (10) or cos(6/7 pi) (7).
+    lowest = {7: -0.9009688679, 10: -1.0}[period]
+    assert measure.max_rebound(profile, 30) == pytest.approx(1 - lowest, abs=1e-5)
+
+
+def test_max_rebound_ignores_a_plain_drift_and_missing_lags():
     t = torch.arange(200, dtype=torch.float64)
-    latents, masks = _circle(2 * torch.pi * t / 10)
+    profile = measure.lag_profile(*_circle(0.01 * t), range(1, 31))
+    assert profile[1] > profile[10] > profile[30]
+    assert measure.max_rebound(profile, 30) < 0
 
-    profile = measure.lag_profile(latents, masks, range(1, 21))
-
-    assert profile[5] == pytest.approx(-1.0, abs=1e-6)
-    assert profile[10] == pytest.approx(1.0, abs=1e-6)
-    assert measure.periodic_rebound(profile, horizon=20) == pytest.approx(2.0, abs=1e-6)
-
-
-def test_drifting_latent_does_not_rebound():
-    t = torch.arange(200, dtype=torch.float64)
-    latents, masks = _circle(0.01 * t)
-
-    profile = measure.lag_profile(latents, masks, range(1, 21))
-
-    assert profile[1] > profile[10] > profile[20]
-    assert measure.periodic_rebound(profile, horizon=20) < 0
+    assert measure.max_rebound({1: 0.9, 2: None, 3: 0.95}, 3) == pytest.approx(0.05)
+    assert measure.max_rebound({1: 0.9, 2: None}, 2) is None
+    assert measure.max_rebound({1: 0.9}, 1) is None
 
 
 def test_fast_share_is_one_for_an_oscillation_and_zero_for_drift():
@@ -406,12 +406,12 @@ def test_collect_metrics_reports_the_lag_profile_and_hint_channels(saved):
     metrics = collect(saved)
     representation, decoder = metrics["representation"], metrics["decoder"]
 
-    # k = 2: every lag 1..k, then 2k, 5k, 10k, 20k (none of the last three fit
-    # in 12-token rows).
-    assert list(representation["lag_cos"]) == ["1", "2", "4", "10", "20", "40"]
+    # Every lag up to the longest horizon, then the fixed long lags (none of
+    # which fit in 12-token rows).
+    assert list(representation["lag_cos"]) == ["1", "2", "40", "100", "200", "400"]
     assert representation["lag_cos"]["2"] == pytest.approx(representation["temporal_cos"])
     assert representation["lag_cos"]["40"] is None
-    assert representation["periodic_rebound"] == pytest.approx(
+    assert representation["max_rebound"] == pytest.approx(
         representation["lag_cos"]["2"] - representation["lag_cos"]["1"]
     )
     assert 0.0 <= representation["fast_share"] <= 1.0
@@ -423,7 +423,8 @@ def test_collect_metrics_reports_the_lag_profile_and_hint_channels(saved):
 
     verdict = next(v for v in metrics["verdicts"] if v["name"] == "no_periodic_shortcut")
     assert verdict["threshold"] == 0.05 and verdict["comparison"] == "<"
-    assert verdict["value"] == pytest.approx(representation["periodic_rebound"])
+    assert verdict["value"] == pytest.approx(representation["max_rebound"])
+    assert verdict["metric"] == "representation.max_rebound"
 
 
 def test_joint_checkpoint_reports_the_weighted_token_term(saved):
@@ -444,6 +445,214 @@ def test_report_prints_the_lag_profile_and_hint_channels(saved, capsys):
     measure.print_report(collect(saved))
     out = capsys.readouterr().out
 
-    assert "lag profile" in out and "periodic rebound" in out and "fast share" in out
+    assert "lag profile" in out and "max rebound" in out and "fast share" in out
     assert "z_t use (no_hints - null)" in out
     assert "future use (null - pi-argmax)" in out
+
+
+# ---------------------------------------------------------------------------
+# Random horizon: scored over fixed evaluation horizons (ADR 0003)
+# ---------------------------------------------------------------------------
+
+
+def test_evaluation_horizons_cover_the_range_with_distinct_residues():
+    assert measure.evaluation_horizons([10, 30]) == [11, 14, 17, 20, 23, 26, 29]
+    assert measure.evaluation_horizons([20, 20]) == [20]
+    assert measure.evaluation_horizons([2, 6]) == [2, 3, 4, 5, 6]
+    for lo in (1, 5, 10):
+        for hi in range(lo, 70):
+            horizons = measure.evaluation_horizons([lo, hi])
+            assert lo <= horizons[0] and horizons[-1] <= hi
+            assert len({k % 10 for k in horizons}) == len(horizons)
+            # Not bunched up at one end or in the middle of the range.
+            assert horizons[-1] - horizons[0] >= 0.75 * (hi - lo) or hi - lo < 12
+
+
+def test_slot_horizon_information_is_zero_or_maximal():
+    import math
+
+    horizons, slots = 7, 8
+    ignoring_k = torch.tensor([[50, 10, 5, 5, 10, 10, 5, 5]] * horizons)
+    assert measure.slot_horizon_information(ignoring_k) == pytest.approx(0.0, abs=1e-9)
+
+    by_phase = torch.zeros(horizons, slots, dtype=torch.long)
+    for k in range(horizons):
+        by_phase[k, (3 * k) % slots] = 100
+    assert measure.slot_horizon_information(by_phase) == pytest.approx(math.log(7))
+
+
+def test_document_share_is_one_for_a_document_code_and_zero_without_one():
+    torch.manual_seed(0)
+    masks = [torch.ones(4, 60, dtype=torch.long)]
+    per_document = [torch.randn(4, 1, 8).expand(4, 60, 8)]
+    assert measure.document_share(per_document, masks) == pytest.approx(1.0)
+    # The same trajectory in every document says nothing about which one it is.
+    shared = [torch.randn(1, 60, 8).expand(4, 60, 8)]
+    assert measure.document_share(shared, masks) == pytest.approx(0.0, abs=1e-6)
+    # Padding and the document start (first 20 positions) are left out.
+    noisy = per_document[0].clone()
+    noisy[:, :20] += torch.randn(4, 20, 8)
+    noisy[1, 50:] += 5
+    short = masks[0].clone()
+    short[1, 50:] = 0
+    assert measure.document_share([noisy], [short]) == pytest.approx(1.0)
+    assert measure.document_share(per_document, [masks[0] * 0]) is None
+
+
+@pytest.fixture()
+def random_horizon(tmp_path):
+    """A model with horizon_range [2, 6], query batches and a bank."""
+    from jepa import apply_overrides
+
+    torch.manual_seed(0)
+    config = apply_overrides(tiny_config(), {"horizon_range": [2, 6], "decoder_w": 0.3})
+    model = JepaModel(config).eval()
+    rows = [
+        {"input_ids": torch.randint(1, 64, (n,)).tolist()} for n in (32, 32, 27, 20)
+    ]
+    from jepa.training.data import tokenize_batch
+
+    batches = [tokenize_batch(rows[i : i + 2], FakeTokenizer()) for i in (0, 2)]
+    bank = torch.randn(16, 32)
+    return model, batches, bank
+
+
+def measure_random(random_horizon, **overrides):
+    options = dict(depths=2, rollout_positions=8, seed=0, loss_chunk_size=4)
+    return measure.collect_metrics(*random_horizon, **{**options, **overrides})
+
+
+def test_policies_report_each_horizon_and_their_mean(random_horizon, monkeypatch):
+    monkeypatch.setattr(measure, "STEADY_STATE_START", 8)
+    from jepa.models.commitment import distance
+
+    model, batches, _ = random_horizon
+    policies = measure_random(random_horizon)["policies"]
+
+    def expected(k, start):
+        """Worked out position by position from the encoder and predictor."""
+        rows = []
+        for labels, mask in batches:
+            with torch.no_grad():
+                z = model.encode(labels)
+                futures = model.predictor(z)
+            for row, length in enumerate(mask.sum(-1).tolist()):
+                for t in range(start, length - k):
+                    target = z[row, t + k]
+                    candidates = distance(futures.candidates[row, t], target)
+                    rows.append((
+                        distance(z[row, t], target).item(),
+                        candidates.min().item(),
+                        candidates[futures.pi[row, t].argmax()].item(),
+                        distance(futures.mu[row, t], target).item(),
+                    ))
+        return torch.tensor(rows).mean(dim=0).tolist()
+
+    names = ("copy", "hindsight", "pi_argmax", "mu")
+    assert policies["steady_state"]["from_position"] == 8
+    for section, start in ((policies, 0), (policies["steady_state"], 8)):
+        assert list(section["by_horizon"]) == ["2", "3", "4", "5", "6"]
+        for k, row in section["by_horizon"].items():
+            assert [row[n] for n in names] == pytest.approx(
+                expected(int(k), start), abs=1e-5
+            )
+        for name in (*names, "pi_sample", "mu_safe", "hindsight_gain_over_mu"):
+            values = [row[name] for row in section["by_horizon"].values()]
+            assert section[name] == pytest.approx(sum(values) / 5)
+
+
+def test_short_queries_have_no_steady_state_rows(random_horizon, capsys):
+    metrics = measure_random(random_horizon)
+    assert metrics["policies"]["steady_state"] is None
+    assert metrics["heads"]["steady_state"] is None
+    measure.print_report(metrics)
+    assert "steady state" in capsys.readouterr().out
+
+
+def test_every_section_averages_over_the_evaluation_horizons(random_horizon):
+    from jepa.models.commitment import Hindsight, distance, rollout
+
+    model, batches, _ = random_horizon
+    metrics = measure_random(random_horizon, rollout_positions=10_000)
+    horizons = [2, 3, 4, 5, 6]
+
+    assert metrics["context"]["horizon_range"] == [2, 6]
+    assert metrics["context"]["horizons"] == horizons
+    representation = metrics["representation"]
+    lag_cos = representation["lag_cos"]
+    assert list(lag_cos)[:6] == ["1", "2", "3", "4", "5", "6"]
+    assert representation["temporal_cos"] == pytest.approx(
+        sum(lag_cos[str(k)] for k in horizons) / 5
+    )
+
+    # Decoder: blocks of k tokens for each k.  A block counts if it ends inside
+    # the sequence the batch is padded to and its targets are real.
+    tokens = 0
+    for k in horizons:
+        for labels, mask in batches:
+            for length in mask.sum(-1).tolist():
+                tokens += sum(
+                    i // k * k + k <= labels.shape[1] - 1 for i in range(length - 1)
+                )
+    assert metrics["decoder"]["tokens"] == tokens
+
+    # Rollouts: the same starts for every k, with room for depths * hi.
+    rollouts = metrics["rollouts"]
+    assert rollouts["horizons"] == horizons
+    lengths = [n for _, mask in batches for n in mask.sum(-1).tolist()]
+    starts = [(row, t) for row, n in enumerate(lengths) for t in range(n - 2 * 6)]
+    assert rollouts["positions"] == len(starts)
+    latents = [z for labels, _ in batches for z in model.encode(labels).detach()]
+    errors = []
+    for row, t in starts:
+        for k in horizons:
+            targets = torch.stack([latents[row][t + k], latents[row][t + 2 * k]])
+            with torch.no_grad():
+                path = rollout(
+                    model.predictor, latents[row][t], Hindsight(), 2, targets=targets
+                ).future
+            errors.append(distance(path, targets))
+    assert rollouts["error"]["hindsight"] == pytest.approx(
+        torch.stack(errors).mean(dim=0).tolist(), abs=1e-5
+    )
+
+    assert metrics["loss"]["terms"]["token"]["weight"] == 0.3
+    assert json.loads(json.dumps(metrics)) == metrics
+
+
+def test_slot_horizon_information_is_reported_only_when_both_can_vary(
+    random_horizon, saved, monkeypatch, capsys
+):
+    import math
+
+    from jepa import apply_overrides
+
+    monkeypatch.setattr(measure, "STEADY_STATE_START", 8)
+    metrics = measure_random(random_horizon)
+    heads = metrics["heads"]
+    # Four slots and five horizons: the slot's entropy is the smaller bound.
+    assert heads["slot_horizon_mi_max"] == pytest.approx(math.log(4))
+    for section in (heads, heads["steady_state"]):
+        assert 0.0 <= section["slot_horizon_mi"] <= math.log(4)
+        assert section["live_slots"] >= 1
+    measure.print_report(metrics)
+    out = capsys.readouterr().out
+    assert "slot-horizon MI" in out and "document share" in out
+
+    # Fixed k.
+    assert collect(saved)["heads"]["slot_horizon_mi"] is None
+    # P = 1.
+    model, batches, bank = random_horizon
+    single = JepaModel(
+        apply_overrides(model.config, {"predictor": {"prediction_count": 1}})
+    ).eval()
+    heads = measure_random((single, batches, bank))["heads"]
+    assert heads["slot_horizon_mi"] is None
+    assert heads["steady_state"]["live_slots"] is None
+
+
+def test_queries_must_exceed_the_longest_horizon(random_horizon):
+    model, batches, bank = random_horizon
+    short = [(labels[:, :6], mask[:, :6]) for labels, mask in batches]
+    with pytest.raises(ValueError, match="horizon"):
+        measure_random((model, short, bank))

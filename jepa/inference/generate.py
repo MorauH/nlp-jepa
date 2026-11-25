@@ -4,6 +4,8 @@
 committed future from the predictor, and generates ``k`` tokens
 autoregressively. The decoder sees the last ``sliding_window`` tokens, so
 grammar comes from the token context and semantics from the committed future.
+``k`` is drawn from the checkpoint's ``horizon_range`` once per call, so every
+block of one generation has the same length, as in training.
 
 **Decoded plans** (``--plan-depth N``): encode the prompt once, plan ``N``
 blocks ahead in latent space, and decode each plan into text without
@@ -11,8 +13,10 @@ re-encoding anything. Conditions: a π-argmax rollout, ``--samples`` π-sample
 rollouts, the μ path (as in measurement), and with ``--baseline-model``
 the π-argmax rollout of another checkpoint (the P = 1 baseline) decoded by its
 own decoder. Prompts are the first ``--num-prompts`` validation chunks long
-enough for ``--prompt-length + N * k`` tokens, in a seeded random order (the
-rest of each chunk is the reference continuation), plus any ``--prompt``.
+enough for ``--prompt-length + N * hi`` tokens (``hi`` is the longest horizon),
+in a seeded random order, plus any ``--prompt``. Each prompt draws one ``k``,
+seeded by ``--seed`` and shared by every condition, sample and the baseline;
+the reference is the ``N * k`` tokens after the prompt.
 
 Caveats when reading decoded plans:
 
@@ -38,6 +42,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import random
 from pathlib import Path
 from typing import NamedTuple
 
@@ -45,6 +50,7 @@ import torch
 
 from ..data.tokenizer import eos_token_id, load_tokenizer
 from ..evaluation.measure import mu_path
+from ..horizon import draw_horizon
 from ..models.commitment import PiArgmax, PiSample, rollout
 from ..models.jepa import JepaModel
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
@@ -72,9 +78,14 @@ def generate(
     top_k: int | None = 50,
     commit_temperature: float = 1.0,
     commit_top_k: int | None = 0,
+    seed: int | None = None,
     device: torch.device,
-) -> tuple[str, list[int]]:
-    """Generate ``steps * k`` tokens from ``prompt``.
+) -> tuple[str, list[int], int]:
+    """Generate ``steps * k`` tokens from ``prompt``; return ``(text, ids, k)``.
+
+    ``k`` is drawn once from the model's ``horizon_range`` and used for every
+    block. ``seed`` fixes that draw only; token and commit sampling use the
+    global RNG.
 
     Each block re-encodes the current context, samples a committed future, and
     generates ``k`` tokens autoregressively. The decoder sees the last
@@ -91,7 +102,9 @@ def generate(
     if max_context is not None:
         context_ids = context_ids[:, -max_context:]
 
-    k = model.pred_horizon
+    if seed is None:
+        seed = random.SystemRandom().getrandbits(64)
+    k = draw_horizon(model.config.horizon_range, seed)
     eos_id = eos_token_id(tokenizer)
     generated_ids: list[int] = []
 
@@ -130,7 +143,7 @@ def generate(
         if max_context is not None:
             context_ids = context_ids[:, -max_context:]
 
-    return tokenizer.decode(generated_ids), generated_ids
+    return tokenizer.decode(generated_ids), generated_ids, k
 
 
 @torch.no_grad()
@@ -140,10 +153,11 @@ def decode_plan(
     path: torch.Tensor,
     context_ids: torch.Tensor,
     *,
+    horizon: int,
     temperature: float = 0.0,
     top_k: int | None = None,
 ) -> list[list[int]]:
-    """Decode a latent path ``(1, depth, D)`` into ``depth`` blocks of ``k`` ids.
+    """Decode a latent path ``(1, depth, D)`` into blocks of ``horizon`` ids.
 
     Block ``i`` is decoded with the hint (start = path latent ``i - 1``, or
     ``z_t`` for the first block; committed = path latent ``i``). The token
@@ -158,7 +172,7 @@ def decode_plan(
             z_t=start,
             committed=committed,
             context_ids=context_ids,
-            k=model.pred_horizon,
+            k=horizon,
             temperature=temperature,
             top_k=top_k,
         )
@@ -174,6 +188,7 @@ def plan_prompt(
     prompt_ids: list[int],
     *,
     depth: int,
+    horizon: int,
     samples: int = DEFAULT_SAMPLES,
     conditions: tuple[str, ...] = PLAN_CONDITIONS,
     temperature: float = 0.0,
@@ -189,7 +204,8 @@ def plan_prompt(
     ``pi_sample`` (``samples`` rollouts, seeded by ``generator_seed``) and
     ``mu`` (measurement's μ path). Every path is decoded block by block
     with :func:`decode_plan`, so each record holds ``depth`` blocks of exactly
-    ``k`` token ids (an EOS does not stop a plan).
+    ``horizon`` token ids (an EOS does not stop a plan). The latent paths do
+    not depend on ``horizon``: it is only how many tokens each block decodes to.
 
     Returns one ``{"condition", "sample", "token_ids"}`` dict per decoded
     plan, in the order of ``conditions``.
@@ -228,7 +244,8 @@ def plan_prompt(
             "condition": condition,
             "sample": sample,
             "token_ids": decode_plan(
-                model, z_t, path, context_ids, temperature=temperature, top_k=top_k
+                model, z_t, path, context_ids, horizon=horizon,
+                temperature=temperature, top_k=top_k,
             ),
         }
         for condition, sample, path in paths
@@ -298,7 +315,7 @@ def plans_html(document: dict) -> str:
             for label, blocks in rows
         )
         parts.append(
-            f"<h2>Prompt {index} ({first['source']})</h2>"
+            f"<h2>Prompt {index} ({first['source']}, k = {first['horizon']})</h2>"
             f"<p>{html.escape(first['prompt'])}</p>"
             f"<table><tr><th>condition</th>{header}</tr>{body}</table>"
         )
@@ -318,15 +335,15 @@ def _load_model(path, tokenizer, device) -> JepaModel:
 
 def run_plans(args, tokenizer, model, device) -> None:
     """``--plan-depth`` mode: decode plans for every prompt and write them."""
-    k = model.pred_horizon
+    horizon_range = model.config.horizon_range
     depth = args.plan_depth
     baseline = None
     if args.baseline_model is not None:
         baseline = _load_model(args.baseline_model, tokenizer, device)
-        if baseline.pred_horizon != k:
+        if baseline.config.horizon_range != horizon_range:
             raise ValueError(
-                f"--baseline-model has horizon {baseline.pred_horizon}, "
-                f"but {args.model} has {k}; plans would not line up."
+                f"--baseline-model has horizon_range {baseline.config.horizon_range}, "
+                f"but {args.model} has {horizon_range}; plans would not line up."
             )
 
     prompts: list[Prompt] = []
@@ -334,7 +351,8 @@ def run_plans(args, tokenizer, model, device) -> None:
         _, validation = load_datasets(args.fineweb_dir)
         for prompt_ids, reference in validation_prompts(
             validation, count=args.num_prompts, prompt_length=args.prompt_length,
-            continuation=depth * k, seed=args.seed,
+            # Room for the longest k, so the prompts do not depend on the draw.
+            continuation=depth * horizon_range[1], seed=args.seed,
         ):
             prompts.append(
                 Prompt("validation", tokenizer.decode(prompt_ids), prompt_ids, reference)
@@ -352,24 +370,31 @@ def run_plans(args, tokenizer, model, device) -> None:
     )
     records = []
     for index, prompt in enumerate(prompts):
-        plans = plan_prompt(model, prompt.ids, samples=args.samples, **options)
+        k = draw_horizon(horizon_range, args.seed, index)
+        plans = plan_prompt(
+            model, prompt.ids, horizon=k, samples=args.samples, **options
+        )
         if baseline is not None:
             plans += [
                 {**plan, "condition": "baseline"}
                 for plan in plan_prompt(
-                    baseline, prompt.ids, samples=0, conditions=("pi_argmax",),
-                    **options,
+                    baseline, prompt.ids, horizon=k, samples=0,
+                    conditions=("pi_argmax",), **options,
                 )
             ]
         reference_text = (
             None if prompt.reference is None
-            else [tokenizer.decode(block) for block in _blocks(prompt.reference, k)]
+            else [
+                tokenizer.decode(block)
+                for block in _blocks(prompt.reference[: depth * k], k)
+            ]
         )
         for plan in plans:
             records.append({
                 "prompt_index": index,
                 "source": prompt.source,
                 "prompt": prompt.text,
+                "horizon": k,
                 "reference": reference_text,
                 **plan,
                 "blocks": [tokenizer.decode(block) for block in plan["token_ids"]],
@@ -379,7 +404,7 @@ def run_plans(args, tokenizer, model, device) -> None:
         "context": {
             "model": str(args.model),
             "baseline_model": None if baseline is None else str(args.baseline_model),
-            "depth": depth, "pred_horizon": k, "samples": args.samples,
+            "depth": depth, "horizon_range": horizon_range, "samples": args.samples,
             "temperature": args.temperature, "top_k": args.top_k,
             "commit_temperature": args.commit_temperature,
             "commit_top_k": args.commit_top_k, "seed": args.seed,
@@ -390,8 +415,8 @@ def run_plans(args, tokenizer, model, device) -> None:
         "records": records,
     }
     for index, prompt in enumerate(prompts):
-        print(f"\n=== prompt {index}: {prompt.text!r}")
         rows = [r for r in records if r["prompt_index"] == index]
+        print(f"\n=== prompt {index} (k = {rows[0]['horizon']}): {prompt.text!r}")
         if rows[0]["reference"] is not None:
             print(f"{'reference':<14}{' | '.join(rows[0]['reference'])!r}")
         for r in rows:
@@ -449,7 +474,9 @@ def main(argv: list[str] | None = None) -> None:
         "--prompt", action="append", default=[],
         help="Prompt text (repeatable with --plan-depth)",
     )
-    parser.add_argument("--seed", type=int, default=None, help="Sampling seed")
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Seed for the horizon and sampling"
+    )
 
     plan = parser.add_argument_group("decoded plans")
     plan.add_argument(
@@ -511,8 +538,8 @@ def main(argv: list[str] | None = None) -> None:
     tokenizer = load_tokenizer(args.tokenizer)
     model = _load_model(args.model, tokenizer, device)
 
-    k = model.pred_horizon
-    print(f"Loaded {args.model} on {device} (k={k} tokens per prediction step)")
+    lo, hi = model.config.horizon_range
+    print(f"Loaded {args.model} on {device} (horizon range: {lo} to {hi} tokens)")
 
     if plan_mode:
         run_plans(args, tokenizer, model, device)
@@ -524,7 +551,7 @@ def main(argv: list[str] | None = None) -> None:
 
     steps = args.steps
 
-    generated_text, generated_ids = generate(
+    generated_text, generated_ids, horizon = generate(
         model,
         tokenizer,
         prompt,
@@ -533,6 +560,7 @@ def main(argv: list[str] | None = None) -> None:
         top_k=args.top_k,
         commit_temperature=args.commit_temperature,
         commit_top_k=args.commit_top_k,
+        seed=args.seed,
         device=device,
     )
 
@@ -540,7 +568,7 @@ def main(argv: list[str] | None = None) -> None:
     print(prompt + generated_text)
     print(
         f"\n[{len(generated_ids)} tokens generated "
-        f"over {steps} prediction step(s)]"
+        f"over {steps} prediction step(s) of k = {horizon}]"
     )
 
 

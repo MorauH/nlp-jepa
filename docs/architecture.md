@@ -3,7 +3,8 @@
 ## The idea
 
 A causal encoder maps tokens to latents. From the latest latent `z_t` the
-predictor proposes several **candidate** futures for `z_{t+k}`, a **π (win
+predictor proposes several **candidate** futures for `z_{t+k}`, where the
+**horizon** `k` is random and hidden from it (see [Horizon](#horizon)), a **π (win
 probability)** distribution over them, and **μ (mean future)**, the blurry
 average of the possible futures. A **commit** chooses exactly one candidate and
 continues from it. A **rollout** chains commits without going back through
@@ -16,8 +17,10 @@ latent, a clear single future instead of μ's average of all of them.
   over token ids, returning one latent `z_t` per position. It owns
   `hidden_size`, `vocab_size` and `pad_token_id`; the other configs derive
   their dependent dimensions from it.
+- **Horizon** (`jepa/horizon.py`): `draw_horizon` (training, generation, plans)
+  and `cycle_horizon` (validation) choose k outside the model.
 - **Predictor** (`jepa/models/predictor.py`, `PredictorConfig`): a pure
-  function of one latent. It expands `z_t` into `P` slots, mixes them with a
+  function of one latent; it never receives k. It expands `z_t` into `P` slots, mixes them with a
   small non-causal Transformer, and returns candidate futures, π logits and μ.
   Candidates are RMS-normalized to the encoder-latent scale, so the loss
   compares normalized latents.
@@ -44,8 +47,44 @@ latent, a clear single future instead of μ's average of all of them.
   predictor, decoder and both losses. `encode` is the single encoder entry
   point (right-padded batches let the causal encoder drop the padding mask);
   `jepa_loss` runs the encoder/predictor objective; `decoder_loss` runs the
-  decoder against a frozen JEPA; `build_block_hints` aligns latents with
-  decoder positions and returns a validity mask for the tail block.
+  decoder against a frozen JEPA. Both take the batch's `horizon`.
+  `horizon_targets` returns the detached latents `horizon` tokens ahead with
+  their validity mask; `build_block_hints` aligns latents with decoder
+  positions and returns a validity mask for the tail block.
+
+## Horizon
+
+There is one horizon k, and it is everything at once: the prediction target's
+offset, the hindsight target, the decoder block length, the end of the hint's
+block, the rollout stride and the number of tokens `generate` writes per block.
+Training draws one k per batch, uniform over the inclusive
+`JepaConfig.horizon_range` (default `[10, 30]`). Generation and decoded plans
+draw one k per call or prompt, so a sequence has equal blocks, as in training.
+The encoder, predictor and decoder are never told k; the decoder only sees
+where its blocks fall, through the hints. The reason is in
+[ADR 0003](adr/0003-random-hidden-horizon.md): with a fixed k, a latent whose
+period divides k is free to predict.
+
+- **Training** draws k from `(seed, global_step)` with a private generator, in
+  both stages. `--resume` replays it without extra state and the global RNG is
+  untouched.
+- **Validation** cycles k through the range by batch index, so every epoch
+  validates on the same k values.
+- **Compile.** k is a 0-dim tensor, like `progress`. The predictor runs on every
+  position; the target is gathered at t + k (clamped) and positions without a
+  real token there are masked. No shape depends on k, so k never recompiles
+  (100 steps and 30 validation batches on CUDA: 23 recompiles in the JEPA stage
+  and 17 in the decoder stage, for `[10, 30]` as for `[20, 20]`).
+- A batch must be longer than `hi`, whatever its k; shorter ones are skipped.
+- A fixed horizon is the range `[k, k]` (`docs/experiments/fixed-horizon.json`
+  is `[20, 20]`). Checkpoints that store the legacy `pred_horizon` and no
+  `horizon_range` load as `[pred_horizon, pred_horizon]`; `pred_horizon` is
+  never written or overridable.
+
+A candidate therefore stands for "some `lo` to `hi` tokens ahead": candidate
+spread and |μ| mix uncertainty about the content with uncertainty about the
+distance. Winner-takes-all could even spend the candidates on "which k" (phase
+copies); `measure` reports the slot-horizon mutual information for that.
 
 ## Two stages
 
@@ -58,6 +97,7 @@ two-stage [ADR 0001](adr/0001-two-stage-training.md).
 ```bash
 python -m jepa train                          # stage jepa -> runs/jepa
 python -m jepa train --config docs/experiments/joint-decoder.json   # joint
+python -m jepa train --config docs/experiments/fixed-horizon.json   # fixed k = 20
 python -m jepa train --resume                 # continue it
 python -m jepa train --stage decoder --from runs/jepa   # -> runs/jepa-decoder
 python -m jepa train --stage decoder --resume --epochs 2
@@ -112,16 +152,19 @@ commit `policy`: `None` uses
 `PiArgmax()` (the inference condition). The model's `train`/`eval` flag is not
 involved.
 
-The last block of a sequence has no real latent `horizon` tokens ahead, so it
-has no committed future; `build_block_hints` marks it invalid and both the
+Blocks have the batch's k tokens, so over training the hint reads z_t at many
+positions rather than at multiples of one k. The last block of a sequence has
+no real latent `horizon` tokens ahead, so it has no committed future;
+`build_block_hints` marks it invalid (a block is valid when
+`block_start + k <= seq - 1`) and both the
 decoder loss and measurement mask those target positions out. No position is
 paired with an earlier block's hint.
 
 A raw block-end latent would leak the block's last token, which is a decoder
 target. A hindsight commit is still a predictor output, but its choice among
 `P` candidates was made with the real future, so it carries up to `log2(P)`
-bits about that future (intended teacher forcing). A π-argmax hint carries
-none. Validation and measurement report both, so the hindsight row is a
+bits about that future (intended teacher forcing). It can also reveal k, on top
+of those bits. A π-argmax hint carries neither. Validation and measurement report both, so the hindsight row is a
 teacher-forced lower bound on the decoder cross-entropy, not the inference
 number. Validation perplexity is `exp` of the token-weighted mean token loss
 (weighted by the `tokens` diagnostic), not a mean of per-batch perplexities.
@@ -144,7 +187,7 @@ a seed reproduces the weights exactly. On CUDA, non-deterministic kernels
 ```json
 {
   "model_type": "jepa",
-  "pred_horizon": 20,
+  "horizon_range": [10, 30],
   "decoder_w": 0.0,
   "encoder":    {"model_type": "jepa_encoder",    "...": "..."},
   "predictor":  {"model_type": "jepa_predictor",  "...": "..."},
@@ -205,31 +248,60 @@ python -m jepa measure --model runs/jepa --json runs/jepa/metrics.json
 ```
 
 `measure` evaluates validation chunks against a bank of real train-split
-latents. The JSON has one dict per section:
+latents.
 
-- `context`: checkpoint, device, example/token counts, horizon, candidates.
-- `representation`: per-dim std, mean norm, effective rank, temporal cosine,
-  and VISReg terms — the no-collapse checks. Also the **lag profile**
-  (`lag_cos`, mean cos(z_t, z_t+lag) for lags 1..k and 2k, 5k, 10k, 20k), the
-  **periodic rebound** (cos at k minus the lowest cos below k) and the
-  **fast share** (within-document energy left after a centred k/2-step moving
-  average). The rebound exists because the two-stage JEPA learned a latent
-  with a period dividing k: cos at k alone looked smooth (0.96) while cos at
-  k/4 was −0.15. Verdict `no_periodic_shortcut`: rebound < 0.05. The fast
-  share has no verdict, since token-to-token change is legitimately fast.
+Everything that compares a prediction with the future is scored at fixed
+**evaluation horizons** and averaged over them: for `[10, 30]` they are 11, 14,
+17, 20, 23, 26 and 29, whose residues modulo 10 all differ (steps of 5 would
+always sit on the observed 10-token cycle). A fixed range `[k, k]` gives just
+k. Latents, candidates and every rollout path except hindsight do not depend on
+k, so each section computes them once and scores them at each; only the loss
+section calls `jepa_loss` per k.
+
+The JSON has one dict per section:
+
+- `context`: checkpoint, device, example/token counts, `horizon_range`, the
+  evaluation `horizons`, candidates.
+- `representation`: per-dim std, mean norm, effective rank, temporal cosine
+  (mean over the evaluation horizons), and VISReg terms — the no-collapse
+  checks. Also the **lag profile** (`lag_cos`, mean cos(z_t, z_t+lag) for lags
+  1..`hi` and 40, 100, 200, 400), the **max rebound** (over every lag L in
+  2..`hi`: cos at L minus the lowest cos at a shorter lag, maximized; a run with
+  a larger `hi` scans more lags, which can only raise it), the
+  **fast share** (within-document energy left after a centred 10-step moving
+  average) and the **document share** (between-document share of the variance,
+  past the first 20 positions; each query chunk counts as a document). The
+  rebound exists because the two-stage JEPA learned a latent with a period
+  dividing k = 20: cos at 20 alone looked smooth (0.96) while cos at 5 was
+  −0.15. Scanning every lag also catches a period that does not divide any one
+  k. Verdict `no_periodic_shortcut`: max rebound < 0.05. The fast share has no
+  verdict, since token-to-token change is legitimately fast. The document
+  share has none either; a per-document constant is free to predict at any k.
 - `loss`: every JEPA term (including `token` for a joint checkpoint) with its
   weight and weighted contribution, plus the
   π floor (`H(r)` and `KL(r||π)`).
 - `heads`: candidate separation, hindsight shares and live slots, π's NLL
   gain over a constant distribution and its accuracy, μ's norm and distance
-  calibration.
+  calibration. **Slot-horizon mutual information** (`slot_horizon_mi`, with its
+  bound `slot_horizon_mi_max`), between the hindsight slot and k over the
+  positions every evaluation horizon can use: near its maximum the slots are
+  phase copies, one per k. Near 0 no slot is tied to a distance from z_t, but a
+  slot tied to an absolute phase wins by t + k and averaging over t hides it,
+  so a low value does not exclude those. n/a for a fixed k or P = 1, and no
+  verdict yet. Live slots alone prove nothing: phase copies would make all of
+  them live. `steady_state` repeats slot usage and MI for positions 80 and up.
 - `policies`: depth-1 distance to the real future for copy, hindsight,
-  π-argmax, π-sample, μ-safe, μ and the lowest-distance fixed slot. The
+  π-argmax, π-sample, μ-safe, μ and the lowest-distance fixed slot, as the mean
+  over the evaluation horizons, with each k in `by_horizon`. `steady_state`
+  has the same rows for positions 80 and up, because the document start
+  dominates the all-position averages. The
   paper's main table is this one plus the rollout rows: hindsight gain over μ
   is what candidates buy; commit headroom is what a better commit rule could
   add.
 - `rollouts`: **rollout error** and **manifold distance** per depth for
-  hindsight, π-argmax, π-sample and μ, with the `real` row as calibration. The
+  hindsight, π-argmax, π-sample and μ, with the `real` row as calibration.
+  Depth i is scored at t + i·k, with the same starts for every k (a start needs
+  `depths × hi` tokens ahead). The
   claim is the depth ≥ 2 manifold row: committed rollouts stay closer to real
   latents than μ. `best_of_k[K][depth]` (minADE_K) exists because rollout
   error against the one realized continuation penalizes commitment by
@@ -239,7 +311,8 @@ latents. The JSON has one dict per section:
   *include* the real one, so it should fall below μ as K grows (verdict:
   best-of-16 < μ at the deepest depth, with μ's error also averaged over
   depths 1..i).
-- `decoder`: token-weighted cross-entropy per hint condition (committed
+- `decoder`: token-weighted cross-entropy over blocks of k tokens for each
+  evaluation horizon, per hint condition (committed
   futures, real latent, shuffled, null, no_hints), hint use and specificity.
   `null` keeps the real z_t and zeroes the future; `no_hints` zeroes both.
   `z_t_use` (`no_hints − null`) and `future_use` (`null − pi_argmax`) split the
@@ -247,15 +320,17 @@ latents. The JSON has one dict per section:
   the commitment adds. All rows use
   the same mask (the tail block with no committed future is excluded). The
   π-argmax row is the inference hint; the hindsight row is teacher-forced and
-  its hint carries up to `log2(P)` bits about the target future, so read it as
+  its hint carries up to `log2(P)` bits about the target future (and may reveal
+  k), so read it as
   a lower bound rather than a leak-free condition.
 - `verdicts`: PASS/FAIL checks, each naming its metric and threshold.
 
 ## Generation
 
-`jepa/inference/generate.py` loads a checkpoint, re-encodes the context each
-block, commits a future sampled from π, and generates `k` tokens with the
-decoder:
+`jepa/inference/generate.py` loads a checkpoint, draws one `k` from its
+`horizon_range`, re-encodes the context each block, commits a future sampled
+from π, and generates `k` tokens with the decoder. Every block of one call has
+the same k; `--seed` fixes it:
 
 ```bash
 python -m jepa generate --prompt "When in Rome, " --steps 3 --temperature 0.8
@@ -286,20 +361,26 @@ latent. Each condition is a latent path of `N` latents:
 Block `i` is decoded with `decoder.generate` and the hint (start = path
 latent `i − 1`, or `z_t` for `i = 1`; committed = path latent `i`). The token
 context is the prompt plus every token decoded so far. Nothing is re-encoded,
-so the text is a decoded plan rather than generation. Each record holds
-exactly `N × k` tokens, and an EOS does not stop a plan.
+so the text is a decoded plan rather than generation. Each prompt draws one k
+from `(--seed, prompt index)`, shared by every condition, sample and the
+baseline model so the columns line up (the baseline must have the same
+`horizon_range`). Each record holds exactly `N × k` tokens, and an EOS does not
+stop a plan.
 
 Prompts are the first `--num-prompts` (default 8) validation chunks with at
-least `--prompt-length + N·k` tokens, taken in a `--seed`-ed random order. The
-`--prompt-length` prefix is the prompt and the next `N·k` tokens are the
-reference continuation. `--prompt` adds free prompts (repeatable) that have no
-reference. The JSON has one record per prompt, condition and sample
-(`prompt_index`, `source`, `prompt`, `reference` per block, `condition`,
-`sample`, `token_ids`, `blocks`). `--html` writes one side-by-side table per
-prompt.
+least `--prompt-length + N·hi` tokens, taken in a `--seed`-ed random order, so
+the choice does not depend on the drawn k. The `--prompt-length` prefix is the
+prompt and the next `N·k` tokens are the reference continuation. `--prompt`
+adds free prompts (repeatable) that have no reference. The JSON has one record
+per prompt, condition and sample (`prompt_index`, `source`, `prompt`,
+`horizon`, `reference` per block, `condition`, `sample`, `token_ids`,
+`blocks`). `--html` writes one side-by-side table per prompt, with its k.
 
 Caveats for the report:
 
+- **A committed latent has no known distance.** Blocks decode to a drawn k, but
+  the latent stands for "some k tokens ahead", so the text may not line up with
+  the reference block by block.
 - **The decoder never saw μ hints.** It is trained on committed candidates, so
   decoding the μ path is out of distribution. That is part of the point (a
   blurry latent is not a valid plan), but it confounds the comparison. The

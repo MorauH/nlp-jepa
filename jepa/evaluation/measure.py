@@ -5,6 +5,12 @@
 
 Queries are validation chunks; the manifold bank samples real encoder latents
 from the train split (whole documents are held out, so they do not overlap).
+
+The horizon is random (``docs/adr/0003-random-hidden-horizon.md``), so everything
+that compares a prediction with the future is scored at a fixed set of
+**evaluation horizons** and averaged.  Latents, candidates and every rollout
+path except hindsight do not depend on k, so each section computes them once
+and scores them against each (the loss section calls ``jepa_loss`` per k).
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import torch.nn.functional as F
 from ..config import EncoderConfig
 from ..data.tokenizer import load_tokenizer
 from ..models.commitment import (
+    Futures,
     Hindsight,
     MuSafe,
     PiArgmax,
@@ -47,11 +54,37 @@ DECODER_CONDITIONS = (
     "pi_argmax", "pi_sample", "mu_safe", "hindsight", "real", "shuffled", "null",
     "no_hints",
 )
-# Lags beyond the horizon, as multiples of it, for the long end of the profile.
-LONG_LAG_MULTIPLES = (2, 5, 10, 20)
+POLICY_NAMES = ("copy", "hindsight", "pi_argmax", "pi_sample", "mu_safe", "mu")
+# Period of the cycle the fixed-k encoders learned (ADR 0003).
+OBSERVED_PERIOD = 10
+# Fixed, not multiples of k, so runs with different horizons compare.
+LONG_LAGS = (40, 100, 200, 400)
+FAST_SHARE_WINDOW = OBSERVED_PERIOD
+# Positions the document start no longer dominates.
+STEADY_STATE_START = 80
+DOCUMENT_SHARE_START = 20
 # A drifting latent has rebound <= 0; the period-10 shortcut of the first
-# two-stage run scored about 1.1.  The margin allows for sampling noise.
+# two-stage run scored about 1.0.  The margin allows for sampling noise.
 REBOUND_THRESHOLD = 0.05
+
+def evaluation_horizons(horizon_range) -> list[int]:
+    """The k values measurement scores: no two alike modulo the observed period.
+
+    A short range is scored in full.  A longer one is sampled evenly around its
+    centre, with the smallest step coprime with the period that covers it in at
+    most one period's worth of values.  Steps of 5 would always sit on the
+    observed cycle.
+    """
+    lo, hi = horizon_range
+    span = hi - lo
+    if span < OBSERVED_PERIOD:
+        return list(range(lo, hi + 1))
+    step = 3
+    while math.gcd(step, OBSERVED_PERIOD) > 1 or span // step >= OBSERVED_PERIOD:
+        step += 1
+    count = span // step + 1
+    first = lo + (span - step * (count - 1)) // 2
+    return [first + step * i for i in range(count)]
 
 def _value(value) -> float:
     return float(value.detach().float().item()) if isinstance(
@@ -67,14 +100,26 @@ def _prediction_mask(mask, horizon: int):
     """A real token with a real token ``horizon`` ahead."""
     return mask[:, :-horizon].bool() & mask[:, horizon:].bool()
 
-def _walk(latents, masks, horizon: int):
-    for z, mask in zip(latents, masks):
-        yield z[:, :-horizon], z[:, horizon:], _prediction_mask(mask, horizon)
+def _proposals(model, batches, latents, horizons):
+    """Yield ``(z, mask, futures)`` per batch: the predictor runs once per batch.
 
-def _commit_distance(distances, futures, policy, valid, target=None):
-    """Distance of the candidate ``policy`` commits to, one per valid position."""
-    index = futures.commit(policy, target).index[valid]
-    return distances.gather(-1, index[:, None]).squeeze(-1)
+    ``futures`` covers every base position some horizon can use.  Batches
+    without any such position are skipped.
+    """
+    shortest = min(horizons)
+    for (_, mask), z in zip(batches, latents):
+        if _prediction_mask(mask, shortest).any():
+            yield z, mask, model.predictor(z[:, :-shortest])
+
+def _bases(futures, z, horizon: int) -> Futures:
+    """The proposals at the base positions ``horizon`` can use."""
+    return Futures(*(x[:, : z.shape[1] - horizon] for x in futures))
+
+def _steady(mask, horizon: int):
+    """``_prediction_mask`` restricted to the steady state."""
+    valid = _prediction_mask(mask, horizon)
+    valid[:, :STEADY_STATE_START] = False
+    return valid
 
 def mu_path(predictor, z, steps: int):
     """The μ path: feed back ``normalize(μ)`` at the latent scale.
@@ -112,19 +157,64 @@ def lag_profile(latents, masks, lags) -> dict[int, float | None]:
         profile[lag] = total / count if count else None
     return profile
 
-def periodic_rebound(profile, horizon: int) -> float | None:
-    """cos at lag ``horizon`` minus the lowest cos at lags 1..horizon-1.
+def max_rebound(profile, longest: int) -> float | None:
+    """Largest return of similarity at any lag up to ``longest``.
 
-    A latent that drifts loses similarity with lag, so its rebound is <= 0.
-    A latent with a period dividing the horizon dips below and returns at the
-    horizon, a shortcut the prediction loss cannot see.  ``None`` when the
-    profile lacks the horizon or every shorter lag.
+    Over every lag L in 2..longest: cos at L minus the lowest cos at a shorter
+    lag, maximized over L.  A latent that drifts loses similarity with lag, so
+    its rebound is <= 0.  A latent with a period dips and returns, whether or
+    not the period divides a horizon.  ``None`` without two usable lags.
     """
-    shorter = [profile.get(lag) for lag in range(1, horizon)]
-    shorter = [value for value in shorter if value is not None]
-    if profile.get(horizon) is None or not shorter:
+    values = [profile.get(lag) for lag in range(1, longest + 1)]
+    lowest, rebound = None, None
+    for value in (v for v in values if v is not None):
+        if lowest is None:
+            lowest = value
+            continue
+        rise = value - lowest
+        rebound = rise if rebound is None else max(rebound, rise)
+        lowest = min(lowest, value)
+    return rebound
+
+def document_share(latents, masks, start: int = DOCUMENT_SHARE_START) -> float | None:
+    """Between-document share of the latent variance (0..1).
+
+    A latent that is constant within a document stays free to predict at any
+    horizon.  Positions before ``start`` are left out: every document starts
+    alike.  A query chunk counts as a document.  ``None`` with fewer than two
+    documents longer than ``start`` (or no variance at all).
+    """
+    counts, sums, square = [], [], 0.0
+    for z, mask in zip(latents, masks):
+        for row, length in enumerate(int(n) for n in mask.sum(dim=-1).tolist()):
+            if length <= start:
+                continue
+            x = z[row, start:length].double()
+            counts.append(x.shape[0])
+            sums.append(x.sum(dim=0))
+            square += (x**2).sum().item()
+    if len(counts) < 2:
         return None
-    return profile[horizon] - min(shorter)
+    sums = torch.stack(sums)
+    n = torch.tensor(counts, dtype=sums.dtype, device=sums.device)
+    grand = (sums.sum(dim=0) ** 2).sum() / n.sum()
+    between = ((sums**2).sum(dim=-1) / n).sum() - grand
+    total = square - grand
+    return _value(between / total) if total > 0 else None
+
+def slot_horizon_information(counts) -> float:
+    """Mutual information in nats between slot and horizon.
+
+    ``counts`` is ``(horizons, slots)``: how often each slot is the hindsight
+    commit at each horizon.  Near its maximum the slots are phase copies, one
+    per k, rather than different futures.  Near 0 no slot is tied to a distance
+    from ``z_t``.  That does not rule out slots tied to an absolute phase: such
+    a slot wins by ``t + k``, and averaging over ``t`` hides it.
+    """
+    joint = counts.double() / counts.sum()
+    independent = joint.sum(dim=1, keepdim=True) * joint.sum(dim=0, keepdim=True)
+    terms = joint * (joint.clamp_min(1e-300) / independent.clamp_min(1e-300)).log()
+    return max(0.0, float(terms.sum()))
 
 def _centred_kernel(window: int) -> torch.Tensor:
     """A centred moving average spanning exactly ``window`` steps.
@@ -227,9 +317,9 @@ def build_bank(
         bank = bank[torch.randperm(bank.shape[0], generator=generator)[:size]]
     return bank
 
-def _representation_section(model, batches, latents) -> dict:
+def _representation_section(model, batches, latents, horizons) -> dict:
     """Section 1: no-collapse checks on the encoder latents."""
-    horizon = model.pred_horizon
+    longest = model.config.horizon_range[1]
     pooled, seen = [], 0
     token_count = 0
     visreg_sums = {name: 0.0 for name in model.visreg.weights}
@@ -244,8 +334,8 @@ def _representation_section(model, batches, latents) -> dict:
         for name, value in model.visreg(z, mask=mask).terms.items():
             visreg_sums[name] += _value(value) * tokens
     masks = [mask for _, mask in batches]
-    lags = (*range(1, horizon + 1), *(m * horizon for m in LONG_LAG_MULTIPLES))
-    profile = lag_profile(latents, masks, lags)
+    profile = lag_profile(latents, masks, sorted({*range(1, longest + 1), *LONG_LAGS}))
+    at_horizons = [profile[k] for k in horizons if profile[k] is not None]
     z_all = torch.cat(pooled)
     mean, centered = z_all.mean(dim=0), z_all - z_all.mean(dim=0)
     covariance = centered.T @ centered / max(1, z_all.shape[0] - 1)
@@ -257,29 +347,31 @@ def _representation_section(model, batches, latents) -> dict:
         "mean_vector_norm": _value(mean.norm()),
         "effective_rank": _value(rank),
         "latents": int(z_all.shape[0]),
-        "temporal_cos": profile[horizon] if profile[horizon] is not None else 0.0,
+        "temporal_cos": sum(at_horizons) / len(at_horizons) if at_horizons else 0.0,
         # String keys: the dict is written to JSON as is.
         "lag_cos": {str(lag): value for lag, value in profile.items()},
-        "periodic_rebound": periodic_rebound(profile, horizon),
-        "fast_share": fast_share(latents, masks, window=max(2, horizon // 2)),
+        "max_rebound": max_rebound(profile, longest),
+        "fast_share": fast_share(latents, masks, window=FAST_SHARE_WINDOW),
+        "document_share": document_share(latents, masks),
         "visreg": {name: visreg_sums[name] / max(1, token_count) for name in visreg_sums},
     }
 
-def _loss_section(model, batches) -> dict:
+def _loss_section(model, batches, horizons) -> dict:
     """Section 2: every JEPA term, its weight, and its contribution."""
-    horizon = model.pred_horizon
     weights = model.loss_weights
     term_sums, diagnostic_sums, count = {}, {}, 0
     for labels, mask in batches:
-        valid = int(_prediction_mask(mask, horizon).sum())
-        if valid == 0:
-            continue
-        out = model.jepa_loss(labels, attention_mask=mask, progress=None)
-        for name, value in out.terms.items():
-            term_sums[name] = term_sums.get(name, 0.0) + _value(value) * valid
-        for name, value in out.diagnostics.items():
-            diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + _value(value) * valid
-        count += valid
+        for horizon in horizons:
+            valid = int(_prediction_mask(mask, horizon).sum())
+            if valid == 0:
+                continue
+            out = model.jepa_loss(labels, attention_mask=mask, horizon=horizon)
+            for sums, values in (
+                (term_sums, out.terms), (diagnostic_sums, out.diagnostics)
+            ):
+                for name, value in values.items():
+                    sums[name] = sums.get(name, 0.0) + _value(value) * valid
+            count += valid
     if count == 0:
         raise ValueError("no valid prediction positions in the query batches")
     terms = {}
@@ -294,49 +386,90 @@ def _loss_section(model, batches) -> dict:
         "diagnostics": {name: value / count for name, value in diagnostic_sums.items()},
     }
 
-def _heads_section(model, batches, latents) -> dict:
+def _shares(counts):
+    """Share of the hindsight commits per slot, and their entropy in nats."""
+    pooled = counts.sum(dim=0).float()
+    shares = pooled / pooled.sum().clamp_min(1)
+    return shares, float(-(shares * shares.clamp_min(1e-12).log()).sum())
+
+def _slot_usage(counts, matched) -> dict:
+    """How many slots the hindsight commit uses, and whether they encode k.
+
+    ``counts`` and ``matched`` are ``(horizons, slots)``.  ``matched`` only has
+    positions every horizon can use, so a slot that follows the position cannot
+    look like one that follows k.  Everything is n/a for a single slot.
+    """
+    horizons, slots = counts.shape
+    if slots == 1:
+        return dict.fromkeys(("live_slots", "effective_slots", "slot_horizon_mi"))
+    shares, entropy = _shares(counts)
+    return {
+        "live_slots": int((shares > 1.0 / (4 * slots)).sum()),
+        "effective_slots": math.exp(entropy),
+        "slot_horizon_mi": slot_horizon_information(matched)
+        if horizons > 1 and matched.sum() > 0 else None,
+    }
+
+def _heads_section(model, batches, latents, horizons) -> dict:
     """Section 3: candidates, π, μ and their calibration."""
-    horizon = model.pred_horizon
-    masks = [mask for _, mask in batches]
     prediction_count = model.config.predictor.prediction_count
     count = 0
     pair_sim_sum = delta_sum = z_norm_sum = 0.0
     pi_nll_sum = mu_norm_sum = mu_distance_sum = 0.0
     pair_count = correct = 0
-    hindsight_counts = torch.zeros(prediction_count, dtype=torch.long)
-    for z_t, future, valid in _walk(latents, masks, horizon):
-        if not valid.any():
-            continue
-        futures = model.predictor(z_t)
-        future_valid, z_valid = future[valid].float(), z_t[valid].float()
-        n = int(valid.sum())
-        count += n
-        # The hindsight commit decides the reference slot and the π target.
-        hindsight_index = futures.commit(Hindsight(), future).index[valid]
-        if prediction_count > 1:
-            sim = futures.candidate_similarity()[valid]  # (N, P, P)
-            off_diagonal = 1.0 - torch.eye(
-                prediction_count, device=sim.device, dtype=sim.dtype
-            )
-            pair_sim_sum += (sim * off_diagonal).sum().item()
-            pair_count += n * prediction_count * (prediction_count - 1)
-        delta_sum += (
-            futures.candidates[valid].float() - z_valid.unsqueeze(-2)
-        ).norm(dim=-1).sum().item()
-        z_norm_sum += z_valid.norm(dim=-1).sum().item()
-        hindsight_counts += torch.bincount(
-            hindsight_index, minlength=prediction_count
-        ).cpu()
-        log_pi = F.log_softmax(futures.pi[valid].float(), dim=-1)
-        pi_nll_sum += -log_pi.gather(-1, hindsight_index[:, None]).sum().item()
-        correct += (log_pi.argmax(dim=-1) == hindsight_index).sum().item()
-        mu = futures.mu[valid].float()
-        mu_norm_sum += mu.norm(dim=-1).sum().item()
-        mu_distance_sum += distance(mu, future_valid).sum().item()
+
+    def slot_counts():
+        return torch.zeros(len(horizons), prediction_count, dtype=torch.long)
+
+    hindsight_counts, matched_counts = slot_counts(), slot_counts()
+    steady_counts, steady_matched = slot_counts(), slot_counts()
+    last = max(horizons)
+    for z, mask, proposals in _proposals(model, batches, latents, horizons):
+        similarity = (
+            proposals.candidate_similarity() if prediction_count > 1 else None
+        )
+        for row, horizon in enumerate(horizons):
+            valid = _prediction_mask(mask, horizon)
+            if not valid.any():
+                continue
+            futures = _bases(proposals, z, horizon)
+            z_t, future = z[:, :-horizon], z[:, horizon:]
+            future_valid, z_valid = future[valid].float(), z_t[valid].float()
+            n = int(valid.sum())
+            count += n
+            # The hindsight commit decides the reference slot and the π target.
+            index = futures.commit(Hindsight(), future).index
+            hindsight_index = index[valid]
+            if prediction_count > 1:
+                sim = similarity[:, : z_t.shape[1]][valid]  # (N, P, P)
+                off_diagonal = 1.0 - torch.eye(
+                    prediction_count, device=sim.device, dtype=sim.dtype
+                )
+                pair_sim_sum += (sim * off_diagonal).sum().item()
+                pair_count += n * prediction_count * (prediction_count - 1)
+            delta_sum += (
+                futures.candidates[valid].float() - z_valid.unsqueeze(-2)
+            ).norm(dim=-1).sum().item()
+            z_norm_sum += z_valid.norm(dim=-1).sum().item()
+            # Positions the last horizon can use are usable at every one.
+            shared = index[:, : z.shape[1] - last]
+            steady = _steady(mask, horizon)
+            for counts, chosen in (
+                (hindsight_counts, hindsight_index),
+                (matched_counts, shared[_prediction_mask(mask, last)]),
+                (steady_counts, index[steady]),
+                (steady_matched, shared[_steady(mask, last)]),
+            ):
+                counts[row] += torch.bincount(chosen, minlength=prediction_count).cpu()
+            log_pi = F.log_softmax(futures.pi[valid].float(), dim=-1)
+            pi_nll_sum += -log_pi.gather(-1, hindsight_index[:, None]).sum().item()
+            correct += (log_pi.argmax(dim=-1) == hindsight_index).sum().item()
+            mu = futures.mu[valid].float()
+            mu_norm_sum += mu.norm(dim=-1).sum().item()
+            mu_distance_sum += distance(mu, future_valid).sum().item()
     if count == 0:
         raise ValueError("no valid prediction positions in the query batches")
-    shares = hindsight_counts.float() / hindsight_counts.sum().clamp_min(1)
-    entropy = float(-(shares * shares.clamp_min(1e-12).log()).sum())
+    shares, entropy = _shares(hindsight_counts)
     pi_nll = pi_nll_sum / count
     mu_norm = mu_norm_sum / count
     mu_distance = mu_distance_sum / count
@@ -345,18 +478,24 @@ def _heads_section(model, batches, latents) -> dict:
     mu_distance_predicted = 2.0 - 2.0 * mu_norm
     choices = {
         "candidate_pair_cos": pair_sim_sum / pair_count if pair_count else None,
-        "live_slots": int((shares > 1.0 / (4 * prediction_count)).sum()),
-        "effective_slots": math.exp(entropy),
         "pi_nll": pi_nll,
         "constant_nll": entropy,
         "pi_gain": entropy - pi_nll,
         "pi_accuracy": correct / count,
         "majority_accuracy": float(shares.max()),
+        # What MI could reach at most: it is bounded by both entropies.
+        "slot_horizon_mi_max": math.log(min(len(horizons), prediction_count))
+        if len(horizons) > 1 else None,
     }
     if prediction_count == 1:  # nothing to choose between: n/a, not a number
         choices = dict.fromkeys(choices)
     return {
         **choices,
+        **_slot_usage(hindsight_counts, matched_counts),
+        "steady_state": {
+            "from_position": STEADY_STATE_START,
+            **_slot_usage(steady_counts, steady_matched),
+        } if steady_counts.sum() > 0 else None,
         "delta_ratio": (delta_sum / (count * prediction_count)) / max(z_norm_sum / count, 1e-12),
         "hindsight_shares": [float(x) for x in shares.tolist()],
         "mu_norm": mu_norm,
@@ -365,59 +504,119 @@ def _heads_section(model, batches, latents) -> dict:
         "mu_calibration_error": mu_distance - mu_distance_predicted,
     }
 
-def _policies_section(model, batches, latents, *, seed: int) -> dict:
-    """Section 4: distance-to-real at depth 1 for every commit rule."""
-    horizon = model.pred_horizon
-    masks = [mask for _, mask in batches]
-    prediction_count = model.config.predictor.prediction_count
-    generator, count = _generator(latents[0].device, seed + 1), 0
-    sums = dict.fromkeys(
-        ("copy", "hindsight", "pi_argmax", "pi_sample", "mu_safe", "mu"),
-        0.0,
-    )
-    slot_sums = torch.zeros(prediction_count, dtype=torch.float64)
-    for z_t, future, valid in _walk(latents, masks, horizon):
-        if not valid.any():
-            continue
-        futures = model.predictor(z_t)
-        distances = futures.distances(future)[valid]
-        future_valid, z_valid = future[valid].float(), z_t[valid].float()
-        count += distances.shape[0]
-        sums["copy"] += distance(z_valid, future_valid).sum().item()
-        sums["hindsight"] += _commit_distance(
-            distances, futures, Hindsight(), valid, target=future
-        ).sum().item()
-        for name, rule in (
-            ("pi_argmax", PiArgmax()),
-            ("pi_sample", PiSample(generator=generator)),
-            ("mu_safe", MuSafe()),
-        ):
-            sums[name] += _commit_distance(
-                distances, futures, rule, valid
-            ).sum().item()
-        sums["mu"] += distance(futures.mu[valid].float(), future_valid).sum().item()
-        slot_sums += distances.double().cpu().sum(dim=-2)
-    if count == 0:
-        raise ValueError("no valid prediction positions in the query batches")
-    fixed_index = int(slot_sums.argmin())
-    hindsight, pi_argmax = sums["hindsight"] / count, sums["pi_argmax"] / count
-    return {
-        **{name: value / count for name, value in sums.items()},
-        "fixed_slot": {"index": fixed_index, "distance": slot_sums[fixed_index].item() / count},
-        "hindsight_gain_over_mu": sums["mu"] / count - hindsight,
-        "commit_headroom": pi_argmax - hindsight,
-    }
+class _PolicySums:
+    """Per-horizon distance sums of every commit rule, over one set of positions."""
 
-def _rollout_starts(batches, stride, steps, limit, generator):
-    """Sample ``(batch, row, t)`` starts where ``t + steps * k`` is valid."""
+    def __init__(self, horizons, prediction_count: int):
+        self.counts = dict.fromkeys(horizons, 0)
+        self.sums = {k: dict.fromkeys(POLICY_NAMES, 0.0) for k in horizons}
+        self.slots = {
+            k: torch.zeros(prediction_count, dtype=torch.float64) for k in horizons
+        }
+
+    def add(self, horizon, named, slot_distances) -> None:
+        """``named`` is one distance per position per rule, slots ``(N, P)``."""
+        self.counts[horizon] += slot_distances.shape[0]
+        for name, values in named.items():
+            self.sums[horizon][name] += values.sum().item()
+        self.slots[horizon] += slot_distances.double().cpu().sum(dim=0)
+
+    def rows(self) -> dict | None:
+        """The mean over horizons, with one row per horizon; None if empty."""
+        used = [k for k, count in self.counts.items() if count]
+        if not used:
+            return None
+        slots = {k: self.slots[k] / self.counts[k] for k in used}
+        # One slot for every horizon: the best single one on average.
+        fixed = int(torch.stack(list(slots.values())).mean(dim=0).argmin())
+
+        def row(k):
+            values = {n: self.sums[k][n] / self.counts[k] for n in POLICY_NAMES}
+            return {
+                **values,
+                "hindsight_gain_over_mu": values["mu"] - values["hindsight"],
+                "commit_headroom": values["pi_argmax"] - values["hindsight"],
+            }, {"index": fixed, "distance": slots[k][fixed].item()}
+
+        rows = {k: row(k) for k in used}
+
+        def mean(values):
+            return sum(values) / len(used)
+
+        return {
+            **{name: mean([rows[k][0][name] for k in used]) for name in rows[used[0]][0]},
+            "fixed_slot": {
+                "index": fixed,
+                "distance": mean([rows[k][1]["distance"] for k in used]),
+            },
+            # String keys: the dict is written to JSON as is.
+            "by_horizon": {
+                str(k): {**rows[k][0], "fixed_slot": rows[k][1]} if k in rows else None
+                for k in self.counts
+            },
+        }
+
+def _policies_section(model, batches, latents, horizons, *, seed: int) -> dict:
+    """Section 4: distance-to-real at depth 1 for every commit rule.
+
+    Each number is the mean over the evaluation horizons, which are reported
+    one by one too, for all positions and for the steady state.
+    """
+    prediction_count = model.config.predictor.prediction_count
+    generator = _generator(latents[0].device, seed + 1)
+    everywhere = _PolicySums(horizons, prediction_count)
+    steady = _PolicySums(horizons, prediction_count)
+    for z, mask, proposals in _proposals(model, batches, latents, horizons):
+        # These rules do not see the future, so they commit once for every k.
+        committed = {
+            name: proposals.commit(rule).index
+            for name, rule in (
+                ("pi_argmax", PiArgmax()),
+                ("pi_sample", PiSample(generator=generator)),
+                ("mu_safe", MuSafe()),
+            )
+        }
+        for horizon in horizons:
+            valid = _prediction_mask(mask, horizon)
+            if not valid.any():
+                continue
+            futures = _bases(proposals, z, horizon)
+            z_t, future = z[:, :-horizon], z[:, horizon:]
+            distances = futures.distances(future)[valid]
+            future_valid = future[valid].float()
+            named = {
+                "copy": distance(z_t[valid].float(), future_valid),
+                "hindsight": distances.min(dim=-1).values,
+                "mu": distance(futures.mu[valid].float(), future_valid),
+            }
+            for name, index in committed.items():
+                index = index[:, : z_t.shape[1]][valid]
+                named[name] = distances.gather(-1, index[:, None]).squeeze(-1)
+            everywhere.add(horizon, named, distances)
+            keep = _steady(mask, horizon)[valid]
+            steady.add(
+                horizon, {n: v[keep] for n, v in named.items()}, distances[keep]
+            )
+    rows, steady_rows = everywhere.rows(), steady.rows()
+    if rows is None:
+        raise ValueError("no valid prediction positions in the query batches")
+    if steady_rows is not None:
+        steady_rows = {"from_position": STEADY_STATE_START, **steady_rows}
+    return {**rows, "steady_state": steady_rows}
+
+def _rollout_starts(batches, longest, steps, limit, generator):
+    """Sample ``(batch, row, t)`` starts where ``t + steps * longest`` is valid.
+
+    ``longest`` is the longest horizon, so every horizon uses the same starts.
+    """
     candidates = []
     for index, (_, mask) in enumerate(batches):
-        last = mask.sum(dim=-1) - 1 - steps * stride
+        last = mask.sum(dim=-1) - 1 - steps * longest
         for row, last_t in enumerate(last.tolist()):
             candidates.extend((index, row, t) for t in range(int(last_t) + 1))
     if not candidates:
         raise ValueError(
-            "no rollout start has t + depths * pred_horizon valid; "
+            f"no rollout start has t + depths * {longest} (the longest horizon) valid; "
             "the query sequences are too short"
         )
     if len(candidates) > limit:
@@ -436,49 +635,71 @@ def _mean_rollout_error(errors):
 def _best_of_k(predictor, z_start, targets, best_of, generator):
     """Best-of-K rollout error per start, ``{K: (N, depths)}``.
 
-    Draws ``max(best_of)`` independent π-sample rollouts in one batch;
-    best-of-K keeps the first K, so the draws are nested and the result is
-    non-increasing in K.  At depth i each rollout is scored by its mean error
-    over depths 1..i, so the minimum is one whole rollout, never a mix of
-    rollouts picked per depth.
+    ``targets`` is ``(horizons, N, depths, D)``; the error is the mean over
+    horizons of the best rollout at each.  Draws ``max(best_of)`` independent
+    π-sample rollouts in one batch; best-of-K keeps the first K, so the draws
+    are nested and the result is non-increasing in K.  At depth i each rollout
+    is scored by its mean error over depths 1..i, so the minimum is one whole
+    rollout, never a mix of rollouts picked per depth.
     """
     draws = max(best_of)
     starts = z_start.unsqueeze(0).expand(draws, *z_start.shape)
     paths = rollout(
         predictor, starts, PiSample(generator=generator), targets.shape[-2]
     ).future
-    scores = _mean_rollout_error(distance(paths, targets.unsqueeze(0)))  # (K, N, depths)
-    return {k: scores[:k].min(dim=0).values for k in best_of}
+    scores = torch.stack([  # (horizons, K, N, depths)
+        _mean_rollout_error(distance(paths, target.unsqueeze(0))) for target in targets
+    ])
+    return {k: scores[:, :k].min(dim=1).values.mean(dim=0) for k in best_of}
 
 def _rollouts_section(
-    model, batches, latents, bank, *, depths, positions, seed, bank_chunk_size,
-    best_of,
+    model, batches, latents, bank, horizons, *, depths, positions, seed,
+    bank_chunk_size, best_of,
 ) -> dict:
-    """Section 5: rollout error, best-of-K error and manifold distance per depth."""
-    stride = model.pred_horizon
+    """Section 5: rollout error, best-of-K error and manifold distance per depth.
+
+    Depth i is scored at ``t + i * k`` and averaged over the evaluation
+    horizons.  Only the hindsight path depends on k.
+    """
     device = latents[0].device
     sampled, groups = _rollout_starts(
-        batches, stride, depths, positions, _generator(torch.device("cpu"), seed)
+        batches, model.config.horizon_range[1], depths, positions,
+        _generator(torch.device("cpu"), seed),
     )
     sample_generator = _generator(device, seed + 2)
     best_generator = _generator(device, seed + 5)
-    best_sums = {k: torch.zeros(depths, dtype=torch.float64) for k in best_of}
-    error_sums = {name: [0.0] * depths for name in ROLLOUT_PATHS}
-    manifold_sums = {name: [0.0] * depths for name in (*ROLLOUT_PATHS, "real")}
-    counts = [0] * depths
+
+    def zeros(names):
+        return {name: torch.zeros(depths, dtype=torch.float64) for name in names}
+
+    best_sums = zeros(best_of)
+    error_sums = zeros(ROLLOUT_PATHS)
+    manifold_sums = zeros((*ROLLOUT_PATHS, "real"))
+
+    def add(sums, name, scores):
+        """Add ``(..., N, depths)`` scores, averaged over any horizon axis."""
+        per_start = scores.reshape(-1, *scores.shape[-2:]).mean(dim=0)
+        sums[name] += per_start.double().sum(dim=0).cpu()
+
+    def manifold(points):
+        flat = points.reshape(-1, points.shape[-1])
+        return _manifold_scores(flat, bank, bank_chunk_size).view(points.shape[:-1])
+
     for index, pairs in groups.items():
         z = latents[index]
         rows = torch.tensor([row for row, _ in pairs], dtype=torch.long, device=device)
         starts = torch.tensor([t for _, t in pairs], dtype=torch.long, device=device)
         z_start = z[rows, starts]
-        targets = torch.stack(
-            [z[rows, starts + (depth + 1) * stride] for depth in range(depths)], dim=1
-        )
-        for depth in range(depths):
-            counts[depth] += z_start.shape[0]
+        targets = torch.stack([  # (horizons, N, depths, D)
+            torch.stack(
+                [z[rows, starts + (depth + 1) * k] for depth in range(depths)], dim=1
+            )
+            for k in horizons
+        ])
         paths = {
             "hindsight": rollout(
-                model.predictor, z_start, Hindsight(), depths, targets=targets
+                model.predictor, z_start.expand(len(horizons), *z_start.shape),
+                Hindsight(), depths, targets=targets,
             ).future,
             "pi_argmax": rollout(model.predictor, z_start, PiArgmax(), depths).future,
             "pi_sample": rollout(
@@ -487,94 +708,90 @@ def _rollouts_section(
             "mu": mu_path(model.predictor, z_start, depths),
         }
         for name, path in paths.items():
-            for depth in range(depths):
-                error_sums[name][depth] += distance(
-                    path[:, depth], targets[:, depth]
-                ).sum().item()
-                manifold_sums[name][depth] += _manifold_scores(
-                    path[:, depth], bank, bank_chunk_size
-                ).sum().item()
-        for depth in range(depths):
-            manifold_sums["real"][depth] += _manifold_scores(
-                targets[:, depth], bank, bank_chunk_size
-            ).sum().item()
+            add(error_sums, name, distance(path, targets))
+            add(manifold_sums, name, manifold(path))
+        add(manifold_sums, "real", manifold(targets))
         # Same memory bound as the single rollouts: at most one group of
         # starts per predictor call, counting the K draws.
         chunk = max(1, z_start.shape[0] // max(best_of))
         for i in range(0, z_start.shape[0], chunk):
             best = _best_of_k(
-                model.predictor, z_start[i : i + chunk], targets[i : i + chunk],
+                model.predictor, z_start[i : i + chunk], targets[:, i : i + chunk],
                 best_of, best_generator,
             )
             for k, scores in best.items():
-                best_sums[k] += scores.double().sum(dim=0).cpu()
+                add(best_sums, k, scores)
 
     def means(sums):
-        return [sums[depth] / max(1, counts[depth]) for depth in range(depths)]
+        return {str(name): (total / sampled).tolist() for name, total in sums.items()}
 
     return {
         "positions": sampled,
         "depths": depths,
-        "stride": stride,
-        "error": {name: means(error_sums[name]) for name in ROLLOUT_PATHS},
-        "best_of_k": {str(k): means(best_sums[k].tolist()) for k in best_of},
-        "manifold": {name: means(manifold_sums[name]) for name in (*ROLLOUT_PATHS, "real")},
+        "horizons": list(horizons),
+        "error": means(error_sums),
+        "best_of_k": means(best_sums),
+        "manifold": means(manifold_sums),
     }
 
-def _decoder_section(model, batches, latents, *, seed, loss_chunk_size) -> dict:
+def _decoder_section(
+    model, batches, latents, horizons, *, seed, loss_chunk_size
+) -> dict:
     """Section 6: token-weighted CE per hint condition.
 
+    Blocks of k tokens for each evaluation horizon, pooled over all of them.
     Every condition uses the same mask: targets whose block runs past the end
     of the sequence have no committed future and are excluded.  The π-argmax
     row is the inference hint; the hindsight row is teacher-forced and its hint
     carries up to log2(P) bits about the target future from the choice among
-    candidates, so it is a lower bound on CE rather than a leak-free condition.
+    candidates (and may reveal k), so it is a lower bound on CE rather than a leak-free condition.
     """
-    horizon = model.pred_horizon
     device = latents[0].device
     sample_generator = _generator(device, seed + 3)
     shuffle_generator = _generator(device, seed + 4)
     totals = {name: 0.0 for name in DECODER_CONDITIONS}
     token_count = 0
+    shortest = min(horizons)
     for (labels, mask), z in zip(batches, latents):
-        futures = model.predictor(z[:, :-horizon])
-        real_future = z[:, horizon:]
-        z_hint, _, hint_valid = build_block_hints(z, horizon)
+        proposals = model.predictor(z[:, :-shortest])
+        # Only the hindsight and real hints depend on k.
         committed = {
-            "pi_argmax": futures.commit(PiArgmax()).future,
-            "pi_sample": futures.commit(PiSample(generator=sample_generator)).future,
-            "mu_safe": futures.commit(MuSafe()).future,
-            "hindsight": futures.commit(Hindsight(), real_future).future,
+            "pi_argmax": proposals.commit(PiArgmax()).future,
+            "pi_sample": proposals.commit(PiSample(generator=sample_generator)).future,
+            "mu_safe": proposals.commit(MuSafe()).future,
         }
         order = torch.randperm(z.shape[0], generator=shuffle_generator, device=device)
-        hints = {
-            name: build_block_hints(z, horizon, committed=value)[1]
-            for name, value in committed.items()
-        }
-        hints["real"] = build_block_hints(z, horizon)[1]
-        hints["shuffled"] = build_block_hints(
-            z, horizon, committed=committed["pi_argmax"][order]
-        )[1]
-        hints["null"] = torch.zeros_like(z_hint)
-        hints["no_hints"] = hints["null"]
-        # Same exclusion as decoder_loss: no committed future for the tail
-        # block, so those targets are not counted.
-        loss_mask = (
-            hint_valid.unsqueeze(0)
-            & mask[:, :-1].bool()
-            & mask[:, 1:].bool()
-        )
-        for name in DECODER_CONDITIONS:
-            # ``null`` keeps the real z_t and zeroes the future; ``no_hints``
-            # zeroes both, which isolates the z_t channel.
-            start = torch.zeros_like(z_hint) if name == "no_hints" else z_hint
-            total, count = model.decoder.token_loss(
-                start.detach(), hints[name].detach(), labels,
-                attention_mask=mask, chunk_size=loss_chunk_size,
-                loss_mask=loss_mask,
+        committed["shuffled"] = committed["pi_argmax"][order]
+        for horizon in horizons:
+            z_hint, real_hint, hint_valid = build_block_hints(z, horizon)
+            hindsight = _bases(proposals, z, horizon).commit(
+                Hindsight(), z[:, horizon:]
+            ).future
+            hints = {
+                name: build_block_hints(z, horizon, committed=value)[1]
+                for name, value in (*committed.items(), ("hindsight", hindsight))
+            }
+            hints["real"] = real_hint
+            hints["null"] = torch.zeros_like(z_hint)
+            hints["no_hints"] = hints["null"]
+            # Same exclusion as decoder_loss: no committed future for the tail
+            # block, so those targets are not counted.
+            loss_mask = (
+                hint_valid.unsqueeze(0)
+                & mask[:, :-1].bool()
+                & mask[:, 1:].bool()
             )
-            totals[name] += _value(total)
-        token_count += int(count)
+            for name in DECODER_CONDITIONS:
+                # ``null`` keeps the real z_t and zeroes the future; ``no_hints``
+                # zeroes both, which isolates the z_t channel.
+                start = torch.zeros_like(z_hint) if name == "no_hints" else z_hint
+                total, count = model.decoder.token_loss(
+                    start.detach(), hints[name].detach(), labels,
+                    attention_mask=mask, chunk_size=loss_chunk_size,
+                    loss_mask=loss_mask,
+                )
+                totals[name] += _value(total)
+            token_count += int(count)
     if token_count == 0:
         raise ValueError("no decoder tokens in the query batches")
 
@@ -630,11 +847,11 @@ def _verdicts(metrics) -> list[dict]:
             representation["effective_rank"], 15.0, ">",
         ),
     ]
-    if representation["periodic_rebound"] is not None:
+    if representation["max_rebound"] is not None:
         verdicts.append(
             _verdict(
-                "no_periodic_shortcut", "representation.periodic_rebound",
-                representation["periodic_rebound"], REBOUND_THRESHOLD, "<",
+                "no_periodic_shortcut", "representation.max_rebound",
+                representation["max_rebound"], REBOUND_THRESHOLD, "<",
             )
         )
     for depth in range(2, rollouts["depths"] + 1):
@@ -692,35 +909,43 @@ def collect_metrics(
     batches = list(batches)
     if not batches:
         raise ValueError("at least one query batch is required")
-    horizon = model.pred_horizon
+    horizon_range = model.config.horizon_range
+    horizons = evaluation_horizons(horizon_range)
     for labels, mask in batches:
         if mask is None:
             raise ValueError("measure needs attention masks (1 = real token)")
-        if labels.shape[1] <= horizon:
-            raise ValueError(f"query length {labels.shape[1]} must exceed pred_horizon {horizon}")
+        if labels.shape[1] <= horizon_range[1]:
+            raise ValueError(
+                f"query length {labels.shape[1]} must exceed the longest "
+                f"horizon {horizon_range[1]}"
+            )
     device = next(model.parameters()).device
     batches = [(labels.to(device), mask.to(device)) for labels, mask in batches]
     bank = F.normalize(bank.float().to(device), dim=-1)
     loss_chunk_size = loss_chunk_size or model.config.decoder.loss_chunk_size
     latents = [model.encode(labels, attention_mask=mask) for labels, mask in batches]
     sections = {
-        "representation": _representation_section(model, batches, latents),
-        "loss": _loss_section(model, batches),
-        "heads": _heads_section(model, batches, latents),
-        "policies": _policies_section(model, batches, latents, seed=seed),
+        "representation": _representation_section(model, batches, latents, horizons),
+        "loss": _loss_section(model, batches, horizons),
+        "heads": _heads_section(model, batches, latents, horizons),
+        "policies": _policies_section(model, batches, latents, horizons, seed=seed),
         "rollouts": _rollouts_section(
-            model, batches, latents, bank, depths=depths, positions=rollout_positions,
-            seed=seed, bank_chunk_size=bank_chunk_size, best_of=best_of,
+            model, batches, latents, bank, horizons, depths=depths,
+            positions=rollout_positions, seed=seed,
+            bank_chunk_size=bank_chunk_size, best_of=best_of,
         ),
-        "decoder": _decoder_section(model, batches, latents, seed=seed,
-                                    loss_chunk_size=loss_chunk_size),
+        "decoder": _decoder_section(
+            model, batches, latents, horizons, seed=seed,
+            loss_chunk_size=loss_chunk_size,
+        ),
     }
     context = {
         "checkpoint": None, "device": None,
         "examples": int(sum(labels.shape[0] for labels, _ in batches)),
         "max_length": int(max(labels.shape[1] for labels, _ in batches)),
         "tokens": int(sum(int(mask.sum()) for _, mask in batches)),
-        "pred_horizon": int(horizon),
+        "horizon_range": [int(k) for k in horizon_range],
+        "horizons": horizons,
         "candidates": int(model.config.predictor.prediction_count),
         "depths": int(depths),
         "best_of": list(best_of),
@@ -744,6 +969,35 @@ def _pairs(title, rows) -> None:
     for label, value in rows:
         print(f"{label + ':':<26}{value}")
 
+def _steady_heads(steady) -> list:
+    """The steady-state slot usage, as ``_pairs`` rows."""
+    if steady is None:
+        return []
+    live = "n/a" if steady["live_slots"] is None else steady["live_slots"]
+    return [(
+        f"positions {steady['from_position']} and up",
+        f"live slots {live}  (effective {_fmt(steady['effective_slots'])})  "
+        f"slot-horizon MI {_fmt(steady['slot_horizon_mi'])}",
+    )]
+
+def _policy_table(p) -> None:
+    """One row per commit rule: the mean over k, then each k."""
+    per_k = {k: row for k, row in p["by_horizon"].items() if row is not None}
+    if len(per_k) == 1:  # a fixed horizon: the mean is the only row
+        per_k = {}
+
+    def cells(get):
+        return [_fmt(get(row)) for row in (p, *per_k.values())]
+
+    _table(
+        [(n, *cells(lambda row, n=n: row[n])) for n in POLICY_NAMES]
+        + [(f"fixed slot {p['fixed_slot']['index']}",
+            *cells(lambda row: row["fixed_slot"]["distance"]))]
+        + [("hindsight gain over mu", *cells(lambda row: row["hindsight_gain_over_mu"])),
+           ("commit headroom", *cells(lambda row: row["commit_headroom"]))],
+        ("commit rule", "distance", *(f"k={k}" for k in per_k)),
+    )
+
 def print_report(metrics: dict) -> None:
     """Print every metric and verdict in ``collect_metrics``'s dict."""
     c, r = metrics["context"], metrics["representation"]
@@ -751,8 +1005,12 @@ def print_report(metrics: dict) -> None:
     print(f"measure: {c.get('checkpoint') or '(in-memory model)'}")
     print(
         f"device: {c.get('device') or '?'} | examples: {c['examples']} x "
-        f"{c['max_length']} | tokens: {c['tokens']:,} | k: {c['pred_horizon']} | "
+        f"{c['max_length']} | tokens: {c['tokens']:,} | "
         f"candidates: {c['candidates']} | bank: {c['bank_size']:,}"
+    )
+    print(
+        f"horizon range: {c['horizon_range']} | scored at k = "
+        f"{', '.join(map(str, c['horizons']))}"
     )
     print("=" * 78)
 
@@ -761,11 +1019,13 @@ def print_report(metrics: dict) -> None:
         ("mean vector norm", _fmt(r["mean_vector_norm"])),
         ("effective rank", f"{_fmt(r['effective_rank'])} / {c['latent_dim']}  "
                            f"({r['latents']:,} latents)"),
-        ("cos(z_t, z_t+k)", _fmt(r["temporal_cos"])),
-        ("periodic rebound", f"{_fmt(r['periodic_rebound'])}  "
-                             "(cos at k minus the lowest cos below k)"),
+        ("cos(z_t, z_t+k)", f"{_fmt(r['temporal_cos'])}  (mean over k)"),
+        ("max rebound", f"{_fmt(r['max_rebound'])}  "
+                        "(largest return of cos at any lag in the range)"),
         ("fast share", f"{_fmt(r['fast_share'])}  "
-                       "(within-document energy faster than k/2)"),
+                       f"(within-document energy faster than {FAST_SHARE_WINDOW} steps)"),
+        ("document share", f"{_fmt(r['document_share'])}  "
+                           "(between-document share of the variance)"),
         ("VISReg", " | ".join(f"{n} {_fmt(v)}" for n, v in r["visreg"].items())),
     ])
     lags = list(r["lag_cos"].items())
@@ -791,6 +1051,10 @@ def print_report(metrics: dict) -> None:
         ("hindsight shares", " ".join(_fmt(x) for x in h["hindsight_shares"])),
         ("live slots", f"{'n/a' if h['live_slots'] is None else h['live_slots']} / {len(h['hindsight_shares'])}  "
                        f"(effective {_fmt(h['effective_slots'])})"),
+        ("slot-horizon MI", f"{_fmt(h['slot_horizon_mi'])}  of at most "
+                            f"{_fmt(h['slot_horizon_mi_max'])} nats "
+                            "(near 0 = no slot is tied to a distance)"),
+        *_steady_heads(h["steady_state"]),
         ("pi NLL", f"{_fmt(h['pi_nll'])}  vs constant {_fmt(h['constant_nll'])}  "
                    f"(gain {_fmt(h['pi_gain'])} nats)"),
         ("pi accuracy", f"{_fmt(h['pi_accuracy'])}  vs majority "
@@ -802,16 +1066,16 @@ def print_report(metrics: dict) -> None:
     ])
 
     p = metrics["policies"]
-    print("\n--- policies (depth 1, distance to the real z_t+k) ---")
-    _table([(n, _fmt(p[n])) for n in ("copy", "hindsight", "pi_argmax",
-                                      "pi_sample", "mu_safe", "mu")]
-           + [(f"fixed slot {p['fixed_slot']['index']}", _fmt(p["fixed_slot"]["distance"]))],
-           ("commit rule", "distance"))
-    print(f"hindsight gain over mu: {_fmt(p['hindsight_gain_over_mu'])}")
-    print(f"commit headroom (pi-argmax - hindsight): {_fmt(p['commit_headroom'])}")
+    print("\n--- policies (depth 1, distance to the real z_t+k, mean over k) ---")
+    _policy_table(p)
+    if p["steady_state"] is None:
+        print(f"steady state: n/a (no query reaches position {STEADY_STATE_START})")
+    else:
+        print(f"steady state, positions {p['steady_state']['from_position']} and up:")
+        _policy_table(p["steady_state"])
 
     ro = metrics["rollouts"]
-    print(f"\n--- rollouts ({ro['positions']} starts, k={ro['stride']}) ---")
+    print(f"\n--- rollouts ({ro['positions']} starts, mean over k) ---")
     print("rollout error (distance to the real latent):")
     _table([(d, *(_fmt(ro["error"][n][d - 1]) for n in ROLLOUT_PATHS))
             for d in range(1, ro["depths"] + 1)], ("depth", *ROLLOUT_PATHS))
@@ -846,13 +1110,17 @@ def print_report(metrics: dict) -> None:
     for line in (
         "representation: std near 1 and effective rank > 15 = no collapse;",
         "                cos(z_t, z_t+k) 0.5-0.85 healthy, >0.95 too smooth.",
-        "                periodic rebound > 0 = the latent dips and returns by",
-        "                lag k, a periodic code the prediction loss cannot see.",
+        "                max rebound > 0 = the latent dips and returns at some lag,",
+        "                a periodic code. document share near 1 = a per-document",
+        "                constant, which is free to predict at any horizon.",
         "loss:           total is the weighted sum of the terms; H(r) is fixed",
         "                by the targets, so only KL(r||pi) can improve.",
         "heads:          pi gain > 0 = pi predicts the closest candidate from z_t.",
+        "                slot-horizon MI near its maximum = the slots are phase",
+        "                copies (which k), not different futures.",
         "policies:       hindsight needs the real future; hindsight gain over mu",
-        "                is what candidates buy, commit headroom is the rest.",
+        "                is what candidates buy, commit headroom is the rest. The",
+        "                document start flatters the averages: read the steady state.",
         "rollouts:       error is distance to the real z at t+i*k; manifold is",
         "                distance to the nearest real latent. The claim: at",
         "                depths >= 2, pi-sample stays closer to the manifold than",

@@ -20,7 +20,7 @@ DEPTH = 3
 HORIZON = 2
 
 
-def tiny_model(prediction_count: int = 4) -> JepaModel:
+def tiny_model(prediction_count: int = 4, horizon_range=(HORIZON, HORIZON)) -> JepaModel:
     torch.manual_seed(0)
     encoder = EncoderConfig(
         vocab_size=64,
@@ -38,7 +38,7 @@ def tiny_model(prediction_count: int = 4) -> JepaModel:
         decoder=DecoderConfig.from_encoder(
             encoder, sliding_window=8, num_hidden_layers=1
         ),
-        pred_horizon=HORIZON,
+        horizon_range=list(horizon_range),
         visreg=VISRegConfig(num_slices=16),
     )
     return JepaModel(config).eval()
@@ -52,7 +52,7 @@ def test_plan_decodes_every_condition_for_depth_blocks_of_k_tokens():
 
     def run():
         return generate.plan_prompt(
-            model, PROMPT, depth=DEPTH, samples=2, generator_seed=0
+            model, PROMPT, depth=DEPTH, horizon=HORIZON, samples=2, generator_seed=0
         )
 
     records = run()
@@ -76,7 +76,9 @@ def test_plan_encodes_the_prompt_exactly_once():
     calls = []
     model.encoder.register_forward_hook(lambda *args: calls.append(1))
 
-    generate.plan_prompt(model, PROMPT, depth=DEPTH, samples=2, generator_seed=0)
+    generate.plan_prompt(
+        model, PROMPT, depth=DEPTH, horizon=HORIZON, samples=2, generator_seed=0
+    )
 
     assert len(calls) == 1
 
@@ -154,3 +156,110 @@ def test_plan_cli_writes_records_with_references(saved, tmp_path, monkeypatch):
     assert by_prompt[2][0]["prompt"] == "w3 w4 w5"
     assert plans["context"]["temperature"] == 0.0
     assert "<table" in out_html.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Random horizon: one k per generated sequence (ADR 0003)
+# ---------------------------------------------------------------------------
+
+
+def test_generate_uses_one_k_for_every_block_and_repeats_with_the_seed(monkeypatch):
+    model = tiny_model(horizon_range=(2, 6))
+    used = []
+    original = model.decoder.generate
+
+    def record(*args, k, **kwargs):
+        used.append(k)
+        return original(*args, k=k, **kwargs)
+
+    monkeypatch.setattr(model.decoder, "generate", record)
+
+    def run(seed):
+        used.clear()
+        _, ids, horizon = generate.generate(
+            model, WordTokenizer(), "w3 w4 w5", 3, seed=seed, temperature=0.0,
+            device=torch.device("cpu"),
+        )
+        assert used == [horizon] * 3 and len(ids) == 3 * horizon
+        return horizon
+
+    horizons = [run(seed) for seed in range(20)]
+    assert horizons == [run(seed) for seed in range(20)]
+    assert set(horizons) == {2, 3, 4, 5, 6}
+    assert 2 <= run(None) <= 6
+
+
+@pytest.fixture()
+def random_saved(tmp_path):
+    """Random-horizon checkpoints; chunks of exactly prompt + DEPTH * hi tokens."""
+    tmp_path = tmp_path / "random"
+    model_dir, baseline_dir = tmp_path / "model", tmp_path / "baseline"
+    tiny_model(horizon_range=(2, 6)).save_pretrained(model_dir)
+    tiny_model(prediction_count=1, horizon_range=(2, 6)).save_pretrained(baseline_dir)
+    # 8 + 3 * 6 = 26 tokens are enough for every k; 25 are not.
+    rows = [torch.randint(1, 64, (n,)).tolist() for n in (26,) * 8 + (25,) * 8]
+    data_dir = tmp_path / "data"
+    DatasetDict(
+        {name: Dataset.from_dict({"input_ids": rows}) for name in ("train", "validation")}
+    ).save_to_disk(str(data_dir))
+    return model_dir, baseline_dir, data_dir, rows
+
+
+def test_plans_share_one_k_per_prompt(random_saved, tmp_path, monkeypatch):
+    model_dir, baseline_dir, data_dir, rows = random_saved
+    monkeypatch.setattr(generate, "load_tokenizer", lambda path: WordTokenizer())
+
+    def run(name, seed):
+        out, page = tmp_path / f"{name}.json", tmp_path / f"{name}.html"
+        generate.main([
+            "--model", str(model_dir), "--baseline-model", str(baseline_dir),
+            "--fineweb-dir", str(data_dir), "--plan-depth", str(DEPTH),
+            "--samples", "2", "--num-prompts", "16", "--prompt-length", "8",
+            "--prompt", "w3 w4 w5", "--seed", str(seed),
+            "--json", str(out), "--html", str(page), "--device", "cpu",
+        ])
+        return json.loads(out.read_text()), page.read_text()
+
+    document, page = run("a", 1)
+    records = document["records"]
+    assert document["context"]["horizon_range"] == [2, 6]
+    by_prompt = {}
+    for record in records:
+        by_prompt.setdefault(record["prompt_index"], []).append(record)
+    # The eight long chunks plus --prompt; the 25-token chunks have no room.
+    assert len(by_prompt) == 9
+
+    horizons = []
+    for prompt_records in by_prompt.values():
+        (k,) = {r["horizon"] for r in prompt_records}
+        horizons.append(k)
+        assert f"k = {k}" in page
+        assert {r["condition"] for r in prompt_records} == {
+            "pi_argmax", "pi_sample", "mu", "baseline"
+        }
+        for r in prompt_records:
+            assert [len(block) for block in r["token_ids"]] == [k] * DEPTH
+            if r["reference"] is None:
+                continue
+            assert [len(block.split()) for block in r["reference"]] == [k] * DEPTH
+            # The reference is the DEPTH * k tokens right after the prompt.
+            words = r["prompt"].split() + " ".join(r["reference"]).split()
+            assert [int(w[1:]) for w in words] in [
+                row[: 8 + DEPTH * k] for row in rows
+            ]
+    assert len(set(horizons)) > 1
+
+    assert run("b", 1)[0]["records"] == records
+    other = {r["prompt_index"]: r["horizon"] for r in run("c", 2)[0]["records"]}
+    assert list(other.values()) != horizons
+
+
+def test_the_baseline_must_have_the_same_horizon_range(saved, random_saved, monkeypatch):
+    model_dir = random_saved[0]
+    _, fixed_baseline, data_dir = saved
+    monkeypatch.setattr(generate, "load_tokenizer", lambda path: WordTokenizer())
+    with pytest.raises(ValueError, match="horizon_range"):
+        generate.main([
+            "--model", str(model_dir), "--baseline-model", str(fixed_baseline),
+            "--fineweb-dir", str(data_dir), "--plan-depth", "2", "--device", "cpu",
+        ])

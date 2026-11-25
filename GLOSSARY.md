@@ -9,8 +9,8 @@ The encoder's representation `z_t` of the text up to position `t`.
 _Avoid_: hidden, embedding, state
 
 **Horizon**:
-The number of tokens `k` between a latent and the future latent the predictor aims at.
-_Avoid_: pred_horizon (in prose), block size
+The number of tokens `k`, random within `horizon_range`, between a latent and the future it aims at. One `k` is drawn per batch, generation, plan or rollout; it is also the decoder's block length and the rollout stride. The predictor never sees it. A range `[k, k]` is a **fixed horizon**.
+_Avoid_: pred_horizon (the legacy constructor argument of old checkpoints), block size
 
 **Candidate**:
 One of the `P` future latents the predictor proposes for `z_{t+k}` from a single `z_t`.
@@ -59,6 +59,26 @@ _Avoid_: drift, multi-step loss
 **Manifold distance**:
 The distance from a latent to its nearest neighbour in a bank of real encoder latents. A clear future is close to some real latent; a blurry average is not.
 _Avoid_: realism, sharpness score
+
+**Evaluation horizons**:
+The fixed values of `k` measurement scores and averages over. Their residues modulo 10 all differ, so no single phase of the observed cycle is favoured.
+_Avoid_: test horizons, horizon grid
+
+**Steady state**:
+Positions 80 and up, where the document start no longer dominates.
+_Avoid_: late positions, tail
+
+**Max rebound**:
+The largest return of similarity at any lag up to the longest horizon: cos at lag L minus the lowest cos at a shorter lag. A drifting latent has none; a periodic one does, whatever its period.
+_Avoid_: periodic rebound (the older check, at lag k only)
+
+**Slot-horizon mutual information**:
+How much the hindsight slot says about `k`. Near its maximum, the candidates are phase copies, one per `k`. Near 0, no slot is tied to a distance from `z_t`; slots tied to an absolute phase (a function of `t + k`) are not seen.
+_Avoid_: slot MI
+
+**Document share**:
+The between-document share of the latent variance. A latent that is constant within a document is free to predict at any horizon.
+_Avoid_: document identity (as a metric name)
 
 **Path validity**:
 Synthetic world only: the fraction of rollouts whose steps 1..i all lie on a state that is a successor of the previous step's state.

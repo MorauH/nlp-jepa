@@ -1,6 +1,6 @@
 # 007: Random horizon per batch, hidden from the predictor
 
-Status: open (decision recorded in ADR 0003)
+Status: implemented (decision recorded in ADR 0003; pending on the cluster: the gate runs of the experiment plan)
 
 ## Why
 

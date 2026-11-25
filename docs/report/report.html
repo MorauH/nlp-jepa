@@ -67,10 +67,11 @@ prediction step <em>commits</em> to exactly one candidate instead of
 averaging. Training uses a relaxed winner-takes-all objective, and a separate
 detached head estimates the mean future \(\mu\), which serves as an in-model
 averaging reference.
-We train the model on FineWeb-Edu with a horizon of \(k = 20\) tokens and
+We train the model on FineWeb-Edu with a horizon of \(k\) tokens that is drawn
+at random from 10 to 30 for every batch and never shown to the predictor, and
 compare committed rollouts with the \(\mu\) path and with an otherwise
 identical single-candidate model (\(P = 1\)), at depths of up to four steps
-(80 tokens).
+(40 to 120 tokens, depending on the \(k\) drawn).
 <span class="todo">TODO: one or two sentences with the main result, e.g. manifold distance and best-of-K rollout error at depth 4, with seeds.</span>
 </p>
 </section>
@@ -110,7 +111,8 @@ different domain: in a JEPA over <em>text</em>, does
 <strong>committing</strong> to one candidate at every step keep a
 <em>multi-step</em> latent rollout close to the latents real text produces,
 where averaging drifts away? The predictor proposes
-\(P\) candidates for the latent \(k\) tokens ahead, and a learned distribution
+\(P\) candidates for the latent \(k\) tokens ahead, where \(k\) is random and
+hidden from the predictor, and a learned distribution
 \(\pi\) says how likely each candidate is to be the closest to the real future.
 A <em>commit</em> chooses exactly one candidate according to a <em>policy</em>
 (sampling from \(\pi\), its argmax, or, during training, the candidate closest
@@ -125,8 +127,9 @@ The prediction mechanism is not new (Section&nbsp;2). Our contributions are
 its application to language, the rollout analysis, and the evaluation:
 </p>
 <ol>
-  <li>A finite-hypothesis JEPA for text over token-level latents with a
-      \(k\)-token horizon. It has an explicit commitment step, a win-probability
+  <li>A finite-hypothesis JEPA for text over token-level latents with a random
+      horizon of \(k\) tokens, drawn per batch and not shown to the predictor.
+      It has an explicit commitment step, a win-probability
       head \(\pi\), and a detached mean-future head \(\mu\) that provides an
       in-model averaging reference and a per-context uncertainty
       estimate (\(\lvert\mu\rvert\)) at no cost to the rest of the model.</li>
@@ -232,14 +235,16 @@ latent space.
 A causal transformer encoder maps tokens \(x_{1..T}\) to latents
 \(z_{1..T} \in \mathbb{R}^D\). The latent \(z_t\) summarizes the prefix up to
 \(t\). The prediction target is the encoder's own latent \(k\) tokens ahead,
-with gradients stopped: \(y_t = \mathrm{sg}(z_{t+k})\). There is no separate
+with gradients stopped: \(y_t = \mathrm{sg}(z_{t+k})\). The horizon \(k\) is
+drawn once per batch, uniformly from 10 to 30, and shared by every position in
+it (Section&nbsp;3.7 gives the reason). There is no separate
 target encoder. Collapse is prevented by a regularizer on the encoder latents
 (Section&nbsp;3.4).
 </p>
 
 <h3>3.2&nbsp; Predictor: candidates, \(\pi\) and \(\mu\)</h3>
 <p>
-The predictor sees only \(z_t\). It expands \(z_t\) into \(P\) slots with a
+The predictor sees only \(z_t\). In particular it does not see \(k\). It expands \(z_t\) into \(P\) slots with a
 per-slot linear map, mixes the slots with a small non-causal transformer, and
 produces for each slot \(i\) a residual \(\delta_i\) and a logit. The
 <em>candidates</em> are
@@ -254,6 +259,13 @@ closest to the real future. A separate MLP on \(\mathrm{sg}(z_t)\) outputs
 \(\hat y = y / \lVert y \rVert\). Its input is detached, so \(\mu\) only
 <em>measures</em>: \(\lvert\mu\rvert \approx 1\) when the future is
 predictable and shrinks when the futures diverge.
+</p>
+<p>
+Because \(k\) is hidden, a candidate is one possible future some 10 to 30
+tokens ahead, at a distance the predictor cannot state, and the expectation in
+\(\mu\) is over \(k\) as well as over continuations. Both
+\(\lvert\mu\rvert\) and the spread of the candidates therefore mix uncertainty
+about the content with uncertainty about the distance.
 </p>
 
 <h3>3.3&nbsp; Commitment</h3>
@@ -318,8 +330,11 @@ unweighted sum of VISReg and \(\mathcal{L}_{\text{commit}}\), with all weights
 <p>
 A rollout of depth \(n\) chains commits without going back to tokens:
 \(z^{(0)} = z_t\) and \(z^{(i)} = \operatorname{commit}(\text{predictor}(z^{(i-1)}), \text{policy})\).
-Each step advances the plan by \(k\) tokens, so depth 4 with \(k = 20\) plans
-80 tokens ahead. The predictor is trained only on real latents. Rollout is
+Each step advances the plan by \(k\) tokens, with \(k\) drawn once per rollout,
+so depth 4 plans 40 to 120 tokens ahead. The rollout itself does not use
+\(k\): it only decides which real latents and tokens the steps are compared
+with. Rollout error therefore depends on \(k\); manifold distance does not.
+The predictor is trained only on real latents. Rollout is
 used for evaluation only, so the experiments test whether committed latents
 remain usable inputs <em>without</em> being trained for it. The \(\mu\) path,
 \(z^{(i)} = \sqrt{D}\,\mu(z^{(i-1)}) / \lVert\mu(z^{(i-1)})\rVert\), is the
@@ -329,7 +344,8 @@ in-model averaging reference.
 <h3>3.6&nbsp; Decoder and hints</h3>
 <p>
 A small causal token transformer with a sliding window of 32 tokens generates
-text. Each token position belongs to a block of \(k\) tokens. Its
+text. Each token position belongs to a block of \(k\) tokens, with the batch's
+\(k\). The decoder is not told \(k\); it only sees where its blocks fall. Its
 <em>hint</em> is a projection of the latent at the block start plus a
 projection of the committed future for that block. The hint is added to the
 token embeddings and re-injected before every layer through zero-initialized
@@ -340,13 +356,15 @@ from the hint.
 During decoder training the committed future is chosen by hindsight. This is
 deliberate teacher forcing, and it leaks information. The hint is still a
 predictor output, but the choice among \(P\) candidates was made with the real
-future, so it carries up to \(\log_2 P = 3\) bits about it. Hints chosen by
-\(\pi\)-argmax carry none. Validation and all reported decoder results use
+future, so it carries up to \(\log_2 P = 3\) bits about it. A hindsight choice
+can also reveal \(k\) to the decoder, on top of those bits. Hints chosen by
+\(\pi\)-argmax carry neither, because \(\pi\) sees neither the future nor
+\(k\). Validation and all reported decoder results use
 \(\pi\)-argmax unless stated otherwise. The last block of a sequence has no
 latent \(k\) tokens ahead and is excluded from the decoder loss.
 </p>
 
-<h3>3.7&nbsp; Training: a decoder gradient into the encoder</h3>
+<h3>3.7&nbsp; Training: a decoder gradient into the encoder, and a hidden horizon</h3>
 <p>
 The encoder, predictor and decoder are trained together. The objective is the
 JEPA loss plus \(w_{\text{dec}}\) times the decoder cross-entropy. The decoder
@@ -359,14 +377,47 @@ inference. The predictor is therefore trained by the commitment loss alone.
 </p>
 <p>
 We first trained the JEPA alone and the decoder afterwards against the frozen
-JEPA (\(w_{\text{dec}} = 0\)). That encoder found a shortcut. Its latent
+JEPA (\(w_{\text{dec}} = 0\)), with a fixed horizon \(k = 20\). That encoder found a shortcut. Its latent
 oscillates with a period of 10 tokens, which divides \(k = 20\): the mean
 cosine between latents is \(-0.15\) at a lag of 5 tokens and \(0.96\) at a
 lag of 20. 93% of the variance within a document is this oscillation. VISReg
 asks for spread, and the prediction loss cannot see a component whose period
 divides \(k\), so nothing in the JEPA loss alone rewards content. The two-stage
-recipe is kept as an ablation (Table 2).
-<span class="todo">TODO: \(w_{\text{dec}}\) from the sweep; confirm the shortcut is gone (lag profile, periodic rebound)</span>
+recipe is kept as an ablation (Table 2), trained with the random horizon
+described below.
+</p>
+<p>
+The decoder gradient weakened the shortcut without removing it. A joint run
+with the same fixed \(k = 20\) (\(w_{\text{dec}} = 0.3\), one seed) took the
+periodic rebound, the cosine at lag \(k\) minus the lowest cosine at a shorter
+lag, from 1.02 to 0.31, against a limit of 0.05. Its latent still repeats every
+10 tokens (cosine 0.65 at a lag of 5, 0.96 at a lag of 10). From position 80 on,
+copying \(z_t\) was as close to \(z_{t+20}\) as the best of the eight
+candidates in hindsight (0.032 for both), and \(\mu\) was worse (0.038).
+</p>
+<p>
+The second change is therefore the random, hidden horizon. Were \(k\) random
+but known to the predictor, a periodic latent would stay predictable, since
+\(z_t\) and \(k\) together give its phase at \(t + k\). With \(k\) hidden,
+\(z_t\) does not determine the phase of \(z_{t+k}\), and a single prediction
+pays for the cycle. On the two existing encoders, without retraining them, replacing the
+fixed \(k\) by a random one raises the distance from \(z_t\) to \(z_{t+k}\)
+past position 80 from 0.032 to 0.426 (joint) and from 0.021 to 1.348
+(two-stage). The same \(k\) is the prediction offset, the decoder block
+length, the rollout stride and the length of a generated block, so the model
+has one meaning of "the future".
+</p>
+<p>
+Two escapes remain. Winner-takes-all can absorb the cycle: eight copies of the
+latent spread over the phases of one period bring the hindsight distance under
+random \(k\) back to 0.043 on the joint encoder, and candidates would then
+stand for "which \(k\)" instead of "which future". \(\pi\) does not
+correct this, since its target \(r\) is detached. \(P = 1\) has no such
+escape, so the main run and its baseline may end up with different encoders. We
+measure it with the mutual information between the hindsight slot and \(k\)
+(Section&nbsp;4.4). And a latent that is constant within a document is free to
+predict at any \(k\); only the decoder gradient works against it.
+<span class="todo">TODO: \(w_{\text{dec}}\) from the sweep; result of the gate runs (max rebound, slot-horizon mutual information, document share)</span>
 </p>
 
 <!-- ===================================================================== -->
@@ -389,7 +440,7 @@ validation chunk continues a training document.
     <tr><td>Encoder</td><td>causal, 8 layers, width 448, 8 heads, SwiGLU 896, RoPE, context 1024</td></tr>
     <tr><td>Predictor</td><td>reads \(z_t\) only; \(P = 8\) slots, 2 non-causal layers, width 448</td></tr>
     <tr><td>Decoder</td><td>4 layers, width 448, sliding window 32, tied embeddings, per-layer hint</td></tr>
-    <tr><td>Horizon</td><td>\(k = 20\) tokens</td></tr>
+    <tr><td>Horizon</td><td>\(k\) uniform on 10 to 30 tokens, drawn per batch, not shown to the model</td></tr>
     <tr><td>Commitment loss</td><td>\(s\): 1.0 → 0.1 over 30%, \(\varepsilon = 0.05\), diversity 0.5 (margin 0.5)</td></tr>
     <tr><td>VISReg</td><td>scale, shape, center weights 1; 256 slices</td></tr>
     <tr><td>Optimizer</td><td>AdamW, lr \(4\cdot10^{-4}\), batch 24, 3 epochs, wd 0.01</td></tr>
@@ -409,18 +460,25 @@ validation chunk continues a training document.
     <tr><td>\(P = 4\)</td><td>four candidates</td><td>Sensitivity to \(P\)</td></tr>
     <tr><td>No annealing</td><td>\(s\) fixed at 0.1</td><td>Does annealing prevent dead candidates?</td></tr>
     <tr><td>No diversity</td><td>diversity weight 0</td><td>Is the diversity term needed?</td></tr>
+    <tr><td>Fixed horizon</td><td><code>horizon_range = [20, 20]</code></td><td>Is the periodic shortcut caused by a fixed \(k\)?</td></tr>
     <tr><td>Two-stage</td><td>\(w_{\text{dec}} = 0\); decoder trained afterwards on the frozen JEPA</td><td>Does the decoder gradient remove the periodic shortcut and make the latent carry content?</td></tr>
     <tr><td>Decoder: \(\pi\)-argmax hints</td><td>decoder trained on \(\pi\)-argmax hints</td><td>Cost and benefit of hindsight teacher forcing</td></tr>
     <tr><td>MDN predictor <span class="muted">(optional)</span></td><td>mixture density predictor, as in MDN-VJEPA</td><td>Finite candidates vs a mixture likelihood <span class="todo">TODO: decide; needs code</span></td></tr>
   </tbody>
   <caption>Table 2. Runs. Each runs with <span class="todo">TODO: n</span> seeds.
+  Every run except "Fixed horizon" uses the same horizon range, 10 to 30.
   Running variants requires ticket 002.</caption>
 </table>
 
 <h3>4.4&nbsp; Metrics</h3>
 <ul>
+  <li><strong>Evaluation horizons.</strong> Everything compared with the future
+      is scored at seven fixed values, \(k = 11, 14, \dots, 29\), and averaged.
+      Their residues modulo 10 all differ, so no phase of the observed cycle is
+      favoured. The fixed-horizon run is scored at its own \(k\).</li>
   <li><strong>Rollout error</strong> at depth \(i\): \(d(z^{(i)}, z_{t+ik})\),
-      the distance to the latent of the real continuation.</li>
+      the distance to the latent of the real continuation, averaged over the
+      evaluation horizons, with the same starting positions for each.</li>
   <li><strong>Best-of-\(K\) rollout error</strong>: the lowest error over
       \(K\) independent \(\pi\)-sample rollouts, with whole trajectories
       compared (ticket 005).</li>
@@ -431,6 +489,23 @@ validation chunk continues a training document.
       what "on the manifold" means. It never compares against the realized
       continuation, so a rollout on another plausible branch is not
       penalized.</li>
+  <li><strong>Max rebound</strong>: over every lag \(L\) from 2 to the longest
+      horizon (30, or 20 for the fixed-horizon run), the
+      largest difference between the mean cosine at lag \(L\) and the lowest one
+      at a shorter lag. A drifting latent has a rebound of at most 0; a periodic
+      one does not, whatever its period. The limit is 0.05.</li>
+  <li><strong>Slot-horizon mutual information</strong>: between the hindsight
+      slot and \(k\). Near its maximum (\(\ln 7 \approx 1.9\) nats for seven
+      horizons), the slots are phase copies. Near 0, no slot is tied to a
+      distance from \(z_t\). A slot tied to an absolute phase is not seen: it
+      wins by \(t + k\), which averages out over \(t\).
+      It is not defined for a fixed \(k\) or \(P = 1\).</li>
+  <li><strong>Document share</strong>: the between-document share of the latent
+      variance, past the first 20 positions.</li>
+  <li><strong>Steady-state rows</strong>: the depth-1 distances and slot usage
+      over positions 80 and up, next to the all-position ones. In the joint
+      fixed-\(k\) run, positions below 40 were 6% of all positions but about
+      70% of the gap between \(\mu\) and hindsight.</li>
   <li><strong>Path validity</strong> and <strong>branch entropy</strong>
       (synthetic only, where the valid transitions are known).</li>
   <li><strong>Decoder cross-entropy</strong> under different hints:
@@ -460,6 +535,10 @@ main run of the same seed.
 <div class="hyp"><strong>H2 (coverage).</strong> At depth 4, best-of-16 \(\pi\)-sample rollout error is lower than the rollout error of the \(\mu\) path and of the \(P = 1\) model.</div>
 <div class="hyp"><strong>H3 (stability).</strong> Hindsight rollout error grows more slowly with depth than \(\mu\)-path error: its increase from depth 1 to depth 4 is lower.</div>
 <div class="hyp"><strong>H4 (use).</strong> The decoder uses the committed future: shuffled-hint cross-entropy exceeds \(\pi\)-argmax cross-entropy by more than 0.05 nats.</div>
+<p class="muted">The horizon protocol (a random, hidden \(k\) instead of
+\(k = 20\)) was changed after two single-seed runs, the two-stage and the joint
+run of Section&nbsp;3.7, and before the grid of Table 2: the hypotheses were
+fixed, the recipe was not.</p>
 <p class="muted">If a hypothesis fails, we report it as failed. We do not change the metric after seeing the results.</p>
 
 <!-- ===================================================================== -->
@@ -548,8 +627,12 @@ that the candidates are used:
 effective rank of the latents, VISReg terms, candidate usage (live and
 effective slots), \(\pi\)'s gain in nats over a constant distribution, and
 \(\mu\) calibration (measured \(\mu\)-direction distance against
-\(2 - 2\lvert\mu\rvert\)).
-<span class="todo">TODO: table from <code>python -m jepa measure --json</code> (sections representation, loss, heads)</span>
+\(2 - 2\lvert\mu\rvert\)). The table also reports max rebound, document share
+and slot-horizon mutual information, and the all-position rows against the
+steady-state ones. Where models are compared, each encoder's max rebound is
+listed, because the \(P = 1\) and \(P = 8\) encoders may differ in
+periodicity.
+<span class="todo">TODO: table from <code>python -m jepa measure --json</code> (sections representation, loss, heads, policies)</span>
 </p>
 
 <h3>5.3&nbsp; Rollouts on FineWeb-Edu</h3>
@@ -571,7 +654,7 @@ effective slots), \(\pi\)'s gain in nats over a constant distribution, and
     <tr><td>\(\mu\) path</td><td class="todo-cell" colspan="4">TODO</td></tr>
     <tr><td>\(P = 1\) model</td><td class="todo-cell" colspan="4">TODO</td></tr>
   </tbody>
-  <caption>Table 4. Main result. Depth \(i\) plans \(20i\) tokens ahead. Mean ± std over seeds. H1–H3.</caption>
+  <caption>Table 4. Main result. Depth \(i\) plans \(ik\) tokens ahead; errors are means over the evaluation horizons. Mean ± std over seeds. H1–H3.</caption>
 </table>
 <figure>
   <div class="placeholder-figure">TODO — Figure 2: manifold distance and best-of-K rollout error vs depth on FineWeb-Edu,
@@ -591,7 +674,7 @@ effective slots), \(\pi\)'s gain in nats over a constant distribution, and
     <tr><td>shuffled</td><td class="todo-cell">TODO</td></tr>
     <tr><td>null</td><td class="todo-cell">TODO</td></tr>
   </tbody>
-  <caption>Table 5. Decoder cross-entropy by hint (H4). Hint use = shuffled − \(\pi\)-argmax.
+  <caption>Table 5. Decoder cross-entropy by hint (H4), token-weighted over blocks of \(k\) tokens for each evaluation horizon. Hint use = shuffled − \(\pi\)-argmax.
   Commit headroom = \(\pi\)-argmax − hindsight.</caption>
 </table>
 
@@ -600,7 +683,10 @@ effective slots), \(\pi\)'s gain in nats over a constant distribution, and
 For fixed, seeded validation prompts, we plan four blocks ahead in latent
 space and decode each plan greedily, without re-encoding. We compare
 \(\pi\)-sample plans (three samples), the \(\pi\)-argmax plan, the \(\mu\) plan,
-the \(P = 1\) model's plan, and the real continuation. The decoder was trained
+the \(P = 1\) model's plan, and the real continuation. Each prompt draws one
+block length \(k\), shared by every column and stated with the prompt; a plan
+is \(4k\) tokens long. The committed latents do not depend on \(k\). The
+decoder was trained
 on committed candidates, so decoding the \(\mu\) plan is out of distribution
 for it. The \(P = 1\) model, whose decoder was trained on its own single
 prediction, is the fair comparison.
@@ -608,12 +694,17 @@ prediction, is the fair comparison.
 </p>
 <figure>
   <div class="placeholder-figure">TODO — Figure 3: side-by-side decoded continuations (prompt · real · π-sample ×3 · π-argmax · μ · P=1),
-    80 tokens each, prompts chosen by seed, not by hand.</div>
-  <figcaption>Figure 3. Decoded latent plans.</figcaption>
+    four blocks of k tokens each, with k stated per prompt; prompts and k chosen by seed, not by hand.</div>
+  <figcaption>Figure 3. Decoded latent plans, with the \(k\) of each prompt.</figcaption>
 </figure>
 
 <h3>5.6&nbsp; Ablations</h3>
-<p><span class="todo">TODO: one table, main metric (depth-4 manifold distance and best-of-16 error) per ablation in Table 2, plus live slots</span></p>
+<p>The fixed-horizon run joins the other ablations here. Its rollout errors are
+measured at \(k = 20\) only, so it is compared on manifold distance and on the
+representation metrics (max rebound, document share), with two caveats: its max
+rebound scans lags up to 20 rather than 30, and its rollouts start from
+different positions, because a start needs four times the longest horizon.
+<span class="todo">TODO: one table, main metric (depth-4 manifold distance and best-of-16 error) per ablation in Table 2, plus live slots, slot-horizon mutual information and max rebound</span></p>
 
 <!-- ===================================================================== -->
 <h2>6&nbsp; Discussion</h2>
@@ -635,17 +726,24 @@ second model. <span class="todo">TODO: relation between |μ| and the gap between
 <p>
 <strong>Candidate usage.</strong> In earlier runs only a few of the eight
 candidates won regularly. Annealing and the margin-based diversity term target
-this. <span class="todo">TODO: report live/effective slots; link to the head-growth direction in <code>docs/vision.md</code></span>
+this. Live slots alone do not show that the candidates stand for different
+futures: with a random horizon, candidates that are copies of one latent at
+different phases would all be live. We read them with the slot-horizon mutual
+information: a high value means phase copies, and a low one is necessary but not
+sufficient for different futures (Section&nbsp;4.4).
+<span class="todo">TODO: report live/effective slots with the mutual information; link to the head-growth direction in <code>docs/vision.md</code></span>
 </p>
 
 <!-- ===================================================================== -->
 <h2>7&nbsp; Limitations</h2>
 <ul>
-  <li>One small model scale and one horizon (\(k = 20\)). <span class="todo">TODO: compute budget</span></li>
+  <li>One small model scale and one horizon range (10 to 30 tokens). The
+      predictor cannot say how far ahead a candidate lies, so rollout errors and
+      decoded blocks use a \(k\) it did not aim at. <span class="todo">TODO: compute budget</span></li>
   <li>Rollouts are evaluated, not trained: the predictor never sees its own
       outputs as inputs. A multi-step training loss is a natural extension.</li>
   <li>Decoder training uses hindsight hints, which carry up to 3 bits about
-      the real future per block. Reported decoder numbers use \(\pi\)-argmax
+      the real future per block and can reveal \(k\). Reported decoder numbers use \(\pi\)-argmax
       hints.</li>
   <li>Manifold distance uses a finite bank of real latents (50k). Distances
       shrink as the bank grows, so only comparisons at a fixed bank size are
@@ -666,7 +764,8 @@ this. <span class="todo">TODO: report live/effective slots; link to the head-gro
 <p>Code: <span class="todo">TODO: repository URL and commit</span>. Commands:</p>
 <pre><code>python -m jepa train-tokenizer
 python -m jepa prepare-data
-python -m jepa train --config docs/experiments/joint-decoder.json  # joint training
+python -m jepa train --config docs/experiments/joint-decoder.json  # joint training, random horizon
+python -m jepa train --config docs/experiments/fixed-horizon.json --output-dir runs/fixed-horizon  # fixed k = 20
 python -m jepa measure --model runs/jepa --json runs/jepa/metrics.json
 python docs/report/synthetic.py                        # Section 5.1: synthetic.json, synthetic.svg</code></pre>
 <p class="muted">Variant runs (P = 1, ablations, seeds) need ticket 002.</p>
