@@ -134,8 +134,11 @@ class CommitmentLoss(nn.Module):
     candidates, ``(B, T, P)`` win-probability logits pi, and a ``(B, T, D)``
     mean future mu.  The single-prediction invariance term is replaced by:
 
-    * a relaxed winner-takes-all move loss that pulls each target toward its
-      nearest candidate (with a small uniform component so no candidate dies),
+    * a relaxed winner-takes-all move loss that pulls each candidate toward
+      the (detached) target, weighted by a soft assignment that favors the
+      nearest candidate (with a small uniform component so no candidate dies).
+      Candidates are ``z_t + delta``, so this gradient also reaches ``z_t``
+      directly and pulls it toward ``z_{t+k}``,
     * a cross-entropy that trains pi to predict the same soft assignment from
       ``z_t`` alone (which candidate will be closest; used for sampling),
     * a regression of mu onto the normalized target, so mu learns
