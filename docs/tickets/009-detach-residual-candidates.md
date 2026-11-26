@@ -1,8 +1,7 @@
 # 009: Stop the move loss from pulling z_t toward z_{t+k}
 
-Status: optional, open. Run only if ticket 008's gate shows that the
-per-document code persists (document share stays above 0.60). Needs an ADR of
-its own when taken up.
+Status: moot. Its condition was not met: ticket 008's run dropped document
+share to 0.04 (`RUNS.md` §0b). ADR 0005 took the second fallback instead.
 
 ## Why
 

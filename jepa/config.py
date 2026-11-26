@@ -343,6 +343,7 @@ class CommitmentLossConfig(PretrainedConfig):
         temperature_start: float = 1.0,
         anneal_fraction: float = 0.3,
         smoothing: float = 0.05,
+        move_target_gradient: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -370,6 +371,12 @@ class CommitmentLossConfig(PretrainedConfig):
         self.anneal_fraction = anneal_fraction
         # Uniform smoothing of the soft assignment (relaxed WTA).
         self.smoothing = smoothing
+        # ADR 0005: let the move term's gradient reach the target z_{t+k}, so
+        # the encoder pays for a latent the candidates cannot reach.  π, μ,
+        # diversity and every diagnostic keep the target detached.  False (the
+        # default, and every checkpoint older than the field) detaches it
+        # everywhere.
+        self.move_target_gradient = move_target_gradient
 
     def validate(self) -> "CommitmentLossConfig":
         for name in ("move_w", "pi_w", "mu_w", "diversity_w"):
@@ -386,6 +393,11 @@ class CommitmentLossConfig(PretrainedConfig):
             raise ValueError("anneal_fraction must be in (0, 1]")
         if self.diversity_margin is None or not -1.0 <= self.diversity_margin < 1.0:
             raise ValueError("diversity_margin must be in [-1, 1)")
+        if not isinstance(self.move_target_gradient, bool):
+            raise ValueError(
+                "move_target_gradient must be true or false; "
+                f"got {self.move_target_gradient!r}"
+            )
         return self
 
 

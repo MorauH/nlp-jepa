@@ -141,6 +141,15 @@ the cost of rendering a predicted future is visible per epoch. `"real"` with
 `decoder_w = 0` is an error. Checkpoints without the field load as
 `"committed"`. The decoder stage ignores it.
 
+`CommitmentLossConfig.move_target_gradient`
+([ADR 0005](adr/0005-move-gradient-into-target.md), preset
+`joint-real-hint-move-target.json`) lets the move term's gradient reach the
+target z_{t+k} as well: `horizon_targets(..., detach=False)` keeps its graph
+and `CommitmentLoss` detaches it for every other term and diagnostic. The
+encoder then pays for a latent the candidates cannot reach, the counterweight to
+the real hint's reward for detail; `decoder_w` balances the two. The default,
+`false`, detaches the target everywhere (and is what older checkpoints load as).
+
 `--stage decoder` loads a checkpoint from `--from`, freezes its encoder and
 predictor (they run under `torch.no_grad()`), attaches a fresh decoder, and
 trains only the decoder on committed futures. The decoder stage writes to

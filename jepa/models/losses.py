@@ -135,10 +135,12 @@ class CommitmentLoss(nn.Module):
     mean future mu.  The single-prediction invariance term is replaced by:
 
     * a relaxed winner-takes-all move loss that pulls each candidate toward
-      the (detached) target, weighted by a soft assignment that favors the
-      nearest candidate (with a small uniform component so no candidate dies).
+      the target, weighted by a soft assignment that favors the nearest
+      candidate (with a small uniform component so no candidate dies).
       Candidates are ``z_t + delta``, so this gradient also reaches ``z_t``
-      directly and pulls it toward ``z_{t+k}``,
+      directly and pulls it toward ``z_{t+k}``.  The target is detached
+      unless ``move_target_gradient`` (ADR 0005): then the move term also
+      pulls ``z_{t+k}`` toward the candidates that cover it,
     * a cross-entropy that trains pi to predict the same soft assignment from
       ``z_t`` alone (which candidate will be closest; used for sampling),
     * a regression of mu onto the normalized target, so mu learns
@@ -204,6 +206,10 @@ class CommitmentLoss(nn.Module):
         candidates = futures.candidates
         batch, seq, count, _ = candidates.shape
         device = candidates.device
+        # Only the move term may see the target's graph (ADR 0005); every
+        # other term and diagnostic reads it detached.
+        move_target = target if self.config.move_target_gradient else target.detach()
+        target = target.detach()
 
         if mask is None:
             valid = torch.ones((batch, seq), dtype=torch.bool, device=device)
@@ -223,7 +229,7 @@ class CommitmentLoss(nn.Module):
         # The one candidate-target distance in the codebase: fp32, normalized,
         # computed from the dot product (no (B, T, P, D) difference).  The
         # clamp hides fp32 rounding when a candidate equals the target.
-        d = futures.distances(target)
+        d = futures.distances(move_target)
         d_detached = d.detach()
 
         # Adaptive temperature: relative differences stay usable even as the
@@ -323,7 +329,8 @@ class CommitmentLoss(nn.Module):
             futures: :class:`jepa.models.commitment.Futures` with
                 ``(B, T, P, D)`` candidates, ``(B, T, P)`` pi logits and
                 ``(B, T, D)`` mu.
-            target: ``(B, T, D)``.
+            target: ``(B, T, D)``.  Detached here for every term except
+                ``move`` with ``config.move_target_gradient``.
             mask: ``(B, T)``, 1 => valid prediction position.
             progress: 0-dim tensor with the fraction of training completed, or
                 ``None`` for the final temperature (evaluation).

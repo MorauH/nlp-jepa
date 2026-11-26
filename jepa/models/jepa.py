@@ -15,10 +15,11 @@ from .losses import CommitmentLoss, LossOutput, VISReg
 from .predictor import PredictorModel
 
 
-def horizon_targets(latents, attention_mask, horizon):
+def horizon_targets(latents, attention_mask, horizon, *, detach=True):
     """Return ``(target, valid)``: the latent ``horizon`` tokens ahead.
 
-    ``target[:, t]`` is the detached ``latents[:, t + horizon]``.  ``valid`` is
+    ``target[:, t]`` is ``latents[:, t + horizon]``, detached unless
+    ``detach=False`` (the move term's target under ADR 0005).  ``valid`` is
     the ``(batch, seq)`` mask of positions where token ``t`` and token
     ``t + horizon`` are both real; elsewhere ``target`` is data that must not be
     used.  The shapes do not depend on ``horizon``, so a 0-dim tensor never
@@ -32,7 +33,8 @@ def horizon_targets(latents, attention_mask, horizon):
     if attention_mask is not None:
         real = attention_mask.bool()
         valid = valid & real & real[:, ahead]
-    return latents[:, ahead, :].detach(), valid
+    target = latents[:, ahead, :]
+    return (target.detach() if detach else target), valid
 
 
 def build_block_hints(latents, horizon, committed=None):
@@ -281,7 +283,12 @@ class JepaModel(PreTrainedModel):
         """
         self._check_length(labels)
         latents = self.encode(labels, attention_mask)
-        target, valid = horizon_targets(latents, attention_mask, horizon)
+        # The commitment loss detaches the target for every term but ``move``
+        # (and for that one too unless ``move_target_gradient``, ADR 0005).
+        target, valid = horizon_targets(
+            latents, attention_mask, horizon,
+            detach=not self.config.commitment.move_target_gradient,
+        )
 
         # From each latent[i, t, :] predict latent[i, t+k, :].  Positions with
         # no real token k ahead are predicted too and masked, so no shape
@@ -316,7 +323,9 @@ class JepaModel(PreTrainedModel):
                 # Detached: a hindsight choice used the real future, so a
                 # gradient through it would train the JEPA on information that
                 # does not exist at inference.
-                committed = futures.commit(rule, target if rule.needs_target else None)
+                committed = futures.commit(
+                    rule, target.detach() if rule.needs_target else None
+                )
                 hints = build_block_hints(
                     latents, horizon, committed=committed.future.detach()
                 )

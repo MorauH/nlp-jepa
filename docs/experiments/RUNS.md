@@ -161,6 +161,53 @@ If document share does not fall, the fallbacks are ticket 009 (detach z_t in
 the residual candidates) and then letting the move term's gradient reach the
 target, each a new ADR.
 
+**Result** (`runs/joint-realhint-seed1`, against
+`runs/random-joint-seed1/metrics-008.json`): failed the other way round.
+Document share 0.81 → 0.04, effective rank 26 → 43, probe hindsight over μ
+0.0007 → 0.0078: the latent carries content and no document code. But it
+summarizes only the last few tokens (cos 0.35 at lag 5, 0.03 at lag 10), so the
+future is unpredictable: hindsight distance 0.03 → 1.26, π gain −0.11, max
+rebound 0.056, slot-horizon MI 0.22. Decoding the π-argmax commit (CE 6.86) is
+worse than no future (4.84); the real latent gives 2.34 (render gap 4.5). The
+hint noise hit its clamp (d > 1) in epoch 1. Ticket 009 is moot; ADR 0005 takes
+the second fallback (§0c).
+
+---
+
+## 0c. The move-target gate (ADR 0005)
+
+The same run as §0b plus `commitment.move_target_gradient = true`: the move
+term's gradient also reaches the target, so the encoder pays for a latent the
+candidates cannot reach. One run, 3 epochs, seed 1, batch size and LR as
+`runs/joint-realhint-seed1`:
+
+```sh
+python -u -m jepa train --batch-size 48 --lr 5.7e-4 --seed 1 --config docs/experiments/joint-real-hint-move-target.json --output-dir runs/joint-realhint-movetarget-seed1
+python -m jepa measure --model runs/joint-realhint-movetarget-seed1 --json runs/joint-realhint-movetarget-seed1/metrics.json
+```
+
+Compare with `runs/joint-realhint-seed1/metrics.json` and
+`runs/random-joint-seed1/metrics-008.json`. The target is between the two
+earlier runs: a latent that is neither a document code nor a local hash.
+Provisional limits:
+
+| Check | random-joint | real hint | Pass |
+|---|---|---|---|
+| `representation.document_share` | 0.81 | 0.04 | below 0.60 |
+| `representation.effective_rank` | 26 | 43 | above 38 |
+| `representation.lag_cos` at 10 | 0.92 | 0.03 | between them, no rebound (`max_rebound` < 0.05) |
+| `heads.slot_horizon_mi` | 0.0001 | 0.22 | near 0 |
+| steady-state hindsight distance | 0.03 | 1.26 | well below 1 (the noise follows it again) |
+| `heads.pi_gain` | 0.071 | −0.11 | above 0 |
+| `probe.hindsight_over_mu` | 0.0007 | 0.0078 | above 0 |
+| `decoder.future_use` | 0.072 | −2.03 | above 0 |
+| `decoder.render_gap` | 0.013 | 4.53 | well below 1 nat |
+
+During training, `jepa_hindsight_d` should fall below 1 and `jepa_hint_noise`
+below √3 (1.73). `val_perplexity` (π-argmax hint) should fall across epochs,
+not rise. If one force wins outright (document share back up, or the lag
+profile still flat at 10), sweep `decoder_w` before adding a mechanism.
+
 ---
 
 ## 1. Main run (P = 8, config defaults)

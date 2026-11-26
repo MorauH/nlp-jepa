@@ -315,3 +315,87 @@ def test_real_hint_jepa_stage_logs_noise_and_real_perplexity(tmp_path):
     assert history["val_perplexity"][0] == pytest.approx(
         math.exp(history["val_jepa_token"][0]), rel=1e-4
     )
+
+
+# ---------------------------------------------------------------------------
+# commitment.move_target_gradient (ADR 0005): the move term trains the target
+# ---------------------------------------------------------------------------
+
+
+def move_target_model(enabled: bool = True, **overrides) -> JepaModel:
+    torch.manual_seed(0)
+    return JepaModel(apply_overrides(
+        tiny_config(), {"commitment": {"move_target_gradient": enabled}, **overrides}
+    ))
+
+
+def _term_gradient_by_position(model, labels, term):
+    """Gradient of one JEPA term on each latent position."""
+    captured = {}
+    encode = model.encode
+
+    def capture(*args, **kwargs):
+        latents = encode(*args, **kwargs)
+        latents.retain_grad()
+        captured["latents"] = latents
+        return latents
+
+    model.encode = capture
+    out = model.jepa_loss(labels, attention_mask=torch.ones_like(labels), horizon=K)
+    if out.terms[term].requires_grad:
+        out.terms[term].backward()
+    grad = captured["latents"].grad
+    if grad is None:
+        return torch.zeros(labels.shape[1])
+    return grad.abs().sum(dim=(0, 2))
+
+
+def test_move_target_gradient_defaults_off_and_validates():
+    from jepa import JepaConfig
+
+    assert tiny_config().commitment.move_target_gradient is False
+    serialized = tiny_config().to_dict()
+    serialized["commitment"].pop("move_target_gradient")
+    assert JepaConfig(**serialized).commitment.move_target_gradient is False
+    with pytest.raises(ValueError, match="move_target_gradient"):
+        apply_overrides(tiny_config(), {"commitment": {"move_target_gradient": 1}})
+
+
+def test_move_term_reaches_the_target_only_when_enabled():
+    labels = torch.randint(1, 64, (2, 12))
+    # The last position is never a base with a real token K ahead: it is
+    # only ever a target, so any gradient on it came through the target.
+    last = labels.shape[1] - 1
+    assert _term_gradient_by_position(move_target_model(True), labels, "move")[last] > 0
+    assert _term_gradient_by_position(move_target_model(False), labels, "move")[last] == 0
+
+
+@pytest.mark.parametrize("term", ["pi", "mu", "diversity"])
+def test_other_commitment_terms_keep_the_target_detached(term):
+    labels = torch.randint(1, 64, (2, 12))
+    last = labels.shape[1] - 1
+    assert _term_gradient_by_position(move_target_model(True), labels, term)[last] == 0
+
+
+def test_move_target_gradient_changes_no_value():
+    labels = torch.randint(1, 64, (2, 12))
+    mask = torch.ones_like(labels)
+    outs = [
+        move_target_model(enabled).jepa_loss(labels, attention_mask=mask, horizon=K)
+        for enabled in (False, True)
+    ]
+    for name in ("move", "pi", "mu", "diversity"):
+        torch.testing.assert_close(outs[0].terms[name], outs[1].terms[name])
+    for name in ("hindsight_d", "pi_argmax_d", "mu_distance"):
+        assert not outs[1].diagnostics[name].requires_grad
+
+
+def test_move_target_gradient_with_the_real_hint_keeps_the_decoder_paths():
+    """The preset combination: the token term still skips z_t and the predictor."""
+    model = move_target_model(True, decoder_w=0.5, decoder_hint="real")
+    labels = torch.randint(1, 64, (2, 12))
+    by_position, _ = _token_gradient_by_position(model, labels)
+    assert by_position[0] == 0 and by_position[K] > 0
+    assert all(
+        p.grad is None or not p.grad.any() for p in model.predictor.parameters()
+    )

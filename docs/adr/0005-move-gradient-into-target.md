@@ -1,0 +1,25 @@
+# The move term's gradient reaches the target, so the encoder pays for an unpredictable latent
+
+Implemented behind `commitment.move_target_gradient = true` (preset `joint-real-hint-move-target.json`, with ADR 0004's real hint). It becomes the default only if the gate in `RUNS.md` §0c passes. ADR 0004 is unchanged; this decision is its fallback 2, taken up because its gate failed the other way round from what the fallback was written for.
+
+ADR 0004 gave the encoder a reward for content: in the joint JEPA stage the decoder reads the real block-end latent z_{t+k}, blurred to the batch's hindsight distance, and its loss trains the encoder through that latent. The run (`runs/joint-realhint-seed1`, 3 epochs, seed 1) removed the per-document code (document share 0.81 → 0.04, effective rank 26 → 43), and the next-block probe found content in the candidates (hindsight candidate over μ 0.0007 → 0.0078). But the latent became a summary of the last few tokens: cos(z_t, z_{t+lag}) is 0.95 at lag 1, 0.35 at lag 5 and 0.03 at lag 10. Nothing at 10 to 30 tokens is predictable from it: the hindsight distance rose from 0.03 to 1.26, |μ| fell to 0.18, π lost to the majority slot, and decoding the π-argmax commit (CE 6.86) is worse than decoding no future at all (4.84), against 2.34 for the real latent.
+
+The noise was meant to stop exactly this. It did not, for two reasons. Its scale follows the hindsight distance only up to d = 1 (s = √3), and the distance passed 1 in the first epoch. And isotropic noise at s = √3 still leaves a 448-dimensional latent about 90 bits, enough to spell out five tokens (CE 2.87 on the noisy hint). The deeper cause is the one ADR 0004 named and left open: the JEPA target is detached, so the encoder is never charged for a z_{t+k} the candidates cannot reach. ADR 0004's run had a reward for content and no price for unpredictability, as the runs before it had a reward for slowness and no reward for content.
+
+So the move term now also trains the target. Its gradient on z_{t+k} pulls the real future toward the candidates that cover it, weighted by the same soft winner-takes-all assignment. Two forces now act on every latent: the decoder pays it for summarizing the block it ends (reconstruction), and the move term pays it for being reachable from the latent k tokens earlier (predictability). `decoder_w` is the balance between them. A latent that stores surface detail no candidate can reach costs move loss. A latent that is constant costs reconstruction. Because the move term pulls toward the closest candidate, not toward μ, a future with several genuine continuations is pulled toward one of them rather than toward their average, so the candidates stay the mechanism that represents a multimodal future.
+
+Only the move term sees the target. π, μ and diversity keep it detached: π's target is the detached assignment and μ is a regression onto the normalized target, and letting either move the target would train the encoder to agree with a head instead of a head to fit the encoder. Every diagnostic (`hindsight_d`, `pi_argmax_d`, `mu_distance`) is computed on the detached target, so the hint noise does not become a gradient path either. The values of every term are unchanged; only the gradient differs.
+
+Alternatives considered:
+
+- **Lower `decoder_w`** with the target still detached. It weakens the reward for detail but adds no price for unpredictability, so the balance only moves; nothing holds the latent at a predictable level. Worth a sweep on top of this decision, not instead of it.
+- **Raise or remove the noise clamp**, or noise that limits bits rather than adds isotropic variance (a variational bottleneck). It limits capacity, not predictability: a latent can fit in a few bits and still be unpredictable from 10 tokens earlier.
+- **Ticket 009 (detach z_t in the residual candidates).** It removes a pull toward slowness, which is no longer the failure. Its own condition (document share above 0.60) is not met.
+- **Let every commitment term train the target.** μ's regression and π's cross-entropy would then shape the encoder; see above.
+
+Accepted costs and open risks:
+
+- **Collapse pressure.** The move term is now minimized by making z_{t+k} easy to reach, and a constant latent is the easiest. VISReg (scale, shape, center) is the only guard besides the decoder. Watch effective rank, document share and the lag profile: the slow failure of the earlier runs could return.
+- **Both sides of the distance move.** z_t is pulled toward z_{t+k} through the residual candidates (ticket 009's identity path) and z_{t+k} toward the candidates. Together they are a stronger reward for slowness than either alone.
+- **The balance sits on one weight.** `decoder_w = 0.3` is kept so the run differs from `runs/joint-realhint-seed1` in this field only. If the gate fails because one force wins, a `decoder_w` sweep is the next step, not another mechanism.
+- **The hint noise clamp stays.** With a predictable latent the hindsight distance should fall back below 1, where the noise follows it again. If it does not, the clamp is the next thing to revisit.

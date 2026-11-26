@@ -1,6 +1,7 @@
 # 008: The decoder reads the real future latent, blurred to the predictor's accuracy
 
-Status: implemented (pending on the cluster: the gate run in `RUNS.md` §0b).
+Status: implemented; the gate failed the other way round (`RUNS.md` §0b:
+content without predictability). Followed by ADR 0005 (fallback 2).
 The optional independent probe (a frozen sentence encoder) is not
 implemented.
 
