@@ -3,7 +3,8 @@
 One loop serves both stages (``docs/adr/0002-joint-decoder-gradient.md``):
 ``stage="jepa"`` trains encoder+predictor, plus the decoder when
 ``config.decoder_w > 0`` (its gradient reaches the encoder through the hint
-``z_t``); with ``decoder_w == 0`` it never runs the decoder.
+``z_t``, or through the blurred block end with ``decoder_hint = "real"``,
+ADR 0004); with ``decoder_w == 0`` it never runs the decoder.
 ``stage="decoder"`` trains the decoder against the frozen JEPA.
 
 Engineering settings are the module constants here; :class:`TrainConfig` holds
@@ -258,13 +259,18 @@ class JepaTrainer:
         """Return the average validation losses (and perplexity if weighted)."""
         self._apply_stage(training=False)
         token_count_key = f"{self.stage.prefix}tokens"
-        token_term_key = f"{self.stage.prefix}token"
+        # Per-token means -> the perplexity reported from them.  ``real_token``
+        # (decoder_hint "real") is the noise-free real hint over the same
+        # targets as the committed hint in ``token``.
+        perplexity_names = {f"{self.stage.prefix}token": "perplexity",
+                        f"{self.stage.prefix}real_token": "real_perplexity"}
         totals: dict[str, torch.Tensor] = {}
         n_batches = 0
         # 0-dim tensor: the same graph input as training; 1.0 = final temperature.
         progress = torch.ones((), device=device)
         policy = self.stage.validation_policy
-        token_sum = token_count = None
+        token_sums: dict[str, torch.Tensor] = {}
+        token_count = None
         horizon_range = self.model.config.horizon_range
         for index, (labels, attention_mask) in enumerate(val_loader):
             labels = labels.to(device, non_blocking=True)
@@ -281,17 +287,17 @@ class JepaTrainer:
             # the joint JEPA stage the total also holds the JEPA terms.
             if token_count_key in values:
                 count = values[token_count_key]
-                contribution = values[token_term_key] * count
-                token_sum = contribution if token_sum is None else token_sum + contribution
+                for key in perplexity_names.keys() & values.keys():
+                    token_sums[key] = token_sums.get(key, 0) + values[key] * count
                 token_count = count if token_count is None else token_count + count
             n_batches += 1
         self._apply_stage(training=True)
         if n_batches == 0:
             return {"loss": float("nan")}
         averages = self._means(totals, n_batches)
-        if token_sum is not None:
-            mean_token_loss = (token_sum / token_count.clamp_min(1)).item()
-            averages["perplexity"] = math.exp(min(mean_token_loss, 20.0))
+        for key, total in token_sums.items():
+            mean_token_loss = (total / token_count.clamp_min(1)).item()
+            averages[perplexity_names[key]] = math.exp(min(mean_token_loss, 20.0))
         return averages
 
     def _state_file(self, output_dir) -> str:
@@ -519,6 +525,8 @@ class JepaTrainer:
                    f"train {train_means['loss']:.4f} | val {val_means['loss']:.4f}")
         if "perplexity" in val_means:
             summary += f" | val_ppl {val_means['perplexity']:.2f}"
+        if "real_perplexity" in val_means:
+            summary += f" | val_ppl real hint {val_means['real_perplexity']:.2f}"
         if terms := self._describe_terms(train_means):
             summary += f"\n  train terms: {terms}"
         if terms := self._describe_terms(val_means):

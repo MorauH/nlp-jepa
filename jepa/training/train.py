@@ -277,6 +277,7 @@ def main(argv: list[str] | None = None) -> JepaTrainer:
     if stage == "jepa" and model.joint_jepa_stage:
         print(
             f"Joint JEPA stage: decoder_w {model.config.decoder_w} | "
+            f"hint: {model.config.decoder_hint} | "
             f"window {model.decoder.sliding_window} | "
             f"train policy: {model.config.decoder.train_policy}"
         )

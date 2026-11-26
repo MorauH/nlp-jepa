@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from transformers import PreTrainedModel
 
@@ -75,6 +77,38 @@ def build_block_hints(latents, horizon, committed=None):
     return latents[:, block_start, :], committed, valid
 
 
+def hint_noise_scale(d):
+    """The noise scale ``s`` that puts a blurred latent at distance ``d``.
+
+    ``s² = 1 / (1 - d/2)² - 1``, with ``d`` detached and clamped to [0, 1]:
+    adding isotropic noise of RMS ``s · ‖z‖ / √D`` gives
+    ``cos(ẑ, z) ≈ 1 / √(1 + s²) = 1 - d/2``, so ``E[distance(ẑ, z)] ≈ d``.
+    A 0-dim tensor in, a 0-dim tensor out: no recompile per value.
+    """
+    d = d.detach().float().clamp(0.0, 1.0)
+    return ((1.0 - d / 2).pow(-2) - 1.0).clamp_min(0.0).sqrt()
+
+
+def blur(latents, scale, generator=None):
+    """``latents + scale · (‖z‖ / √D) · ε``, ε ~ N(0, I) per position.
+
+    The per-position scale is detached: the noise level is not a gradient
+    path, the latent itself is.  ``generator=None`` draws from the global RNG
+    (restored on resume like the rest of training).
+    """
+    if generator is None:
+        # ``randn_like``: a factory call with symbolic sizes breaks the graph
+        # under ``torch.compile(dynamic=True)``.
+        noise = torch.randn_like(latents)
+    else:
+        noise = torch.randn(
+            latents.shape, generator=generator, device=latents.device,
+            dtype=latents.dtype,
+        )
+    rms = latents.detach().norm(dim=-1, keepdim=True) / math.sqrt(latents.shape[-1])
+    return latents + scale.to(latents.dtype) * rms * noise
+
+
 class JepaModel(PreTrainedModel):
     """Full JEPA stack: encoder, predictor and autoregressive decoder.
 
@@ -83,7 +117,8 @@ class JepaModel(PreTrainedModel):
     * :meth:`jepa_loss` trains the encoder and predictor with VISReg plus the
       commitment loss, and with ``config.decoder_w > 0`` also the decoder
       through a weighted token term whose gradient reaches the encoder via
-      the hint ``z_t``.
+      the hint ``z_t`` (``decoder_hint = "committed"``) or the blurred block
+      end (``"real"``, ADR 0004).
     * :meth:`decoder_loss` trains the decoder against the frozen encoder and
       predictor.
 
@@ -169,18 +204,17 @@ class JepaModel(PreTrainedModel):
                 f"horizon ({longest})"
             )
 
-    def _block_token_loss(self, labels, attention_mask, latents, committed, horizon):
+    def _block_token_loss(self, labels, attention_mask, hints):
         """Mean decoder CE on block hints and the number of counted targets.
 
-        Gradients follow whatever ``latents`` and ``committed`` carry: the
-        decoder stage passes both without a graph, the joint JEPA stage passes
-        online latents (so the hint ``z_t`` reaches the encoder) and a
-        detached committed future.
+        ``hints`` is :func:`build_block_hints`' ``(z_t, future, valid)``.
+        Gradients follow whatever the hints carry: the decoder stage passes
+        them without a graph; the joint JEPA stage passes an online ``z_t``
+        and a detached committed future (``"committed"``), or a detached
+        ``z_t`` and an online blurred block end (``"real"``).
         """
-        z_t, committed, valid = build_block_hints(
-            latents, horizon, committed=committed
-        )
-        # A block start past ``seq - horizon - 1`` has no committed future, so those
+        z_t, future, valid = hints
+        # A block start past ``seq - horizon - 1`` has no future, so those
         # targets are excluded instead of being paired with another block.
         loss_mask = valid.unsqueeze(0)
         if attention_mask is not None:
@@ -191,7 +225,7 @@ class JepaModel(PreTrainedModel):
             )
         token_sum, token_count = self.decoder.token_loss(
             z_t,
-            committed,
+            future,
             labels,
             attention_mask=attention_mask,
             chunk_size=self.config.decoder.loss_chunk_size,
@@ -211,10 +245,17 @@ class JepaModel(PreTrainedModel):
         """Run the JEPA stage objective.
 
         With ``config.decoder_w > 0`` the decoder token loss is added as the
-        ``token`` term (ADR 0002).  Its gradient reaches the encoder through
-        the block-start hint ``z_t`` only: the committed future is detached,
-        so the predictor is trained by the commitment loss alone.  With
-        ``decoder_w == 0`` the decoder never runs.
+        ``token`` term.  The predictor is trained by the commitment loss alone
+        in both hint modes (``config.decoder_hint``):
+
+        * ``"committed"`` (ADR 0002): the hint is (``z_t``, the detached
+          committed future); the gradient reaches the encoder through ``z_t``.
+        * ``"real"`` (ADR 0004): the hint is (detached ``z_t``, the real
+          block-end latent blurred by :func:`blur` to the batch's hindsight
+          distance); the gradient reaches the encoder through the block end.
+          The noise scale is logged as the ``hint_noise`` diagnostic.
+
+        With ``decoder_w == 0`` the decoder never runs.
 
         Args:
             labels: ``(batch, seq)`` token ids.
@@ -224,9 +265,13 @@ class JepaModel(PreTrainedModel):
                 blocks; the encoder, predictor and decoder never receive it.
             progress: 0-dim tensor with the fraction of training completed, or
                 ``None`` for the final commitment temperature (evaluation).
-            policy: commit rule for the decoder hint; ``None`` uses
-                ``config.decoder.train_policy``.  Ignored when
-                ``decoder_w == 0``.
+            policy: ``None`` is the training condition: the hint of
+                ``config.decoder_hint`` (committed by
+                ``config.decoder.train_policy``, or the blurred real future).
+                A policy is an evaluation condition in either hint mode: the
+                token term decodes that commit, and the ``"real"`` mode also
+                reports the noise-free real hint's CE as ``real_token``.
+                Ignored when ``decoder_w == 0``.
 
         Returns:
             :class:`~jepa.models.losses.LossOutput` whose total is
@@ -256,17 +301,37 @@ class JepaModel(PreTrainedModel):
         diagnostics = {**visreg_out.diagnostics, **commitment_out.diagnostics}
 
         if self.joint_jepa_stage:
-            rule = self._commit_rule(policy)
-            # Detached: a hindsight choice used the real future, so a gradient
-            # through it would train the JEPA on information that does not
-            # exist at inference.
-            committed = futures.commit(rule, target if rule.needs_target else None)
-            token, count = self._block_token_loss(
-                labels, attention_mask, latents, committed.future.detach(), horizon
-            )
+            real_hint = self.config.decoder_hint == "real"
+            if real_hint and policy is None:
+                # ADR 0004: (sg(z_t), blurred z_{t+k}).  The token loss reaches
+                # the encoder through the block end only, and the committed
+                # future is not part of the objective.
+                scale = hint_noise_scale(commitment_out.diagnostics["hindsight_d"])
+                z_t, _, valid_blocks = build_block_hints(latents, horizon)
+                _, future, _ = build_block_hints(blur(latents, scale), horizon)
+                hints = (z_t.detach(), future, valid_blocks)
+                diagnostics["hint_noise"] = scale
+            else:
+                rule = self._commit_rule(policy)
+                # Detached: a hindsight choice used the real future, so a
+                # gradient through it would train the JEPA on information that
+                # does not exist at inference.
+                committed = futures.commit(rule, target if rule.needs_target else None)
+                hints = build_block_hints(
+                    latents, horizon, committed=committed.future.detach()
+                )
+            token, count = self._block_token_loss(labels, attention_mask, hints)
             loss = loss + self.config.decoder_w * token
             terms["token"] = token
             diagnostics["tokens"] = count
+            if real_hint and policy is not None:
+                # Evaluation: what rendering the real future costs, next to
+                # the committed one in the token term.
+                real_token, _ = self._block_token_loss(
+                    labels, attention_mask,
+                    build_block_hints(latents.detach(), horizon),
+                )
+                diagnostics["real_token"] = real_token.detach()
 
         return LossOutput(loss=loss, terms=terms, diagnostics=diagnostics)
 
@@ -315,7 +380,8 @@ class JepaModel(PreTrainedModel):
             committed = futures.commit(rule, target).future
 
         token_loss, token_count = self._block_token_loss(
-            labels, attention_mask, latents, committed, horizon
+            labels, attention_mask,
+            build_block_hints(latents, horizon, committed=committed),
         )
         return LossOutput(
             loss=token_loss,

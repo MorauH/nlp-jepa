@@ -80,6 +80,14 @@ _Avoid_: slot MI
 The between-document share of the latent variance. A latent that is constant within a document is free to predict at any horizon.
 _Avoid_: document identity (as a metric name)
 
+**Next-block probe**:
+A linear probe, fit on the train split, from a latent (z_t, μ, a committed or hindsight candidate) to the bag of words of the next `k` tokens, scored as R² on the queries. A hindsight candidate that beats μ carries the next block's content. Never trained into the model.
+_Avoid_: content probe, BoW head (a head would be trained)
+
+**Render gap**:
+The decoder CE with the π-argmax hint minus the CE with the real future latent: what decoding a predicted future costs.
+_Avoid_: decoding gap
+
 **Path validity**:
 Synthetic world only: the fraction of rollouts whose steps 1..i all lie on a state that is a successor of the previous step's state.
 _Avoid_: accuracy, correctness
@@ -95,7 +103,7 @@ _Avoid_: recall
 ## Decoding
 
 **Hint**:
-What the decoder is conditioned on for one block: the latent at the block start and the committed future at the block end.
+What the decoder is conditioned on for one block: the latent at the block start and a future at the block end. At inference and in the decoder stage the future is a committed one; with the **real hint** of the joint JEPA stage it is the real block-end latent, blurred to the predictor's hindsight distance.
 _Avoid_: waypoint, plan (a plan is a whole decoded rollout), condition
 
 **Decoded plan**:
@@ -107,7 +115,7 @@ One of the two training phases: the JEPA stage trains encoder and predictor (and
 _Avoid_: mode
 
 **Joint JEPA stage**:
-The JEPA stage with `decoder_w > 0` (ADR 0002): the decoder trains alongside the encoder and predictor, and its loss reaches the encoder only through the hint's block-start latent. The committed future is detached, so the predictor gets no decoder gradient. `decoder_w = 0` is the **two-stage** recipe.
+The JEPA stage with `decoder_w > 0`: the decoder trains alongside the encoder and predictor, and the predictor gets no decoder gradient. Two hint modes (`decoder_hint`): **committed** (ADR 0002, the default), where the loss reaches the encoder through the hint's block-start latent and the committed future is detached; **real** (ADR 0004), where the block-start latent is detached and the loss reaches the encoder through the blurred real block-end latent. `decoder_w = 0` is the **two-stage** recipe.
 _Avoid_: end-to-end (the predictor and the committed future are cut off), joint model (the model is the same; only the stage's objective changes)
 
 ## Experiments

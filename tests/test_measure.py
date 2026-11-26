@@ -24,6 +24,7 @@ SECTION_KEYS = {
     "policies",
     "rollouts",
     "decoder",
+    "probe",
     "verdicts",
 }
 
@@ -104,11 +105,16 @@ def collect(saved, **overrides):
         batch_size=2,
         seed=0,
     )
+    probe_batches = measure.load_query_batches(
+        dataset["train"], tokenizer, num_examples=6, max_length=12, batch_size=2,
+        seed=1,
+    )
     options = dict(
         depths=2,
         rollout_positions=8,
         seed=0,
         loss_chunk_size=4,
+        probe_batches=probe_batches,
     )
     options.update(overrides)
     return measure.collect_metrics(model, batches, bank, **options)
@@ -207,6 +213,7 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
         "mu_safe",
         "hindsight",
         "real",
+        "real_noisy",
         "shuffled",
         "null",
         "no_hints",
@@ -236,6 +243,7 @@ def test_collect_metrics_has_every_section_and_nested_key(saved):
         "mu_calibrated",
         "encoder_center",
         "encoder_effective_rank",
+        "hindsight_carries_content",
         "committed_on_manifold_depth_2",
         "best_of_16_beats_mu",
     } <= names
@@ -656,3 +664,122 @@ def test_queries_must_exceed_the_longest_horizon(random_horizon):
     short = [(labels[:, :6], mask[:, :6]) for labels, mask in batches]
     with pytest.raises(ValueError, match="horizon"):
         measure_random((model, short, bank))
+
+
+# ---------------------------------------------------------------------------
+# Ticket 008: real-hint decoder conditions, the next-block probe, pooled center
+# ---------------------------------------------------------------------------
+
+
+def test_decoder_reports_the_render_gap_and_the_noisy_real_condition(saved):
+    decoder = collect(saved)["decoder"]
+    ce = decoder["ce"]
+    assert decoder["render_gap"] == pytest.approx(ce["pi_argmax"] - ce["real"])
+    assert decoder["commit_headroom"] == pytest.approx(ce["pi_argmax"] - ce["hindsight"])
+    # The noise is drawn, so the noisy real hint is a different condition.
+    assert ce["real_noisy"] != ce["real"]
+
+
+def test_real_noisy_is_the_real_hint_without_noise(saved, monkeypatch):
+    monkeypatch.setattr(measure, "hint_noise_scale", lambda d: torch.zeros_like(d))
+    ce = collect(saved)["decoder"]["ce"]
+    assert ce["real_noisy"] == pytest.approx(ce["real"])
+
+
+def test_encoder_center_verdict_reads_the_pooled_latents(saved):
+    model_dir, data_dir = saved
+    metrics = collect(saved)
+    model = JepaModel.from_pretrained(str(model_dir)).eval()
+    tokenizer = FakeTokenizer()
+    batches = measure.load_query_batches(
+        load_from_disk(str(data_dir))["validation"], tokenizer,
+        num_examples=4, max_length=12, batch_size=2, seed=0,
+    )
+    with torch.no_grad():
+        pooled = torch.cat([
+            model.encode(labels)[mask.bool()].double() for labels, mask in batches
+        ])
+    expected = (pooled.mean(dim=0) ** 2).mean().item()
+
+    representation = metrics["representation"]
+    assert representation["pooled_center"] == pytest.approx(expected, rel=1e-5)
+    verdict = next(v for v in metrics["verdicts"] if v["name"] == "encoder_center")
+    assert verdict["metric"] == "representation.pooled_center"
+    assert verdict["value"] == pytest.approx(expected, rel=1e-5)
+
+
+def test_bag_of_words_probe_matches_a_dense_ridge_regression():
+    torch.manual_seed(0)
+    dim, vocab = 6, 11
+    fit_x, test_x = torch.randn(200, dim), torch.randn(50, dim)
+    fit_tokens = torch.randint(0, vocab, (200, 3))
+    test_tokens = torch.randint(0, vocab, (50, 4))  # rows of another k pool too
+
+    probe = measure._BagOfWordsProbe(dim, vocab, "cpu")
+    probe.add(fit_x[:120], fit_tokens[:120])
+    probe.add(fit_x[120:], fit_tokens[120:])
+    probe.solve()
+    errors, reference = probe.errors(test_x, test_tokens)
+
+    def bag(tokens):
+        counts = torch.zeros(tokens.shape[0], vocab, dtype=torch.float64)
+        counts.scatter_add_(1, tokens, torch.ones_like(tokens, dtype=torch.float64))
+        return counts / tokens.shape[1]
+
+    x, y = fit_x.double(), bag(fit_tokens)
+    mean_x, mean_y = x.mean(dim=0), y.mean(dim=0)
+    xc = x - mean_x
+    cxx = xc.T @ xc
+    ridge = measure.PROBE_RIDGE * cxx.trace() / dim
+    weight = torch.linalg.solve(cxx + ridge * torch.eye(dim, dtype=x.dtype), xc.T @ y)
+    target = bag(test_tokens)
+    prediction = mean_y + (test_x.double() - mean_x) @ weight
+    torch.testing.assert_close(errors, ((target - prediction) ** 2).sum(dim=-1))
+    torch.testing.assert_close(reference, ((target - mean_y) ** 2).sum(dim=-1))
+
+
+def test_probe_section_reports_r2_and_gains(saved, capsys):
+    metrics = collect(saved)
+    probe = metrics["probe"]
+
+    assert set(probe["r2"]) == {"z_t", "mu", "pi_argmax", "hindsight"}
+    for name, gain in probe["gain_over_z_t"].items():
+        assert gain == pytest.approx(probe["r2"][name] - probe["r2"]["z_t"])
+    assert probe["hindsight_over_mu"] == pytest.approx(
+        probe["r2"]["hindsight"] - probe["r2"]["mu"]
+    )
+    # 6 train rows and 4 query rows of 12 tokens, k = 2: 10 positions each.
+    assert probe["fit_positions"] == 60 and probe["positions"] == 40
+    verdict = next(
+        v for v in metrics["verdicts"] if v["name"] == "hindsight_carries_content"
+    )
+    assert verdict["value"] == pytest.approx(probe["hindsight_over_mu"])
+
+    measure.print_report(metrics)
+    out = capsys.readouterr().out
+    assert "next-block probe" in out and "render gap" in out and "pooled center" in out
+
+
+def test_probe_is_skipped_without_train_batches(saved, capsys):
+    metrics = collect(saved, probe_batches=None)
+    assert metrics["probe"] is None
+    assert "hindsight_carries_content" not in {v["name"] for v in metrics["verdicts"]}
+    measure.print_report(metrics)
+    assert "next-block probe: n/a" in capsys.readouterr().out
+
+
+def test_real_hint_checkpoint_measures(saved):
+    from jepa import apply_overrides
+
+    model_dir, _ = saved
+    model = JepaModel.from_pretrained(str(model_dir))
+    model.config = apply_overrides(
+        model.config, {"decoder_w": 0.3, "decoder_hint": "real"}
+    )
+    model.save_pretrained(model_dir)
+
+    metrics = collect(saved)
+
+    assert metrics["loss"]["terms"]["token"]["weight"] == 0.3
+    assert "hint_noise" in metrics["loss"]["diagnostics"]
+    assert json.loads(json.dumps(metrics)) == metrics

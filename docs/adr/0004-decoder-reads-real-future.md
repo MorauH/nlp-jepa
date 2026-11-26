@@ -1,6 +1,6 @@
 # In joint training the decoder reads the real future latent, blurred to the predictor's accuracy
 
-Proposed, to be implemented by ticket 008. Supersedes the gradient paths of ADR 0002 for the joint JEPA stage when `decoder_hint = "real"`; ADR 0002 stays the recipe for `decoder_hint = "committed"` (the default until the gate in ticket 008 passes). ADR 0003 (random hidden horizon) is unchanged.
+Implemented by ticket 008 behind `decoder_hint = "real"` (preset `joint-real-hint.json`); it becomes the default only if the gate in `RUNS.md` §0b passes. Supersedes the gradient paths of ADR 0002 for the joint JEPA stage when `decoder_hint = "real"`; ADR 0002 stays the recipe for `decoder_hint = "committed"` (the default until the gate in ticket 008 passes). ADR 0003 (random hidden horizon) is unchanged.
 
 The random-horizon joint run (`runs/random-joint-seed1`, `decoder_w = 0.3`, 3 epochs) removed the periodic shortcut (max rebound 0.0009, slot-horizon mutual information 0.0001 nats) but not the reason the encoder finds shortcuts: nothing rewards it for content. Document identity now explains 81% of the latent's variance (0.22 two-stage, 0.60 joint with fixed k), effective rank fell from 41 to 26, and the decoder cannot tell the hindsight commit from the π-argmax commit (0.002 nats apart). Three gradient paths explain it:
 

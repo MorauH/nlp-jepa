@@ -125,6 +125,44 @@ comparison.
 
 ---
 
+## 0b. The real-hint gate (ticket 008)
+
+The random-horizon joint run (`runs/random-joint-seed1`) removed the periodic
+shortcut but turned the latent into a per-document code (document share 0.81).
+ADR 0004 lets the decoder read the real future latent, blurred to the
+predictor's hindsight distance (`decoder_hint = "real"`). One run, 3 epochs,
+seed 1, the same as `runs/random-joint-seed1` except `decoder_hint`:
+
+```sh
+sbatch scripts/slurm_train.sh --config docs/experiments/joint-real-hint.json --seed 1 --output-dir runs/real-hint-seed1
+python -m jepa measure --model runs/real-hint-seed1 --json runs/real-hint-seed1/metrics.json
+python -m jepa measure --model runs/random-joint-seed1 --json runs/random-joint-seed1/metrics-008.json
+```
+
+Re-measure `runs/random-joint-seed1` with the current `measure`: the probe,
+`render_gap`, `real_noisy` and `pooled_center` are new. Its `real` row is
+the noise-free real hint in both runs, but only the real-hint decoder was
+trained on it; compare the two through `pi_argmax`, `commit_headroom` and the
+probe. Limits are provisional; set them once there are runs.
+
+| Check | Today | Pass |
+|---|---|---|
+| `representation.document_share` | 0.81 | below 0.60 (the fixed-k joint run) |
+| `representation.effective_rank` | 26 | above 38 |
+| `max_rebound`, `heads.slot_horizon_mi` | 0.0009, 0.0001 | stay below 0.05 and near 0 |
+| `probe.hindsight_over_mu` | n/a | above 0 (verdict `hindsight_carries_content`) |
+| `decoder.commit_headroom` | 0.002 nats | clearly above 0.002; report it with `render_gap` |
+| steady state μ vs copy | 0.077 vs 0.123 | μ still beats copy |
+
+During training, `jepa_hint_noise` follows the hindsight distance, and
+`val_real_perplexity` against `val_perplexity` is the render gap per epoch.
+
+If document share does not fall, the fallbacks are ticket 009 (detach z_t in
+the residual candidates) and then letting the move term's gradient reach the
+target, each a new ADR.
+
+---
+
 ## 1. Main run (P = 8, config defaults)
 
 Feeds Tables 4 and 5, Figures 2 and 3, and section 5.2 (H1–H4).

@@ -1,6 +1,8 @@
 # 008: The decoder reads the real future latent, blurred to the predictor's accuracy
 
-Status: open (decision drafted in ADR 0004)
+Status: implemented (pending on the cluster: the gate run in `RUNS.md` §0b).
+The optional independent probe (a frozen sentence encoder) is not
+implemented.
 
 ## Why
 

@@ -399,6 +399,10 @@ class JepaConfig(PretrainedConfig):
     once per batch or generated sequence (ADR 0003).  ``[k, k]`` is a fixed
     horizon.  ``pred_horizon`` is the legacy constructor argument of older
     checkpoints: it means ``[pred_horizon, pred_horizon]`` and is never stored.
+
+    ``decoder_hint`` is what the decoder reads in the joint JEPA stage
+    (``decoder_w > 0``): ``"committed"`` (ADR 0002) or ``"real"`` (ADR 0004).
+    The decoder stage always reads committed futures and ignores it.
     """
 
     model_type = "jepa"
@@ -412,6 +416,7 @@ class JepaConfig(PretrainedConfig):
         commitment: CommitmentLossConfig | dict | None = None,
         horizon_range: list[int] | None = None,
         decoder_w: float = 0.0,
+        decoder_hint: str = "committed",
         pred_horizon: int | None = None,
         **kwargs,
     ):
@@ -445,6 +450,13 @@ class JepaConfig(PretrainedConfig):
         # 0 trains encoder and predictor alone and never runs the decoder (the
         # two-stage recipe of ADR 0001).
         self.decoder_w = decoder_w
+        # The joint stage's decoder hint.  "committed" (ADR 0002): (z_t, the
+        # detached committed future), the token loss trains the encoder
+        # through z_t.  "real" (ADR 0004): (detached z_t, the real block-end
+        # latent blurred to the batch's hindsight distance), the token loss
+        # trains the encoder through the block end.  Checkpoints older than
+        # the field load as "committed".
+        self.decoder_hint = decoder_hint
 
         # Fill in derived component configs before validating them.
         if self.predictor is None:
@@ -495,6 +507,7 @@ class JepaConfig(PretrainedConfig):
         visreg: VISRegConfig | None = None,
         commitment: CommitmentLossConfig | None = None,
         decoder_w: float = 0.0,
+        decoder_hint: str = "committed",
         **kwargs,
     ) -> "JepaConfig":
         """Derive a full JEPA config from an encoder config.
@@ -514,6 +527,7 @@ class JepaConfig(PretrainedConfig):
             commitment=commitment,
             horizon_range=horizon_range,
             decoder_w=decoder_w,
+            decoder_hint=decoder_hint,
             **kwargs,
         )
 
@@ -555,6 +569,15 @@ class JepaConfig(PretrainedConfig):
         self._link_horizon_range()
         if self.decoder_w is None or self.decoder_w < 0:
             raise ValueError(f"decoder_w must be non-negative; got {self.decoder_w!r}")
+        if self.decoder_hint not in DECODER_HINTS:
+            raise ValueError(
+                f"decoder_hint must be one of {DECODER_HINTS}; got {self.decoder_hint!r}"
+            )
+        if self.decoder_hint == "real" and self.decoder_w == 0:
+            raise ValueError(
+                'decoder_hint "real" needs the joint JEPA stage (decoder_w > 0); '
+                "with decoder_w = 0 the decoder never runs in the JEPA stage"
+            )
 
         self.visreg.validate()
         self.commitment.validate()
@@ -589,6 +612,7 @@ class JepaConfig(PretrainedConfig):
             )
 
 
+DECODER_HINTS = ("committed", "real")
 COMPONENTS = ("encoder", "predictor", "decoder", "visreg", "commitment")
 
 

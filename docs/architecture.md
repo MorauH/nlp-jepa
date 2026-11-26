@@ -120,6 +120,27 @@ the JEPA. The gradient paths are fixed:
 Training uses `DecoderConfig.train_policy` hints; validation uses π-argmax
 hints, and validation perplexity comes from the `token` term, not the total.
 
+`JepaConfig.decoder_hint` (top level, next to `decoder_w`) chooses the joint
+stage's hint. The paths above are `"committed"`, the default (ADR 0002).
+`"real"` ([ADR 0004](adr/0004-decoder-reads-real-future.md), preset
+`joint-real-hint.json`) replaces them:
+
+- the hint is (z_t detached, ẑ_{t+k}), with ẑ the online block-end latent plus
+  noise: ẑ = z + s · (‖z‖ / √D) · ε, ε ~ N(0, I) per latent position, drawn
+  from the global RNG. s² = 1 / (1 − d/2)² − 1, with d the batch's detached
+  `hindsight_d` clamped to [0, 1], so E[distance(ẑ, z)] ≈ d (`hint_noise_scale`
+  and `blur` in `jepa/models/jepa.py`). s is logged as `hint_noise`;
+- the token loss reaches the encoder only through the block-end latent, which
+  has read the whole block (a reconstruction; it never exists at inference);
+- the committed future is not part of the objective, so the predictor is
+  trained by the commitment loss alone, as before.
+
+Validation keeps the π-argmax hint for `token` and `perplexity`, and adds the
+noise-free real hint as the `real_token` diagnostic and `real_perplexity`, so
+the cost of rendering a predicted future is visible per epoch. `"real"` with
+`decoder_w = 0` is an error. Checkpoints without the field load as
+`"committed"`. The decoder stage ignores it.
+
 `--stage decoder` loads a checkpoint from `--from`, freezes its encoder and
 predictor (they run under `torch.no_grad()`), attaches a fresh decoder, and
 trains only the decoder on committed futures. The decoder stage writes to
@@ -189,6 +210,7 @@ a seed reproduces the weights exactly. On CUDA, non-deterministic kernels
   "model_type": "jepa",
   "horizon_range": [10, 30],
   "decoder_w": 0.0,
+  "decoder_hint": "committed",
   "encoder":    {"model_type": "jepa_encoder",    "...": "..."},
   "predictor":  {"model_type": "jepa_predictor",  "...": "..."},
   "decoder":    {"model_type": "jepa_decoder",    "...": "..."},
@@ -248,7 +270,8 @@ python -m jepa measure --model runs/jepa --json runs/jepa/metrics.json
 ```
 
 `measure` evaluates validation chunks against a bank of real train-split
-latents.
+latents, and fits the next-block probe on other train-split chunks
+(`--probe-examples`, 0 skips it).
 
 Everything that compares a prediction with the future is scored at fixed
 **evaluation horizons** and averaged over them: for `[10, 30]` they are 11, 14,
@@ -277,6 +300,10 @@ The JSON has one dict per section:
   k. Verdict `no_periodic_shortcut`: max rebound < 0.05. The fast share has no
   verdict, since token-to-token change is legitimately fast. The document
   share has none either; a per-document constant is free to predict at any k.
+  The VISReg terms are computed per measure batch (4 documents), as training
+  sees them; their center term grows with document share / batch size, so the
+  `encoder_center` verdict reads `pooled_center`, the center of every query
+  latent pooled.
 - `loss`: every JEPA term (including `token` for a joint checkpoint) with its
   weight and weighted contribution, plus the
   π floor (`H(r)` and `KL(r||π)`).
@@ -322,7 +349,25 @@ The JSON has one dict per section:
   π-argmax row is the inference hint; the hindsight row is teacher-forced and
   its hint carries up to `log2(P)` bits about the target future (and may reveal
   k), so read it as
-  a lower bound rather than a leak-free condition.
+  a lower bound rather than a leak-free condition. `real` is the noise-free
+  block-end latent and `real_noisy` the `decoder_hint = "real"` training
+  condition (blurred to the batch's hindsight distance at each k);
+  `render_gap` (`pi_argmax − real`) is what decoding a predicted future costs
+  against the real one. With the real hint, `real`, `hint_use` and `z_t_use`
+  mean something else than with the committed one (the decoder trained on
+  real latents), so runs of the two modes compare only through conditions
+  both report.
+- `probe`: the **next-block probe**. One ridge regression per latent (z_t, μ,
+  the π-argmax and the hindsight candidate, each unit-normalized) to the next
+  k tokens' bag of words, fit on train-split chunks and scored on the queries,
+  pooled over the evaluation horizons. `r2` is against the mean bag of words;
+  `gain_over_z_t` per latent and `hindsight_over_mu` (verdict
+  `hindsight_carries_content`: > 0) ask whether the candidates carry the next
+  block's content. It is never trained into the model. `None` without
+  train-split batches. The latents vary mostly between documents, so the fit
+  needs many of them (default 2048 chunks; with 256 the probe overfits and R²
+  goes negative). R² stays small (about 0.01 on `runs/random-joint-seed1`)
+  because a k-token sample of words is mostly noise; read the gains.
 - `verdicts`: PASS/FAIL checks, each naming its metric and threshold.
 
 ## Generation

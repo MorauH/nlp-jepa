@@ -4,7 +4,8 @@
     python -m jepa measure --model runs/jepa --json runs/jepa/metrics.json
 
 Queries are validation chunks; the manifold bank samples real encoder latents
-from the train split (whole documents are held out, so they do not overlap).
+from the train split (whole documents are held out, so they do not overlap),
+and the next-block probe is fit on other train-split chunks.
 
 The horizon is random (``docs/adr/0003-random-hidden-horizon.md``), so everything
 that compares a prediction with the future is scored at a fixed set of
@@ -35,7 +36,7 @@ from ..models.commitment import (
     pairwise_distance,
     rollout,
 )
-from ..models.jepa import JepaModel, build_block_hints
+from ..models.jepa import JepaModel, blur, build_block_hints, hint_noise_scale
 from ..paths import DEFAULT_RUN_DIR, FINEWEB_DIR, TOKENIZER_DIR
 from ..runtime import select_device
 from ..training.data import load_datasets, tokenize_batch
@@ -51,9 +52,17 @@ DEFAULT_LOSS_CHUNK_SIZE = None
 REPRESENTATION_LATENTS = 20_000  # effective rank is sample-size sensitive
 ROLLOUT_PATHS = ("hindsight", "pi_argmax", "pi_sample", "mu")
 DECODER_CONDITIONS = (
-    "pi_argmax", "pi_sample", "mu_safe", "hindsight", "real", "shuffled", "null",
-    "no_hints",
+    "pi_argmax", "pi_sample", "mu_safe", "hindsight", "real", "real_noisy",
+    "shuffled", "null", "no_hints",
 )
+# Latents the next-block probe reads, and the train-split chunks it is fit on.
+PROBE_FEATURES = ("z_t", "mu", "pi_argmax", "hindsight")
+# Latents vary mostly between documents, so the probe needs many of them:
+# with 256 it overfits the fit documents (negative R² on random-joint-seed1),
+# with 2048 it is stable for ridges from 0.1 to 1.
+DEFAULT_PROBE_EXAMPLES = 2048
+# Ridge penalty, relative to the mean feature variance times the row count.
+PROBE_RIDGE = 0.1
 POLICY_NAMES = ("copy", "hindsight", "pi_argmax", "pi_sample", "mu_safe", "mu")
 # Period of the cycle the fixed-k encoders learned (ADR 0003).
 OBSERVED_PERIOD = 10
@@ -322,11 +331,13 @@ def _representation_section(model, batches, latents, horizons) -> dict:
     longest = model.config.horizon_range[1]
     pooled, seen = [], 0
     token_count = 0
+    latent_sum = 0.0
     visreg_sums = {name: 0.0 for name in model.visreg.weights}
     for (_, mask), z in zip(batches, latents):
         valid = mask.bool()
         tokens = int(valid.sum())
         token_count += tokens
+        latent_sum = latent_sum + z[valid].double().sum(dim=0)
         if seen < REPRESENTATION_LATENTS:
             take = z[valid].float()[: REPRESENTATION_LATENTS - seen]
             pooled.append(take)
@@ -353,7 +364,11 @@ def _representation_section(model, batches, latents, horizons) -> dict:
         "max_rebound": max_rebound(profile, longest),
         "fast_share": fast_share(latents, masks, window=FAST_SHARE_WINDOW),
         "document_share": document_share(latents, masks),
+        # VISReg as training sees it, one measure batch at a time.  Its center
+        # term grows with document share / batch size, so the verdict reads
+        # the center of every query latent pooled instead.
         "visreg": {name: visreg_sums[name] / max(1, token_count) for name in visreg_sums},
+        "pooled_center": _value(((latent_sum / max(1, token_count)) ** 2).mean()),
     }
 
 def _loss_section(model, batches, horizons) -> dict:
@@ -749,6 +764,7 @@ def _decoder_section(
     device = latents[0].device
     sample_generator = _generator(device, seed + 3)
     shuffle_generator = _generator(device, seed + 4)
+    noise_generator = _generator(device, seed + 6)
     totals = {name: 0.0 for name in DECODER_CONDITIONS}
     token_count = 0
     shortest = min(horizons)
@@ -764,14 +780,23 @@ def _decoder_section(
         committed["shuffled"] = committed["pi_argmax"][order]
         for horizon in horizons:
             z_hint, real_hint, hint_valid = build_block_hints(z, horizon)
-            hindsight = _bases(proposals, z, horizon).commit(
-                Hindsight(), z[:, horizon:]
-            ).future
+            futures = _bases(proposals, z, horizon)
+            hindsight = futures.commit(Hindsight(), z[:, horizon:]).future
+            # The real-hint training condition: the real future blurred to
+            # this batch's hindsight distance at this k.
+            valid = _prediction_mask(mask, horizon)
+            hindsight_d = futures.distances(z[:, horizon:]).min(dim=-1).values[valid]
+            scale = hint_noise_scale(
+                hindsight_d.float().mean() if hindsight_d.numel()
+                else z.new_zeros((), dtype=torch.float32)
+            )
+            noisy = blur(z, scale, generator=noise_generator)
             hints = {
                 name: build_block_hints(z, horizon, committed=value)[1]
                 for name, value in (*committed.items(), ("hindsight", hindsight))
             }
             hints["real"] = real_hint
+            hints["real_noisy"] = build_block_hints(noisy, horizon)[1]
             hints["null"] = torch.zeros_like(z_hint)
             hints["no_hints"] = hints["null"]
             # Same exclusion as decoder_loss: no committed future for the tail
@@ -805,11 +830,155 @@ def _decoder_section(
         "z_t_use": ce["no_hints"] - ce["null"],
         "future_use": ce["null"] - ce["pi_argmax"],
         "commit_headroom": ce["pi_argmax"] - ce["hindsight"],
+        # What decoding a predicted future costs against the real one.
+        "render_gap": ce["pi_argmax"] - ce["real"],
         "specificity": {
             "shuffled_minus_hindsight": ce["shuffled"] - ce["hindsight"],
             "pi_argmax_minus_hindsight": ce["pi_argmax"] - ce["hindsight"],
         },
     }
+
+
+class _BagOfWordsProbe:
+    """Ridge regression from a unit latent to the next block's bag of words.
+
+    The target of a row is the next block's token frequencies (counts / k)
+    over the vocabulary.  Only sufficient statistics are kept, so neither the
+    targets nor the predictions are ever materialized as ``(N, vocab)``.  The
+    features are centred, so the unpenalized intercept is the mean bag of
+    words, which is also the reference the R² is measured against.
+    """
+
+    def __init__(self, dim: int, vocab: int, device):
+        self.count = 0
+        self.sum_x = torch.zeros(dim, dtype=torch.float64, device=device)
+        self.xx = torch.zeros(dim, dim, dtype=torch.float64, device=device)
+        # fp64: centring subtracts n · mean_x · mean_yᵀ later, and a latent
+        # with a large document share has a large mean.
+        self.xy = torch.zeros(dim, vocab, dtype=torch.float64, device=device)
+        self.sum_y = torch.zeros(vocab, dtype=torch.float64, device=device)
+
+    def add(self, x, tokens) -> None:
+        """Fit rows: ``x`` is ``(N, D)``, ``tokens`` the ``(N, k)`` next block."""
+        k = tokens.shape[1]
+        x64 = x.double()
+        self.count += x.shape[0]
+        self.sum_x += x64.sum(dim=0)
+        self.xx += x64.T @ x64
+        source = (x64 / k).T.repeat(1, k)  # (D, k * N), j-major
+        self.xy.index_add_(1, tokens.T.reshape(-1), source)
+        self.sum_y.index_add_(
+            0, tokens.reshape(-1),
+            torch.full((tokens.numel(),), 1.0 / k, dtype=torch.float64,
+                       device=tokens.device),
+        )
+
+    def solve(self) -> None:
+        n = max(1, self.count)
+        self.mean_x, self.mean_y = self.sum_x / n, self.sum_y / n
+        cxx = self.xx - n * torch.outer(self.mean_x, self.mean_x)
+        cxy = self.xy - n * torch.outer(self.mean_x, self.mean_y)
+        dim = cxx.shape[0]
+        ridge = PROBE_RIDGE * cxx.trace().clamp_min(1e-12) / dim
+        eye = torch.eye(dim, dtype=cxx.dtype, device=cxx.device)
+        weight = torch.linalg.solve(cxx + ridge * eye, cxy)  # (D, vocab)
+        self.weight_t = weight.T.float().contiguous()  # (vocab, D), for gathers
+        self.gram = weight @ weight.T  # (D, D)
+        self.weight_mean_y = weight @ self.mean_y  # (D,)
+        self.mean_y_sq = (self.mean_y**2).sum()
+        del self.xy
+
+    def errors(self, x, tokens):
+        """Per-row squared error of the probe and of the mean bag of words."""
+        k = tokens.shape[1]
+        xc = x.double() - self.mean_x
+        y_sq = (tokens.unsqueeze(-1) == tokens.unsqueeze(-2)).sum(dim=(-1, -2)) / k**2
+        y_mean = self.mean_y[tokens].sum(dim=-1) / k
+        y_weight = F.embedding_bag(tokens, self.weight_t, mode="sum").double() / k
+        y_pred = y_mean + (xc * y_weight).sum(dim=-1)
+        pred_sq = (
+            self.mean_y_sq + 2 * xc @ self.weight_mean_y
+            + ((xc @ self.gram) * xc).sum(dim=-1)
+        )
+        return y_sq - 2 * y_pred + pred_sq, y_sq - 2 * y_mean + self.mean_y_sq
+
+
+def _probe_rows(model, batches, latents, horizons):
+    """Yield ``(features, tokens)`` per batch and horizon.
+
+    ``features`` maps each name in :data:`PROBE_FEATURES` to ``(N, D)`` unit
+    latents at the base positions with a real token ``k`` ahead; ``tokens``
+    is the ``(N, k)`` block after each of them.
+    """
+    shortest = min(horizons)
+    for (labels, mask), z in zip(batches, latents):
+        if labels.shape[1] <= max(horizons):
+            continue
+        proposals = model.predictor(z[:, :-shortest])
+        for horizon in horizons:
+            valid = _prediction_mask(mask, horizon)
+            if not valid.any():
+                continue
+            futures = _bases(proposals, z, horizon)
+            features = {
+                "z_t": z[:, :-horizon],
+                "mu": futures.mu,
+                "pi_argmax": futures.commit(PiArgmax()).future,
+                "hindsight": futures.commit(Hindsight(), z[:, horizon:]).future,
+            }
+            width = z.shape[1] - horizon
+            tokens = torch.stack(
+                [labels[:, j : j + width][valid] for j in range(1, horizon + 1)],
+                dim=-1,
+            )
+            yield (
+                {n: F.normalize(f[valid].float(), dim=-1) for n, f in features.items()},
+                tokens,
+            )
+
+
+def _probe_section(model, fit_batches, batches, latents, horizons) -> dict:
+    """Section 7: how much of the next block's words a latent predicts.
+
+    One linear probe per latent, fit on train-split chunks and scored on the
+    query batches, pooled over the evaluation horizons.  The score is R²
+    against the mean bag of words.  Nothing here is trained into the model.
+    """
+    device = latents[0].device
+    vocab = model.config.encoder.vocab_size
+    dim = latents[0].shape[-1]
+    probes = {name: _BagOfWordsProbe(dim, vocab, device) for name in PROBE_FEATURES}
+    # Encoded one batch at a time: 2048 chunks of latents would not fit at once.
+    fit_latents = (model.encode(labels, attention_mask=mask) for labels, mask in fit_batches)
+    for features, tokens in _probe_rows(model, fit_batches, fit_latents, horizons):
+        for name, x in features.items():
+            probes[name].add(x, tokens)
+    if probes["z_t"].count == 0:
+        raise ValueError("no probe fit positions in the train-split batches")
+    for probe in probes.values():
+        probe.solve()
+    sse = dict.fromkeys(PROBE_FEATURES, 0.0)
+    sst, positions = 0.0, 0
+    for features, tokens in _probe_rows(model, batches, latents, horizons):
+        positions += tokens.shape[0]
+        for name, x in features.items():
+            errors, reference = probes[name].errors(x, tokens)
+            sse[name] += errors.sum().item()
+        sst += reference.sum().item()
+    r2 = {name: 1.0 - sse[name] / sst if sst > 0 else None for name in PROBE_FEATURES}
+
+    def gain(name, over):
+        return None if r2[name] is None else r2[name] - r2[over]
+
+    return {
+        "r2": r2,
+        "gain_over_z_t": {n: gain(n, "z_t") for n in PROBE_FEATURES if n != "z_t"},
+        "hindsight_over_mu": gain("hindsight", "mu"),
+        "fit_positions": probes["z_t"].count,
+        "positions": positions,
+    }
+
+
 def _verdict(name, metric, value, threshold, comparison) -> dict:
     value, threshold = float(value), float(threshold)
     ok = value > threshold if comparison == ">" else value < threshold
@@ -818,7 +987,7 @@ def _verdict(name, metric, value, threshold, comparison) -> dict:
         "comparison": comparison, "ok": bool(ok),
     }
 def _verdicts(metrics) -> list[dict]:
-    """Section 7: pass/fail checks, each naming its metric and threshold."""
+    """Section 8: pass/fail checks, each naming its metric and threshold."""
     heads, policies = metrics["heads"], metrics["policies"]
     decoder, representation, rollouts = (
         metrics["decoder"], metrics["representation"], metrics["rollouts"]
@@ -839,14 +1008,22 @@ def _verdicts(metrics) -> list[dict]:
             abs(heads["mu_calibration_error"]), 0.05, "<",
         ),
         _verdict(
-            "encoder_center", "representation.visreg.center",
-            representation["visreg"]["center"], 0.05, "<",
+            "encoder_center", "representation.pooled_center",
+            representation["pooled_center"], 0.05, "<",
         ),
         _verdict(
             "encoder_effective_rank", "representation.effective_rank",
             representation["effective_rank"], 15.0, ">",
         ),
     ]
+    probe = metrics["probe"]
+    if probe is not None and probe["hindsight_over_mu"] is not None:
+        verdicts.append(
+            _verdict(
+                "hindsight_carries_content", "probe.hindsight_over_mu",
+                probe["hindsight_over_mu"], 0.0, ">",
+            )
+        )
     if representation["max_rebound"] is not None:
         verdicts.append(
             _verdict(
@@ -893,12 +1070,14 @@ def collect_metrics(
     model, batches, bank, *, depths=DEFAULT_DEPTHS,
     rollout_positions=DEFAULT_ROLLOUT_POSITIONS, seed=0,
     loss_chunk_size: int | None = DEFAULT_LOSS_CHUNK_SIZE, bank_chunk_size=None,
-    best_of=DEFAULT_BEST_OF,
+    best_of=DEFAULT_BEST_OF, probe_batches=None,
 ) -> dict:
     """Measure ``model`` on ``batches`` against a bank of real latents.
 
     ``loss_chunk_size=None`` uses the checkpoint's ``DecoderConfig``.
     ``best_of`` lists the K values of the best-of-K rollout error.
+    ``probe_batches`` are train-split ``(labels, attention_mask)`` batches the
+    next-block probe is fit on; without them the ``probe`` section is None.
     """
     if depths < 1 or rollout_positions < 1:
         raise ValueError("depths and rollout_positions must be at least 1")
@@ -938,10 +1117,16 @@ def collect_metrics(
             model, batches, latents, horizons, seed=seed,
             loss_chunk_size=loss_chunk_size,
         ),
+        "probe": None if probe_batches is None else _probe_section(
+            model,
+            [(labels.to(device), mask.to(device)) for labels, mask in probe_batches],
+            batches, latents, horizons,
+        ),
     }
     context = {
         "checkpoint": None, "device": None,
         "examples": int(sum(labels.shape[0] for labels, _ in batches)),
+        "batch_size": int(max(labels.shape[0] for labels, _ in batches)),
         "max_length": int(max(labels.shape[1] for labels, _ in batches)),
         "tokens": int(sum(int(mask.sum()) for _, mask in batches)),
         "horizon_range": [int(k) for k in horizon_range],
@@ -1026,7 +1211,10 @@ def print_report(metrics: dict) -> None:
                        f"(within-document energy faster than {FAST_SHARE_WINDOW} steps)"),
         ("document share", f"{_fmt(r['document_share'])}  "
                            "(between-document share of the variance)"),
-        ("VISReg", " | ".join(f"{n} {_fmt(v)}" for n, v in r["visreg"].items())),
+        ("VISReg", " | ".join(f"{n} {_fmt(v)}" for n, v in r["visreg"].items())
+                   + f"  (per batch of {c['batch_size']}; center grows with "
+                     "document share / batch size)"),
+        ("pooled center", f"{_fmt(r['pooled_center'])}  (mean over every query latent)"),
     ])
     lags = list(r["lag_cos"].items())
     print("lag profile, mean cos(z_t, z_t+lag):")
@@ -1097,9 +1285,20 @@ def print_report(metrics: dict) -> None:
     print(f"z_t use (no_hints - null):             {_fmt(dec['z_t_use'])}")
     print(f"future use (null - pi-argmax):         {_fmt(dec['future_use'])}")
     print(f"commit headroom (pi-argmax - hindsight): {_fmt(dec['commit_headroom'])}")
+    print(f"render gap (pi-argmax - real):         {_fmt(dec['render_gap'])}")
     print(f"specificity: shuffled-hindsight "
           f"{_fmt(dec['specificity']['shuffled_minus_hindsight'])}  vs "
           f"pi-argmax-hindsight {_fmt(dec['specificity']['pi_argmax_minus_hindsight'])}")
+
+    pr = metrics["probe"]
+    if pr is None:
+        print("\n--- next-block probe: n/a (no train-split batches) ---")
+    else:
+        print(f"\n--- next-block probe (bag of words of the next k tokens, R², "
+              f"fit on {pr['fit_positions']:,}, scored on {pr['positions']:,}) ---")
+        _table([(n, _fmt(pr["r2"][n]), _fmt(pr["gain_over_z_t"].get(n)))
+                for n in PROBE_FEATURES], ("latent", "R2", "gain over z_t"))
+        print(f"hindsight over mu: {_fmt(pr['hindsight_over_mu'])}")
 
     _pairs("verdicts", [
         (f"[{'PASS' if v['ok'] else 'FAIL'}] {v['name']}",
@@ -1129,7 +1328,14 @@ def print_report(metrics: dict) -> None:
         "                K grows if the committed futures cover the real one.",
         "decoder:        hint use > 0 means the decoder uses the committed future.",
         "                null keeps the real z_t; future use is what the",
-        "                committed future adds beyond it.",
+        "                committed future adds beyond it. real is the noise-free",
+        "                block-end latent, real_noisy the decoder_hint=real training",
+        "                condition; render gap is what a predicted future costs.",
+        "                A decoder_hint=real decoder trained on real latents, so its",
+        "                real, hint use and z_t use differ in meaning from a",
+        "                committed-hint run; compare runs through pi_argmax.",
+        "probe:          R² of a linear map to the next block's words; a hindsight",
+        "                gain over mu means the candidates carry content.",
         "verdicts:       PASS/FAIL on the checks above, each naming its metric.",
     ):
         print(line)
@@ -1162,6 +1368,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--loss-chunk-size", type=int, default=DEFAULT_LOSS_CHUNK_SIZE,
         help="Decoder positions per lm_head chunk (default: checkpoint config).",
     )
+    parser.add_argument(
+        "--probe-examples", type=int, default=DEFAULT_PROBE_EXAMPLES,
+        help="Train-split chunks the next-block probe is fit on (0 skips it).",
+    )
     parser.add_argument("--device", default=None, help="cpu, cuda, cuda:0, ...")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", type=Path, default=None, help="Write every metric as JSON.")
@@ -1188,10 +1398,15 @@ def main(argv: list[str] | None = None) -> None:
         model, train_dataset, tokenizer, size=args.bank_size,
         max_length=args.max_length, batch_size=args.batch_size, seed=args.seed,
     )
+    probe_batches = load_query_batches(
+        train_dataset, tokenizer, num_examples=args.probe_examples,
+        max_length=args.max_length, batch_size=args.batch_size, seed=args.seed + 1,
+    ) if args.probe_examples > 0 else None
     metrics = collect_metrics(
         model, batches, bank, depths=args.depths,
         rollout_positions=args.rollout_positions, seed=args.seed,
         loss_chunk_size=args.loss_chunk_size, best_of=args.best_of,
+        probe_batches=probe_batches,
     )
     metrics["context"]["checkpoint"] = str(args.model)
     metrics["context"]["device"] = str(device)
